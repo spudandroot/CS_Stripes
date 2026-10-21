@@ -267,7 +267,6 @@ class CompanyConfigTests(unittest.TestCase):
         # label size comes from the printer's stock
         self.assertEqual((packing.stock, zl.label_dots(packing)), ("2x1-gap", (406, 203)))
         self.assertEqual((pallets.stock, zl.label_dots(pallets)), ("3x3-mark", (610, 610)))
-        self.assertEqual(pallets.expected["media"], "mark")
         self.assertTrue(all(p.port == 9100 and not p.windows_name for p in cfg.printers))
 
     def test_notepad_bom_and_bad_entries(self):
@@ -380,30 +379,23 @@ class MonitorTests(unittest.TestCase):
         fake = FakePrinter(hs_reply=HS_BUSY, config_report=ZD_REPORT.encode(),
                            sgd={"odometer.total_label_count": "19259"})
         self.addCleanup(fake.close)
-        p = zl.Printer(name="Gary", host="127.0.0.1", port=fake.port, model="ZD420", expected={"darkness": 10})
+        p = zl.Printer(name="Gary", host="127.0.0.1", port=fake.port, model="ZD420")
         snap = zl.inspect_printer(p)
         self.assertTrue(snap.reachable)
         self.assertEqual(snap.state, ("Printing", "busy"))
         self.assertEqual(snap.activity, "Printing: 24 labels left in this job")
-        self.assertEqual(snap.diffs, [])
         self.assertEqual(snap.info["odometer.total_label_count"], "19259")
         self.assertIn(("PRINT WIDTH", "406"), snap.report)
 
-    def test_stock_check(self):
+    def test_label_length(self):
         p = zl.Printer(name="Alaine", host="x", model="ZD420", dpi=203)
         stock = zl.Stock("2x1-gap", "2 x 1 in", 2, 1, "gap")
-        snap = zl.PrinterSnapshot(p, None, reachable=True, status={"label_length_dots": 217},
-                                  settings={"print_width": 406, "media": "gap"})
-        self.assertEqual(zl.check_stock(p, stock, snap),
-                         ("2.00 x 1.07 in, gap labels", None))  # within tolerance
-        snap.status["label_length_dots"] = 320  # a longer label loaded
-        snap.settings["media"] = "mark"
-        text, problem = zl.check_stock(p, stock, snap)
-        self.assertEqual(problem, "Doesn't look like 2 x 1 in: printer measures labels 1.57 in long; "
-                                  "printer is set for black mark labels")
-        p.expected = {"media": "gap"}  # the spec check already reports media; don't say it twice
-        self.assertNotIn("black mark", zl.check_stock(p, stock, snap)[1])
-        self.assertIsNone(zl.check_stock(p, None, snap)[1])  # no stock set: nothing to compare
+        self.assertIsNone(zl.check_label_length(p, stock, 217))  # 1.07 in: 1 in label plus its gap
+        self.assertIsNone(zl.check_label_length(p, stock, 196))  # 0.97 in: calibration wobble
+        self.assertEqual(zl.check_label_length(p, stock, 320), "Labels loaded are 1.57 in long, not 2 x 1 in")
+        self.assertIsNotNone(zl.check_label_length(p, stock, 180))  # 0.89 in: too short
+        self.assertIsNone(zl.check_label_length(p, None, 320))  # no stock: nothing to compare
+        self.assertIsNone(zl.check_label_length(p, stock, None))  # printer didn't say
 
     def test_unreachable_and_non_link_os(self):
         s = socket.socket()
@@ -416,30 +408,14 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(zl.is_link_os(zl.Printer(name="x", model="Other")))  # never sent SGD
 
 
-class SpecCheckTests(unittest.TestCase):
-    def test_parse_report(self):
-        self.assertEqual(zl.parse_config_report(ZD_REPORT), {
-            "darkness": 10.0, "speed": 6.0, "print_mode": "tear-off", "media": "gap", "print_width": 406})
-
-    def test_unknown_format_means_no_checks(self):
-        self.assertEqual(zl.parse_config_report("garbage\nmore garbage"), {})
-
-    def test_differences(self):
-        actual = zl.parse_config_report(ZD_REPORT)
-        same = {"print_width": 406, "media": "gap", "print_mode": "tear-off", "darkness": 10, "speed": 6,
-                "sensor": "transmissive"}
-        self.assertEqual(zl.spec_differences(same, actual), [])
-        diffs = zl.spec_differences({"darkness": 15, "print_mode": "peel-off", "print_width": 609}, actual)
-        self.assertEqual(diffs, ["Darkness is 10 (spec says 15)", "Print mode is tear-off (spec says peel-off)",
-                                 "Print width is 406 (spec says 609)"])
-
+class CheckPrinterTests(unittest.TestCase):
     def test_check_printer_over_network(self):
-        fake = FakePrinter(config_report=ZD_REPORT.encode())
+        fake = FakePrinter(hs_reply=HS_BUSY)
         self.addCleanup(fake.close)
-        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port, expected={"darkness": 12, "media": "gap"})
-        self.assertEqual(zl.check_printer(p), ([], ["Darkness is 10 (spec says 12)"]))
-        p.expected = {}
-        self.assertEqual(zl.check_printer(p), ([], None))  # no spec, no check
+        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port)
+        self.assertEqual(zl.check_printer(p), ([], None))  # no stock: status only
+        self.assertEqual(zl.check_printer(p, zl.Stock("3x3", "3 x 3 in", 3, 3, "gap")),
+                         ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
 
 class VersionTests(unittest.TestCase):
