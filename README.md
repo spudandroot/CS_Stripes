@@ -89,12 +89,9 @@ Domain Computers need read access to the script; Domain Users need read access t
 ## Releasing a new version
 
 Every push to `main` is tested and built by GitHub Actions on Windows (download the build from
-the run's artifacts). To ship to all PCs, tag a version:
-
-```
-git tag v1.1.0
-git push origin v1.1.0
-```
+the run's artifacts). To ship to all PCs, publish a release: on GitHub go to
+**Actions > Build > Run workflow**, type the version (e.g. `v1.1.0`) and click **Run workflow**.
+Pushing a tag (`git tag v1.1.0 && git push origin v1.1.0`) does the same.
 
 That publishes a Release, and PCs install it at their next scheduled check (within a day).
 

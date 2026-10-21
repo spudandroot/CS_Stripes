@@ -1,13 +1,19 @@
 name: Build
 
-# Every push is tested and built. Pushing a version tag (e.g. v1.2.0) also
-# publishes a GitHub Release, which PCs pick up via deploy/Update-Stripes.ps1.
+# Every push is tested and built. To publish a release (which PCs pick up via
+# deploy/Update-Stripes.ps1), either push a version tag like v1.2.0, or use
+# Actions > Build > Run workflow and type the version.
 on:
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Version to release, e.g. v1.2.0 (leave empty to just build)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -30,8 +36,13 @@ jobs:
 
       - name: Stamp version
         shell: pwsh
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
-          $v = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $v = if ($env:RELEASE) { $env:RELEASE }
+               elseif ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
+               else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.2.0" }
           "VERSION = `"$v`"" | Out-File -Encoding utf8 stripes_version.py
           "STRIPES_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
@@ -50,7 +61,7 @@ jobs:
           path: dist/*
 
       - name: Publish release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.release != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --title "Stripes ${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes
