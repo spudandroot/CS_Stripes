@@ -7,6 +7,8 @@ Needs pywin32 for Windows printers; everything else is standard library.
 
 import copy
 import gc
+import glob
+import hashlib
 import json
 import os
 import re
@@ -14,7 +16,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import queue
 import urllib.request
 from dataclasses import dataclass, asdict, field, fields, replace
@@ -45,6 +49,8 @@ MODELS = {
 MAX_RECENT = 20
 MAX_COPIES = 9999
 CONFIRM_COPIES_OVER = 50
+UPDATE_URL = "https://github.com/spudandroot/CS_Stripes/releases"
+UPDATE_CHECK_HOURS = 6
 
 
 # --------------------------------------------------------------------------
@@ -619,6 +625,67 @@ def labelary_png(zpl, printer):
 
 
 # --------------------------------------------------------------------------
+# Self-update
+# --------------------------------------------------------------------------
+
+def parse_version(text):
+    """'v1.2.3' -> (1, 2, 3); None for anything else (e.g. development builds)."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
+    return tuple(int(n) for n in m.groups()) if m else None
+
+
+def _fetch(url, timeout=60):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read()
+
+
+def check_for_update(current=None, fetch=_fetch):
+    """The newest release's version if it's newer than this one, else None."""
+    mine = parse_version(VERSION if current is None else current)
+    if mine is None:
+        return None
+    latest = fetch(f"{UPDATE_URL}/latest/download/version.txt").decode("ascii", "replace").strip()
+    theirs = parse_version(latest)
+    return latest if theirs and theirs > mine else None
+
+
+def folder_is_writable(folder):
+    try:
+        with tempfile.TemporaryFile(dir=folder):
+            return True
+    except OSError:
+        return False
+
+
+def install_update(version, exe_path, fetch=_fetch):
+    """Download a release and put it in place of exe_path, for the next start.
+
+    Windows lets a running program be renamed but not overwritten, so the
+    running exe is moved aside (Stripes.exe.old-...) and the new one takes its
+    name. Old copies are cleaned up on a later start.
+    """
+    base = f"{UPDATE_URL}/download/{version}"
+    data = fetch(f"{base}/Stripes.exe", timeout=600)
+    expected = fetch(f"{base}/Stripes.exe.sha256").decode("ascii", "replace").strip().upper()
+    if hashlib.sha256(data).hexdigest().upper() != expected:
+        raise ValueError("the download was damaged (checksum mismatch)")
+    new = exe_path + ".new"
+    with open(new, "wb") as f:
+        f.write(data)
+    if os.path.exists(exe_path):
+        os.replace(exe_path, f"{exe_path}.old-{int(time.time() * 1000)}")
+    os.replace(new, exe_path)
+
+
+def remove_old_versions(exe_path):
+    for old in glob.glob(glob.escape(exe_path) + ".old-*") + [exe_path + ".new"]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass  # still running in another window; next time
+
+
+# --------------------------------------------------------------------------
 # User interface
 # --------------------------------------------------------------------------
 
@@ -717,6 +784,48 @@ class App(tk.Tk):
         else:
             self._show_config_problems()
             self._maybe_first_run()
+        if getattr(sys, "frozen", False):  # only the built .exe updates itself
+            remove_old_versions(sys.executable)
+            self.after(3000, self._check_for_update)
+
+    # ----- self-update -----
+
+    def _check_for_update(self):
+        exe = sys.executable
+
+        def work():
+            latest = check_for_update()
+            if not latest:
+                return None
+            if not folder_is_writable(os.path.dirname(exe)):
+                return "available", latest
+            install_update(latest, exe)
+            return "installed", latest
+
+        def done(result, error):
+            if error or not result:
+                # offline or nothing new: look again later
+                self.after(UPDATE_CHECK_HOURS * 3600 * 1000, self._check_for_update)
+                return
+            kind, version = result
+            if kind == "installed":
+                self.update_label.configure(text=f"Stripes {version} is ready.", style="Ok.TLabel")
+                self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
+            else:
+                self.update_label.configure(text=f"Stripes {version} is available; this copy can't update itself.",
+                                            style="Warn.TLabel")
+
+        self.bg.run(work, done)
+
+    def _restart_to_update(self):
+        if not self.design.is_empty() and not messagebox.askyesno(
+                APP_NAME, "Restart Stripes now? The label you're working on will be cleared.", parent=self):
+            return
+        # PYINSTALLER_RESET_ENVIRONMENT makes the new copy start fresh rather
+        # than reuse this one's unpacked files.
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        subprocess.Popen([sys.executable], env=env, close_fds=True)
+        self.destroy()
 
     @property
     def company(self):
@@ -761,6 +870,9 @@ class App(tk.Tk):
         titles.pack(side="left")
         ttk.Label(titles, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(titles, text="Zebra label printing", style="Muted.TLabel").pack(anchor="w")
+        self.update_label = ttk.Label(header, text=f"Version {VERSION}", style="Muted.TLabel")
+        self.update_label.pack(side="right")
+        self.update_button = ttk.Button(header, text="Restart to update", command=self._restart_to_update)
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
         # Printer row

@@ -65,28 +65,24 @@ Keep your real files on the internal share, **not in this repo**.
 
 ## Deploying to domain PCs (Group Policy)
 
-One computer GPO linked to the OU with the label-printing PCs:
+Each user runs their own copy from `%LocalAppData%\Programs\Stripes`, and **Stripes keeps itself up
+to date**: at start (and every few hours while open) it checks the latest GitHub release, downloads
+it, verifies its SHA-256 checksum and offers **Restart to update**. Users own that folder, so no admin
+rights or install scripts are needed. (A copy in a folder it can't write to, like Program Files, just
+says a new version is available.)
 
-1. **Install and update the app** with [`deploy/Update-Stripes.ps1`](deploy/Update-Stripes.ps1). It
-   downloads the latest release into `C:\Program Files\Stripes`, checks its SHA-256 checksum, and does
-   nothing if it's already up to date (or if Stripes is open). It retries for a few minutes while the
-   network comes up. Log: `C:\ProgramData\Stripes\update.log`.
+One GPO, linked to an OU that contains both the users and their PCs:
 
-   Keep the script **inside the GPO** so only GPO editors can change it (it runs as SYSTEM on every PC):
-   *Computer Configuration > Policies > Windows Settings > Scripts > Startup > Show Files...*, copy
-   `Update-Stripes.ps1` there, then **Add...** on the *Scripts* tab:
-   - Script Name: `powershell.exe`
-   - Script Parameters: `-NoProfile -ExecutionPolicy Bypass -File "<path of that Show Files folder>\Update-Stripes.ps1"`
-
-   Startup scripts run at boot only. For daily updates without a reboot, run the same command from a
-   *Scheduled Task (At least Windows 7)* preference as `NT AUTHORITY\SYSTEM` instead.
-2. **Company settings location**: *Computer Configuration > Preferences > Windows Settings >
-   Registry*, action **Update**: hive `HKEY_LOCAL_MACHINE`, key `SOFTWARE\Policies\Stripes`, value
-   `ConfigPath` (REG_SZ) = `\\SERVER\Share\Stripes\config`
-3. **Shortcut**: *Computer Configuration > Preferences > Windows Settings > Shortcuts*, **All Users
-   Desktop**, target `C:\Program Files\Stripes\Stripes.exe`
-
-Domain Users need read access to the config folder; only IT should be able to change it.
+1. Put `Stripes.exe` from [Releases](../../releases/latest) on a share Domain Users can read
+   (Properties > **Unblock** it first). It's only the starting copy; it never needs updating.
+2. **Settings location**: *Computer Configuration > Preferences > Windows Settings > Registry*,
+   action **Update**: hive `HKEY_LOCAL_MACHINE`, key `SOFTWARE\Policies\Stripes`, value `ConfigPath`
+   (REG_SZ) = `\\SERVER\Share\Stripes\config`
+3. **Each user's copy**: *User Configuration > Preferences > Windows Settings > Files*, action
+   **Create** (copies only if missing, so it never undoes a self-update): source
+   `\\SERVER\Share\Stripes\Stripes.exe`, destination `%LocalAppData%\Programs\Stripes\Stripes.exe`
+4. **Shortcuts**: *User Configuration > Preferences > Windows Settings > Shortcuts*, location
+   **Desktop** and **Start Menu**, target `%LocalAppData%\Programs\Stripes\Stripes.exe`
 
 ## Releasing a new version
 
@@ -95,7 +91,7 @@ the run's artifacts). To ship to all PCs, publish a release: on GitHub go to
 **Actions > Build > Run workflow**, type the version (e.g. `v1.1.0`) and click **Run workflow**.
 Pushing a tag (`git tag v1.1.0 && git push origin v1.1.0`) does the same.
 
-That publishes a Release, and PCs install it at their next scheduled check (within a day).
+That publishes a Release; each copy of Stripes picks it up the next time it starts (or within a few hours).
 
 ## Development
 

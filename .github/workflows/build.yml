@@ -1,7 +1,7 @@
 name: Build
 
-# Every push is tested and built. To publish a release (which PCs pick up via
-# deploy/Update-Stripes.ps1), either push a version tag like v1.2.0, or use
+# Every push is tested and built. To publish a release (which every copy of
+# Stripes then updates itself to), either push a version tag like v1.2.0, or use
 # Actions > Build > Run workflow and type the version.
 on:
   push:
