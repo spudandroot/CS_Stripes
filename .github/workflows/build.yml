@@ -55,10 +55,34 @@ jobs:
       - name: Build Stripes.exe
         run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" stripes.py
 
+      # The same program already unpacked (Stripes.exe + a Stripes-<version> folder), which
+      # starts much faster. Copies of Stripes install this; the single exe above is for
+      # Group Policy's first copy and for older versions.
+      - name: Build Stripes-app.zip
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onedir --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --contents-directory "Stripes-$env:STRIPES_VERSION" --distpath onedir --workpath build-onedir stripes.py
+          if ($LASTEXITCODE) { exit 1 }
+          python -c "import shutil; shutil.make_archive('dist/Stripes-app', 'zip', 'onedir/Stripes')"
+
+      - name: Check both builds start
+        shell: pwsh
+        run: |
+          Expand-Archive dist\Stripes-app.zip -DestinationPath check-onedir
+          foreach ($run in @(@{exe = "dist\Stripes.exe"; layout = "onefile"}, @{exe = "check-onedir\Stripes.exe"; layout = "onedir"})) {
+            $out = Join-Path $PWD "check-$($run.layout).txt"
+            Start-Process -FilePath $run.exe -ArgumentList "--self-check", "`"$out`"" -Wait
+            $got = Get-Content $out -ErrorAction SilentlyContinue
+            if ($got -ne "ok $env:STRIPES_VERSION $($run.layout)") { throw "$($run.exe) self-check failed: '$got'" }
+            Write-Output "$($run.exe): $got"
+          }
+
       - name: Checksum and version files
         shell: pwsh
         run: |
-          (Get-FileHash dist\Stripes.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii -NoNewline dist\Stripes.exe.sha256
+          foreach ($f in "Stripes.exe", "Stripes-app.zip") {
+            (Get-FileHash "dist\$f" -Algorithm SHA256).Hash | Out-File -Encoding ascii -NoNewline "dist\$f.sha256"
+          }
           $env:STRIPES_VERSION | Out-File -Encoding ascii -NoNewline dist\version.txt
 
       - uses: actions/upload-artifact@v4
@@ -70,7 +94,7 @@ jobs:
         if: (github.ref_type == 'tag' || inputs.release != '') && !contains(env.STRIPES_VERSION, '-beta.')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes --latest
+        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/Stripes-app.zip dist/Stripes-app.zip.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes --latest
 
       - name: Publish beta
         if: (github.ref_type == 'tag' || inputs.release != '') && contains(env.STRIPES_VERSION, '-beta.')
@@ -79,7 +103,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           V: ${{ env.STRIPES_VERSION }}
         run: |
-          gh release create $env:V dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes $env:V" --generate-notes --prerelease
+          gh release create $env:V dist/Stripes.exe dist/Stripes.exe.sha256 dist/Stripes-app.zip dist/Stripes-app.zip.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes $env:V" --generate-notes --prerelease
           if ($LASTEXITCODE) { exit 1 }
           # Point the beta channel at it: beta PCs read beta/version.txt, then download from the release above
           gh release view beta *> $null

@@ -1,5 +1,8 @@
 """Tests for the non-UI parts of stripes. Run: python -m unittest -v"""
 
+import glob
+import io
+import zipfile
 import os
 import re
 import shutil
@@ -485,7 +488,7 @@ class SelfUpdateTests(unittest.TestCase):
             for suffix, data in files.items():
                 if url.endswith(suffix):
                     return data
-            raise OSError(f"404 {url}")
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
         return fetch
 
     def test_versions(self):
@@ -504,15 +507,9 @@ class SelfUpdateTests(unittest.TestCase):
 
     def beta_github(self, latest, beta=None):
         files = {"/latest/download/version.txt": latest.encode()}
-        fetch = self.fake_github(files)
-        if beta is None:
-            def without_beta(url, timeout=60):
-                if url.endswith("/download/beta/version.txt"):
-                    raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
-                return fetch(url, timeout)
-            return without_beta
-        files["/download/beta/version.txt"] = beta.encode()
-        return fetch
+        if beta:
+            files["/download/beta/version.txt"] = beta.encode()
+        return self.fake_github(files)
 
     def test_beta_channel(self):
         fetch = self.beta_github("v1.3.0", "v1.4.0-beta.2")
@@ -541,6 +538,44 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertFalse(zl.on_beta(["ARROW01"], "ARROW07", "jdoe"))
         self.assertFalse(zl.on_beta([], "ARROW01", "jdoe"))
         self.assertIsNone(zl.on_beta(None, "ARROW01", "jdoe"))
+
+    def app_zip(self, version, extra=None):
+        import hashlib
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("Stripes.exe", b"fast exe")
+            z.writestr(f"Stripes-{version}/base_library.zip", b"python")
+            for name, data in (extra or {}).items():
+                z.writestr(name, data)
+        data = buf.getvalue()
+        return {f"/download/{version}/Stripes-app.zip": data,
+                f"/download/{version}/Stripes-app.zip.sha256": hashlib.sha256(data).hexdigest().encode()}
+
+    def test_install_unpacked_build(self):
+        fetch = self.fake_github(self.app_zip("v1.4.0"))
+        self.assertTrue(zl.install_update("v1.4.0", self.exe, fetch))
+        with open(self.exe, "rb") as f:
+            self.assertEqual(f.read(), b"fast exe")
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "Stripes-v1.4.0", "base_library.zip")))
+        self.assertFalse(glob.glob(os.path.join(self.dir, ".staging-*")))
+        # the next version's folder goes next to it; cleanup keeps only the running one
+        zl.install_update("v1.5.0", self.exe, self.fake_github(self.app_zip("v1.5.0")))
+        zl.remove_old_versions(self.exe, keep=os.path.join(self.dir, "Stripes-v1.5.0"))
+        self.assertEqual(sorted(os.listdir(self.dir)), ["Stripes-v1.5.0", "Stripes.exe"])
+
+    def test_layout_only_needs_the_zip(self):
+        fetch = self.fake_github({})  # an older release without Stripes-app.zip
+        self.assertFalse(zl.install_update("v1.3.0", self.exe, fetch, layout_only=True))
+        with open(self.exe, "rb") as f:
+            self.assertEqual(f.read(), b"old version")
+
+    def test_zip_must_stay_in_its_folder(self):
+        fetch = self.fake_github(self.app_zip("v1.4.0", {"../evil.txt": b"x"}))
+        with self.assertRaises(ValueError):
+            zl.install_update("v1.4.0", self.exe, fetch)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.dir), "evil.txt")))
+        with open(self.exe, "rb") as f:
+            self.assertEqual(f.read(), b"old version")
 
     def test_install_swaps_the_exe(self):
         import hashlib

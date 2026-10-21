@@ -10,6 +10,7 @@ import gc
 import getpass
 import glob
 import hashlib
+import io
 import json
 import os
 import platform
@@ -24,6 +25,7 @@ import time
 import queue
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass, asdict, field, fields, replace
 from datetime import datetime
 
@@ -926,7 +928,7 @@ class DeploymentLog:
     def started(self, version, exe):
         previous = self.read().get("version")
         fields = dict(version=version, exe=exe, last_start=_now(), running=True, pending_update=None,
-                      windows=platform.platform())
+                      windows=platform.platform(), layout=running_layout())
         if previous is None:
             event = f"Installed ({version})"
         elif previous != version:
@@ -1057,32 +1059,117 @@ def folder_is_writable(folder):
         return False
 
 
-def install_update(version, exe_path, fetch=_fetch):
-    """Download a release and put it in place of exe_path, for the next start.
+# Releases come two ways: Stripes.exe on its own (unpacks itself to a temp folder on
+# every start, which is slow) and Stripes-app.zip: the same program already unpacked, as
+# Stripes.exe plus a "Stripes-<version>" folder next to it, which starts much faster.
+# Copies install the zip when there is one; the single exe is what Group Policy hands out
+# and what older copies know how to download.
+APP_ZIP = "Stripes-app.zip"
+CONTENTS_PREFIX = "Stripes-"
 
-    Windows lets a running program be renamed but not overwritten, so the
-    running exe is moved aside (Stripes.exe.old-...) and the new one takes its
-    name. Old copies are cleaned up on a later start.
-    """
-    base = f"{UPDATE_URL}/download/{version}"
-    data = fetch(f"{base}/Stripes.exe", timeout=600)
-    expected = fetch(f"{base}/Stripes.exe.sha256").decode("ascii", "replace").strip().upper()
+
+def running_layout():
+    """'onedir' (the fast, unpacked install), 'onefile', or None when run from source."""
+    if not getattr(sys, "frozen", False):
+        return None
+    unpacked = os.path.dirname(os.path.normpath(getattr(sys, "_MEIPASS", "")))
+    same = os.path.normcase(unpacked) == os.path.normcase(os.path.dirname(sys.executable))
+    return "onedir" if same else "onefile"
+
+
+def _download_checked(base, name, fetch):
+    data = fetch(f"{base}/{name}", timeout=600)
+    expected = fetch(f"{base}/{name}.sha256").decode("ascii", "replace").strip().upper()
     if hashlib.sha256(data).hexdigest().upper() != expected:
         raise ValueError("the download was damaged (checksum mismatch)")
-    new = exe_path + ".new"
-    with open(new, "wb") as f:
-        f.write(data)
+    return data
+
+
+def _swap_exe(new, exe_path):
+    """Windows lets a running program be renamed but not overwritten, so the running exe
+    is moved aside (Stripes.exe.old-...) and the new one takes its name. Old copies are
+    cleaned up on a later start."""
     if os.path.exists(exe_path):
         os.replace(exe_path, f"{exe_path}.old-{int(time.time() * 1000)}")
     os.replace(new, exe_path)
 
 
-def remove_old_versions(exe_path):
+def _remove_folder(path):
+    """Delete a folder, but only if nothing in it is in use: renaming fails on Windows
+    while a program is running from it, so a copy still open is left alone."""
+    doomed = f"{path}.delete-{int(time.time() * 1000)}"
+    os.rename(path, doomed)
+    shutil.rmtree(doomed, ignore_errors=True)
+
+
+def install_update(version, exe_path, fetch=_fetch, layout_only=False):
+    """Download a release and put it in place of exe_path, for the next start.
+
+    Uses the unpacked build (Stripes-app.zip) when the release has one. layout_only:
+    only install that (to switch this version to the faster layout); returns False
+    if the release doesn't have it.
+    """
+    base = f"{UPDATE_URL}/download/{version}"
+    try:
+        data = _download_checked(base, APP_ZIP, fetch)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        data = None  # an older release: single exe only
+    folder = os.path.dirname(exe_path)
+    if data is None:
+        if layout_only:
+            return False
+        data = _download_checked(base, "Stripes.exe", fetch)
+        new = exe_path + ".new"
+        with open(new, "wb") as f:
+            f.write(data)
+        _swap_exe(new, exe_path)
+        return True
+
+    staging = os.path.join(folder, f".staging-{int(time.time() * 1000)}")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            root = os.path.realpath(staging)
+            for name in z.namelist():
+                if not os.path.realpath(os.path.join(staging, name)).startswith(root + os.sep):
+                    raise ValueError("the download isn't a Stripes build")
+            z.extractall(staging)
+        contents = [d for d in os.listdir(staging)
+                    if d.startswith(CONTENTS_PREFIX) and os.path.isdir(os.path.join(staging, d))]
+        new = os.path.join(staging, "Stripes.exe")
+        if len(contents) != 1 or not os.path.isfile(new):
+            raise ValueError("the download isn't a Stripes build")
+        target = os.path.join(folder, contents[0])
+        if os.path.exists(target):
+            _remove_folder(target)  # a half-finished earlier attempt
+        os.replace(os.path.join(staging, contents[0]), target)
+        _swap_exe(new, exe_path)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return True
+
+
+def remove_old_versions(exe_path, keep=None):
+    """Clean up what earlier updates left behind: old exes, and unpacked versions
+    other than `keep` (the one running) that nothing is using any more."""
+    folder = os.path.dirname(exe_path)
     for old in glob.glob(glob.escape(exe_path) + ".old-*") + [exe_path + ".new"]:
         try:
             os.remove(old)
         except OSError:
             pass  # still running in another window; next time
+    for path in glob.glob(os.path.join(glob.escape(folder), CONTENTS_PREFIX + "*")) + \
+            glob.glob(os.path.join(glob.escape(folder), ".staging-*")):
+        if not os.path.isdir(path) or (keep and os.path.normcase(path) == os.path.normcase(keep)):
+            continue
+        try:
+            if ".delete-" in os.path.basename(path) or os.path.basename(path).startswith(".staging-"):
+                shutil.rmtree(path)
+            else:
+                _remove_folder(path)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -1187,7 +1274,8 @@ class App(tk.Tk):
         self._updates_started = not getattr(sys, "frozen", False)  # only the built .exe updates itself
         if not self._updates_started:
             remove_download_mark(sys.executable)
-            remove_old_versions(sys.executable)
+            remove_old_versions(sys.executable,
+                                keep=getattr(sys, "_MEIPASS", None) if running_layout() == "onedir" else None)
             if not self.config_folder:
                 self.after(3000, self._start_updates)
             # otherwise once the server's settings arrive, since they say who's on beta
@@ -1240,6 +1328,11 @@ class App(tk.Tk):
         def work():
             latest = check_for_update(beta=beta)
             if not latest:
+                # Nothing newer: switch a single-exe copy to the faster unpacked layout
+                if running_layout() == "onefile" and parse_version(VERSION) and \
+                        folder_is_writable(os.path.dirname(exe)) and \
+                        install_update(VERSION, exe, layout_only=True):
+                    return "faster", VERSION
                 return None
             if not folder_is_writable(os.path.dirname(exe)):
                 return "available", latest
@@ -1254,7 +1347,12 @@ class App(tk.Tk):
                 self.after(UPDATE_CHECK_HOURS * 3600 * 1000, self._check_for_update)
                 return
             kind, version = result
-            if kind == "installed":
+            if kind == "faster":
+                self._log(lambda log: log.write("Set up to start faster; finishes when Stripes restarts",
+                                                pending_update=version, last_update_error=None))
+                self.update_label.configure(text="Stripes will start faster after a restart.", style="Ok.TLabel")
+                self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
+            elif kind == "installed":
                 self._log(lambda log: log.write(f"Downloaded {version}; finishes when Stripes restarts",
                                                 pending_update=version, last_update_error=None))
                 self.update_label.configure(text=f"Stripes {display_version(version)} is ready.", style="Ok.TLabel")
@@ -3324,7 +3422,27 @@ class PrinterDialog(tk.Toplevel):
         self._run(p, "Calibrating", lambda: send_label(p, b"~JC"), ("Calibration started.", "Ok.TLabel"))
 
 
+def self_check(out_path):
+    """Used by the release build: prove a built copy can load everything it needs
+    (Tk, Pillow, QR codes, its icon), then write what it is to out_path and exit."""
+    from PIL import Image, ImageTk  # noqa: F401 (the preview needs both)
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        ImageTk.PhotoImage(Image.new("1", (8, 8)), master=root)
+        ld.qr_matrix("Stripes")
+        with open(resource_path(os.path.join("assets", "icon.ico")), "rb"):
+            pass
+    finally:
+        root.destroy()
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"ok {VERSION} {running_layout()}\n")
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
+        self_check(sys.argv[2])
+        return
     if sys.platform == "win32":
         try:  # sharp text on high-DPI screens
             import ctypes

@@ -13,7 +13,13 @@ A small Windows app for designing and printing labels on Zebra printers.
   labels loaded are the size of the label stock. **Stripes never changes printer settings**: labels
   only carry their content, so other software printing to the same printers isn't affected.
 - **Printer monitor** shows every printer at once: problems and what to do about them first, then
-  which printer it is, with everything else behind **More info**.
+  which printer it is, with everything else behind **More info**. Users can turn on **alerts**: a
+  notice in the corner of the screen when a printer runs out of labels, opens its head, etc.
+- **Automatic fields** filled in when the label prints: `{date}`, `{longdate}`, `{julian}`, `{yy}`,
+  `{week}`, `{time}`, `{count}` of `{copies}`... Dates can be moved: `{date+3}`. Use **Insert field**.
+- **Templates**: save a label (with its stock and copies) for everyone to pick from a list.
+- **Print history**: everything printed from the PC, to open again or **reprint** with the original
+  dates (and, for numbered labels, just the numbers that need redoing).
 
 Download the latest `Stripes.exe` from **[Releases](../../releases/latest)**. It's a single file;
 nothing to install.
@@ -68,7 +74,9 @@ Keep your real files on the internal share, **not in this repo**.
 ## Deploying to domain PCs (Group Policy)
 
 Each user runs their own copy from `%LocalAppData%\Programs\Stripes`, and **Stripes keeps itself up
-to date**: at start (and every few hours while open) it checks the latest GitHub release, downloads
+to date**. Group Policy hands out the single `Stripes.exe`; on its first run it swaps itself for the
+unpacked build (`Stripes-app.zip` on each release: `Stripes.exe` plus a `Stripes-<version>` folder),
+which starts much faster because it no longer unpacks itself every time. Updates: at start (and every few hours while open) it checks the latest GitHub release, downloads
 it, verifies its SHA-256 checksum and offers **Restart to update**. Users own that folder, so no admin
 rights or install scripts are needed. (A copy in a folder it can't write to, like Program Files, just
 says a new version is available.)
@@ -85,6 +93,12 @@ One GPO, linked to an OU that contains both the users and their PCs:
    `\\SERVER\Share\Stripes\Stripes.exe`, destination `%LocalAppData%\Programs\Stripes\Stripes.exe`
 4. **Shortcuts**: *User Configuration > Preferences > Windows Settings > Shortcuts*, location
    **Desktop** and **Start Menu**, target `%LocalAppData%\Programs\Stripes\Stripes.exe`
+
+### Shared templates
+
+Create a `templates` folder next to `config` (e.g. `\\SERVER\Share\Stripes\templates`) and give
+Domain Users **Modify** on it; templates saved in Stripes then appear for everyone (one small JSON
+file each). Without the folder, each user's templates stay on their PC.
 
 ### Deployment log
 
