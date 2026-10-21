@@ -590,14 +590,13 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill="both", expand=True)
 
-        # Header: company logo + app name
+        # Header: app icon + name
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 10))
         try:
             big = float(self.tk.call("tk", "scaling")) >= 2.0  # high-DPI screen
-            self.logo = tk.PhotoImage(file=resource_path(os.path.join("assets", "logo-96.png")))
-            if not big:
-                self.logo = self.logo.subsample(2)
+            size = "96" if big else "48"
+            self.logo = tk.PhotoImage(file=resource_path(os.path.join("assets", f"icon-{size}.png")))
             ttk.Label(header, image=self.logo).pack(side="left", padx=(0, 10))
         except tk.TclError:
             pass  # logo missing; the app works without it
