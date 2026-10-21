@@ -9,13 +9,15 @@ import gc
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import queue
 import urllib.request
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, field, fields, replace
+from datetime import datetime
 from math import inf
 
 import tkinter as tk
@@ -63,6 +65,8 @@ class Printer:
     dpi: int = 203
     shift_x: int = 0   # nudge everything right (+) or left (-), in dots
     shift_y: int = 0   # nudge everything down (+) or up (-), in dots
+    stock: str = ""    # id of the printer's default label stock (company printers)
+    expected: dict = field(default_factory=dict)  # how the printer should be set up; checked, never sent
 
     @property
     def dpmm(self):
@@ -78,8 +82,42 @@ class Printer:
 
     @classmethod
     def from_dict(cls, d):
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        return _from_dict(cls, d)
+
+
+def _from_dict(cls, d):
+    """Build a dataclass from a JSON object, ignoring keys it doesn't know."""
+    if not isinstance(d, dict):
+        raise TypeError("each entry must be a {...} object")
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in known})
+
+
+MEDIA_TYPES = ("gap", "mark", "continuous")
+
+
+@dataclass
+class Stock:
+    """A kind of label roll."""
+    id: str
+    name: str
+    width_in: float
+    height_in: float
+    media: str = "gap"  # gap (gap/notch), mark (black mark) or continuous
+
+    @classmethod
+    def from_dict(cls, d):
+        return _from_dict(cls, d)
+
+
+@dataclass
+class CompanyConfig:
+    """Printers and label stock that IT manages for every PC."""
+    printers: list = field(default_factory=list)
+    stock: list = field(default_factory=list)
+    source: str = None     # where it was read from
+    problems: list = field(default_factory=list)
+    cached_at: str = None  # set when the server was unreachable and the saved copy is in use
 
 
 def settings_path():
@@ -112,46 +150,165 @@ def load_settings():
     }
 
 
-def company_list_paths():
-    """Where IT can put a shared printers.json, in order of preference."""
-    override = os.environ.get("STRIPES_COMPANY")
+def configured_folder():
+    r"""The company config folder that Group Policy points this PC at, if any.
+
+    Set by IT as HKLM\SOFTWARE\Policies\Stripes\ConfigPath (e.g. a \\server\share path),
+    so the location never needs to be written into the app.
+    """
+    override = os.environ.get("STRIPES_CONFIG")
     if override:
-        return [override]
-    paths = []
+        return override
+    if sys.platform != "win32":
+        return None
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Stripes") as key:
+            return str(winreg.QueryValueEx(key, "ConfigPath")[0]).strip() or None
+    except OSError:
+        return None
+
+
+def local_folders():
+    """Fallback config folders on the PC itself, for PCs without the registry setting."""
+    folders = []
     if os.environ.get("PROGRAMDATA"):
-        paths.append(os.path.join(os.environ["PROGRAMDATA"], "Stripes", "printers.json"))
+        folders.append(os.path.join(os.environ["PROGRAMDATA"], "Stripes"))
     here = sys.executable if getattr(sys, "frozen", False) else __file__
-    paths.append(os.path.join(os.path.dirname(os.path.abspath(here)), "printers.json"))
-    return paths
+    folders.append(os.path.dirname(os.path.abspath(here)))
+    return folders
 
 
-def load_company_printers():
-    """Read the company printer list. Returns (printers, path or None, problems)."""
-    for path in company_list_paths():
+def cache_folder():
+    override = os.environ.get("STRIPES_CACHE")
+    if override:
+        return override
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "Stripes", "config-cache")
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8-sig") as f:  # tolerate Notepad's BOM
+        return json.load(f)
+
+
+def _entries(data, key):
+    return data.get(key, []) if isinstance(data, dict) else []
+
+
+def parse_config(folder):
+    """Read printers.json and (optional) stock.json from a folder.
+
+    Raises OSError/ValueError if printers.json itself can't be read; bad entries
+    are skipped and listed in the returned problems.
+    """
+    problems = []
+    try:
+        stock_data = _read_json(os.path.join(folder, "stock.json"))
+    except FileNotFoundError:
+        stock_data = {}
+    except (OSError, ValueError) as e:
+        stock_data = {}
+        problems.append(f"Could not read stock.json: {e}")
+    stock, by_id = [], {}
+    for i, d in enumerate(_entries(stock_data, "stock")):
         try:
-            with open(path, encoding="utf-8-sig") as f:  # tolerate Notepad's BOM
-                data = json.load(f)
-        except FileNotFoundError:
+            st = Stock.from_dict(d)
+            st.width_in, st.height_in = float(st.width_in), float(st.height_in)
+            if st.width_in <= 0 or st.height_in <= 0:
+                raise ValueError("width_in and height_in must be above 0")
+            if st.media not in MEDIA_TYPES:
+                raise ValueError(f"media must be one of {', '.join(MEDIA_TYPES)}")
+            if st.id in by_id:
+                raise ValueError("duplicate id")
+        except (TypeError, ValueError) as e:
+            problems.append(f"stock.json entry {i + 1} skipped: {e}")
             continue
+        by_id[st.id] = st
+        stock.append(st)
+
+    printer_data = _read_json(os.path.join(folder, "printers.json"))
+    printers, names = [], set()
+    for i, d in enumerate(_entries(printer_data, "printers")):
+        try:
+            p = Printer.from_dict(d)
+            if p.dpi not in DPI_TO_DPMM:
+                raise ValueError(f"dpi must be one of {', '.join(map(str, DPI_TO_DPMM))}")
+            if not p.host and not p.windows_name:
+                raise ValueError("needs a host (IP address) or windows_name")
+            if p.name in names:
+                raise ValueError("duplicate name")
+            if not isinstance(p.expected, dict):
+                raise ValueError("expected must be a {...} object")
+        except (TypeError, ValueError) as e:
+            problems.append(f"printers.json entry {i + 1} skipped: {e}")
+            continue
+        if p.stock:
+            if p.stock in by_id:
+                p.width_in, p.height_in = by_id[p.stock].width_in, by_id[p.stock].height_in
+            else:
+                problems.append(f"Printer {p.name}: unknown stock '{p.stock}'")
+                p.stock = ""
+        names.add(p.name)
+        printers.append(p)
+    return printers, stock, problems
+
+
+def save_cache(folder):
+    """Keep a copy of the server's config so the app works when the server is down."""
+    cache = cache_folder()
+    os.makedirs(cache, exist_ok=True)
+    for name in ("printers.json", "stock.json"):
+        src, dst = os.path.join(folder, name), os.path.join(cache, name)
+        if os.path.exists(src):
+            shutil.copyfile(src, dst + ".tmp")
+            os.replace(dst + ".tmp", dst)
+        elif os.path.exists(dst):
+            os.remove(dst)
+
+
+def load_cached_config(folder):
+    """The saved copy of the server's config, or None if there isn't one."""
+    cache = cache_folder()
+    try:
+        printers, stock, problems = parse_config(cache)
+        stamp = os.path.getmtime(os.path.join(cache, "printers.json"))
+    except (OSError, ValueError):
+        return None
+    return CompanyConfig(printers, stock, folder, problems,
+                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"))
+
+
+def load_company_config():
+    """Read the company config: from the server if one is configured, else a local folder.
+
+    Can be slow when the server is unreachable, so the app calls this off the UI thread.
+    """
+    folder = configured_folder()
+    if folder:
+        try:
+            printers, stock, problems = parse_config(folder)
         except (OSError, ValueError) as e:
-            return [], path, [f"Could not read the company printer list ({path}): {e}"]
-        printers, problems, names = [], [], set()
-        for i, d in enumerate(data.get("printers", []) if isinstance(data, dict) else []):
+            cached = load_cached_config(folder)
+            if cached:
+                cached.problems.insert(0, f"Couldn't read the company settings from {folder}; "
+                                          f"using the copy saved {cached.cached_at}.")
+                return cached
+            return CompanyConfig(source=folder, problems=[f"Couldn't read the company settings from {folder}: {e}"])
+        try:
+            save_cache(folder)
+        except OSError:
+            pass  # the app still works, just without an offline copy
+        return CompanyConfig(printers, stock, folder, problems)
+    for local in local_folders():
+        if os.path.exists(os.path.join(local, "printers.json")):
             try:
-                p = Printer.from_dict(d)
-                if p.dpi not in DPI_TO_DPMM:
-                    raise ValueError(f"dpi must be one of {', '.join(map(str, DPI_TO_DPMM))}")
-                if not p.host and not p.windows_name:
-                    raise ValueError("needs a host (IP address) or windows_name")
-                if p.name in names:
-                    raise ValueError("duplicate name")
-            except (TypeError, ValueError) as e:
-                problems.append(f"Company printer list entry {i + 1} skipped: {e}")
-                continue
-            names.add(p.name)
-            printers.append(p)
-        return printers, path, problems
-    return [], None, []
+                printers, stock, problems = parse_config(local)
+            except (OSError, ValueError) as e:
+                path = os.path.join(local, "printers.json")
+                return CompanyConfig(source=local, problems=[f"Could not read {path}: {e}"])
+            return CompanyConfig(printers, stock, local, problems)
+    return CompanyConfig()
 
 
 def merge_printers(company, personal):
@@ -291,9 +448,14 @@ def zpl_escape(s):
 
 
 def build_zpl(layout, printer, align="center", copies=1, border=False):
+    """The label format. It only places text: no printer settings (width, length,
+    media, darkness...) are sent, because those stay in effect on the printer and
+    would change how other software's labels print."""
     just = {"left": "L", "center": "C", "right": "R"}[align]
     sx, sy = printer.shift_x, printer.shift_y
-    out = ["^XA", "^CI28", f"^PW{layout.width}", f"^LL{layout.height}"]
+    out = ["^XA"]
+    if any(ord(c) > 126 for ln in layout.lines for c in ln.text):
+        out.append("^CI28")  # UTF-8, only when needed: it also stays in effect
     if border:
         out.append(f"^FO{max(0, sx)},{max(0, sy)}^GB{layout.width},{layout.height},3^FS")
     for ln in layout.lines:
@@ -357,6 +519,96 @@ def query_status(host, port, timeout=3):
                 break
             reply += chunk
     return parse_host_status(reply)
+
+
+# Lines of the printer's configuration report (^HH) that we compare with the spec.
+_REPORT_FIELDS = {
+    "DARKNESS": "darkness",
+    "PRINT SPEED": "speed",
+    "PRINT MODE": "print_mode",
+    "MEDIA TYPE": "media",
+    "PRINT WIDTH": "print_width",
+}
+_REPORT_MEDIA = {"GAP/NOTCH": "gap", "NON-CONTINUOUS": "gap", "WEB": "gap", "MARK": "mark",
+                 "BLACK MARK": "mark", "CONTINUOUS": "continuous"}
+
+
+def parse_config_report(text):
+    """Pull the settings we care about out of a ^HH configuration report.
+
+    Report lines look like "  +10.0               DARKNESS" (value, then name).
+    Anything unrecognised is skipped, so an unexpected format just means fewer checks.
+    """
+    found = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*(\S.*?)\s{2,}([A-Z][A-Z0-9 ./-]*?)\s*$", line)
+        if not m or m.group(2) not in _REPORT_FIELDS:
+            continue
+        key, value = _REPORT_FIELDS[m.group(2)], m.group(1).strip().upper()
+        number = re.match(r"[+-]?\d+(\.\d+)?", value)
+        if key in ("darkness", "speed") and number:
+            found[key] = float(number.group())
+        elif key == "print_width" and number:
+            found[key] = int(float(number.group()))
+        elif key == "print_mode":
+            found[key] = value.lower().replace(" ", "-")  # TEAR OFF -> tear-off
+        elif key == "media":
+            found[key] = _REPORT_MEDIA.get(value, value.lower())
+    return found
+
+
+def query_config(host, port, timeout=4):
+    """Ask the printer for its configuration report. Read-only."""
+    reply = b""
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.sendall(b"^XA^HH^XZ")
+        try:
+            while b"\x03" not in reply:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+        except socket.timeout:
+            pass
+    return parse_config_report(reply.decode("ascii", "replace"))
+
+
+_SPEC_LABELS = {"darkness": "Darkness", "speed": "Speed", "print_mode": "Print mode",
+                "media": "Media type", "print_width": "Print width"}
+
+
+def spec_differences(expected, actual):
+    """Human-readable differences between a printer's spec and what it reports."""
+    diffs = []
+    for key, label in _SPEC_LABELS.items():
+        if key not in expected or key not in actual:
+            continue
+        want, have = expected[key], actual[key]
+        if isinstance(have, (int, float)):
+            try:
+                same = abs(float(want) - have) < 0.05
+            except (TypeError, ValueError):
+                same = False
+        else:
+            same = str(want).strip().lower().replace(" ", "-") == have
+        if not same:
+            diffs.append(f"{label} is {have:g}" if isinstance(have, float) else f"{label} is {have}")
+            diffs[-1] += f" (spec says {want})"
+    return diffs
+
+
+def check_printer(printer):
+    """Status problems, plus spec differences for company printers with a spec.
+
+    Returns (problems, differences); differences is None when not checked.
+    """
+    problems = printer_problems(printer)
+    if not (printer.expected and printer.host):
+        return problems, None
+    try:
+        return problems, spec_differences(printer.expected, query_config(printer.host, printer.port))
+    except OSError:
+        return problems, None
 
 
 def describe_error(exc):
@@ -560,7 +812,14 @@ class App(tk.Tk):
         except tk.TclError:
             pass  # .ico window icons only work on Windows
         self.settings = load_settings()
-        self.company, self.company_path, company_problems = load_company_printers()
+        # Show the saved copy of the server's settings straight away; the server
+        # itself is read in the background (it can be slow when unreachable).
+        self.config_folder = configured_folder()
+        if self.config_folder:
+            self.cfg = load_cached_config(self.config_folder) or CompanyConfig(source=self.config_folder)
+        else:
+            self.cfg = load_company_config()
+        self.stock_options = []
         self.bg = Background(self)
         self.preview_family = pick_font_family(self)
         self.measure_font = tkinter.font.Font(self, family=self.preview_family, weight="bold")
@@ -579,8 +838,32 @@ class App(tk.Tk):
         self.bind_all("<Control-p>", lambda e: self.print_label())
         self.bind_all("<Control-Return>", lambda e: self.print_label())
         self.text.focus_set()
-        if company_problems:
-            self.set_status(" ".join(company_problems), "Warn.TLabel")
+        if self.config_folder:
+            self.bg.run(load_company_config, self._config_loaded)
+        else:
+            self._show_config_problems()
+            self._maybe_first_run()
+
+    @property
+    def company(self):
+        return self.cfg.printers
+
+    @property
+    def company_path(self):
+        return self.cfg.source
+
+    def _config_loaded(self, cfg, error):
+        if error is None:
+            self.cfg = cfg
+            self._load_printer_list(select=self.printer_var.get() or self.settings.get("last_printer"))
+        self._show_config_problems()
+        self._maybe_first_run()
+
+    def _show_config_problems(self):
+        if self.cfg.problems:
+            self.set_status(" ".join(self.cfg.problems), "Warn.TLabel")
+
+    def _maybe_first_run(self):
         if not self.all_printers():
             self.after(300, self._first_run)
 
@@ -619,8 +902,14 @@ class App(tk.Tk):
         self.printer_status = ttk.Label(top, text="", style="Muted.TLabel")
         self.printer_status.pack(side="left", padx=8)
 
-        self.size_label = ttk.Label(outer, text="", style="Muted.TLabel")
-        self.size_label.pack(anchor="w", pady=(4, 8))
+        stock_row = ttk.Frame(outer)
+        stock_row.pack(fill="x", pady=(6, 8))
+        ttk.Label(stock_row, text="Label stock:").pack(side="left")
+        self.stock_box = ttk.Combobox(stock_row, state="readonly", width=34)
+        self.stock_box.pack(side="left", padx=(6, 8))
+        self.stock_box.bind("<<ComboboxSelected>>", lambda e: self._stock_changed())
+        self.size_label = ttk.Label(stock_row, text="", style="Muted.TLabel")
+        self.size_label.pack(side="left")
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
@@ -704,12 +993,28 @@ class App(tk.Tk):
     def all_printers(self):
         return merge_printers(self.company, self.settings["printers"])
 
-    def current_printer(self):
+    def base_printer(self):
         name = self.printer_var.get()
         for p in self.all_printers():
             if p.name == name:
                 return p
         return None
+
+    def selected_stock(self):
+        i = self.stock_box.current()
+        return self.stock_options[i] if 0 <= i < len(self.stock_options) else None
+
+    def current_printer(self):
+        """The selected printer, sized for the selected label stock."""
+        p = self.base_printer()
+        st = self.selected_stock()
+        if p and st:
+            p = replace(p, width_in=st.width_in, height_in=st.height_in)
+        return p
+
+    def stock_is_default(self):
+        p, st = self.base_printer(), self.selected_stock()
+        return not (p and p.stock and st and st.id != p.stock)
 
     def current_text(self):
         return self.text.get("1.0", "end-1c")
@@ -755,16 +1060,50 @@ class App(tk.Tk):
             self.printer_var.set(names[0] if names else "")
         self._printer_changed(remember=False)
 
+    def _fill_stock(self):
+        """List the label stock, selecting the printer's default (also used to reset it)."""
+        p = self.base_printer()
+        self.stock_options, labels = [], []
+        if p and not p.stock:
+            self.stock_options.append(None)
+            labels.append(f"Printer's own size ({p.width_in:g} x {p.height_in:g} in)")
+        for st in self.cfg.stock:
+            self.stock_options.append(st)
+            labels.append(f"{st.name}  (default)" if p and st.id == p.stock else st.name)
+        self.stock_box["values"] = labels
+        default = next((i for i, st in enumerate(self.stock_options) if st and p and st.id == p.stock), 0)
+        if labels:
+            self.stock_box.current(default)
+        else:
+            self.stock_box.set("")
+        self._update_info()
+
+    def _stock_changed(self):
+        self._update_info()
+        self.refresh()
+
+    def _update_info(self):
+        p = self.current_printer()
+        if not p:
+            self.size_label.configure(text="No printer set up yet. Click 'Manage printers...'.",
+                                      style="Muted.TLabel")
+            return
+        text = f"{p.model} via {p.where}, {p.dpi} dpi  |  {p.width_in:g} x {p.height_in:g} in"
+        if self.stock_is_default():
+            self.size_label.configure(text=text, style="Muted.TLabel")
+        else:
+            self.size_label.configure(text=text + "  |  one-off stock, resets after printing",
+                                      style="Warn.TLabel")
+
     def _printer_changed(self, remember=True):
+        self._fill_stock()
         p = self.current_printer()
         if p:
-            self.size_label.configure(text=f"{p.model} via {p.where}  |  Label: {p.size_text}")
             if remember and self.settings.get("last_printer") != p.name:
                 self.settings["last_printer"] = p.name
                 self.save()
             self.check_status(quiet=True)
         else:
-            self.size_label.configure(text="No printer set up yet. Click 'Manage printers...'.")
             self.printer_status.configure(text="")
         self.refresh()
 
@@ -776,19 +1115,27 @@ class App(tk.Tk):
         seq = self._status_seq
         self.printer_status.configure(text="Checking...", style="Muted.TLabel")
 
-        def done(problems, error):
+        def done(result, error):
             if seq != self._status_seq:
                 return  # a newer check has started
             if error:
                 self.printer_status.configure(text="Not reachable", style="Bad.TLabel")
                 if not quiet:
                     messagebox.showwarning(APP_NAME, f"{p.name}: {describe_error(error)}", parent=self)
-            elif problems:
+                return
+            problems, diffs = result
+            if problems:
                 self.printer_status.configure(text=", ".join(problems), style="Bad.TLabel")
+            elif diffs:
+                self.printer_status.configure(text="Ready (differs from spec)", style="Warn.TLabel")
             else:
                 self.printer_status.configure(text="Ready", style="Ok.TLabel")
+            if diffs and not quiet:
+                messagebox.showinfo(APP_NAME, f"{p.name}'s settings differ from its spec:\n\n- "
+                                    + "\n- ".join(diffs) + "\n\nLabels still print; tell IT if they look wrong.",
+                                    parent=self)
 
-        self.bg.run(lambda: printer_problems(p), done)
+        self.bg.run(lambda: check_printer(p), done)
 
     def manage_printers(self):
         PrinterDialog(self)
@@ -965,7 +1312,12 @@ class App(tk.Tk):
                 messagebox.showerror(APP_NAME, f"Could not print on {p.name} ({p.where}).\n\n"
                                      f"{describe_error(error)}", parent=self)
                 return
-            self.set_status(f"Sent {copies} {label_word} to {p.name}.", "Ok.TLabel")
+            note = ""
+            if not self.stock_is_default():
+                self._fill_stock()  # a non-default stock is a one-off; back to the printer's default
+                self.refresh()
+                note = " Label stock is back to the printer's default."
+            self.set_status(f"Sent {copies} {label_word} to {p.name}.{note}", "Ok.TLabel")
             self._remember()
             self.check_status(quiet=True)
 
@@ -1044,7 +1396,8 @@ class PrinterDialog(tk.Toplevel):
         self.save_btn.pack(side="left")
         ttk.Button(actions, text="Test connection", command=self._test).pack(side="left", padx=6)
         ttk.Button(actions, text="Print test label", command=self._test_label).pack(side="left")
-        ttk.Button(actions, text="Calibrate media", command=self._calibrate).pack(side="left", padx=6)
+        self.calibrate_btn = ttk.Button(actions, text="Calibrate media", command=self._calibrate)
+        self.calibrate_btn.pack(side="left", padx=6)
 
         self.msg = ttk.Label(form, text="", wraplength=460, justify="left")
         self.msg.grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 0))
@@ -1178,12 +1531,13 @@ class PrinterDialog(tk.Toplevel):
                 w.configure(state="disabled" if locked else "readonly")
             else:
                 w.configure(state="disabled" if locked else "normal")
-        for b in (self.save_btn, self.delete_btn):
+        for b in (self.save_btn, self.delete_btn, self.calibrate_btn):
             b.configure(state="disabled" if locked else "normal")
 
     def _show(self, p):
         for k, v in asdict(p).items():
-            self.vars[k].set(f"{v:g}" if isinstance(v, float) else str(v))
+            if k in self.vars:
+                self.vars[k].set(f"{v:g}" if isinstance(v, float) else str(v))
         if not p.windows_name:
             self.vars["windows_name"].set(NO_WINDOWS_PRINTER)
 

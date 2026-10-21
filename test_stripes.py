@@ -1,6 +1,9 @@
 """Tests for the non-UI parts of stripes. Run: python -m unittest -v"""
 
+import os
 import re
+import shutil
+import tempfile
 import socket
 import sys
 import threading
@@ -65,7 +68,9 @@ class LayoutTests(unittest.TestCase):
 class ZplTests(unittest.TestCase):
     def test_structure(self):
         zpl = zl.build_zpl(zl.layout_label("Line one\nLine two", ZD420), ZD420, "center", 3)
-        self.assertTrue(zpl.startswith("^XA\n^CI28\n^PW406\n^LL203\n"))
+        self.assertTrue(zpl.startswith("^XA\n^FO"))
+        for setting in ("^PW", "^LL", "^CI", "^MN", "^MT", "^MD", "~SD", "^PR", "^JUS"):
+            self.assertNotIn(setting, zpl)  # never change the printer's own settings
         self.assertTrue(zpl.endswith("^PQ3\n^XZ\n"))
         f = fields_of(zpl)
         self.assertEqual([x[6] for x in f], ["Line one", "Line two"])
@@ -79,6 +84,7 @@ class ZplTests(unittest.TestCase):
     def test_special_characters_escaped(self):
         zpl = zl.build_zpl(zl.layout_label("A^B~C_D 50°F", ZD420), ZD420)
         self.assertIn("^FDA_5EB_7EC_5FD 50°F^FS", zpl)
+        self.assertTrue(zpl.startswith("^XA\n^CI28\n"))  # UTF-8 only when the text needs it
         self.assertEqual(zpl.count("^XA"), 1)
 
     def test_shift_and_border(self):
@@ -97,8 +103,9 @@ class ZplTests(unittest.TestCase):
 class FakePrinter:
     """Listens like a Zebra on port 9100: records data, answers ~HS."""
 
-    def __init__(self, hs_reply=HS_READY):
+    def __init__(self, hs_reply=HS_READY, config_report=b"\x02\x03"):
         self.hs_reply = hs_reply
+        self.config_report = config_report
         self.received = []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
@@ -121,6 +128,9 @@ class FakePrinter:
                     data += chunk
                     if data == b"~HS":
                         conn.sendall(self.hs_reply)
+                        break
+                    if data == b"^XA^HH^XZ":
+                        conn.sendall(self.config_report)
                         break
                 self.received.append(data)
 
@@ -268,50 +278,138 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(loaded["recent"], s["recent"])
 
 
-class CompanyListTests(unittest.TestCase):
-    def load(self, content, encoding="utf-8"):
-        import tempfile, os
-        d = tempfile.mkdtemp()
-        path = os.path.join(d, "printers.json")
-        with open(path, "w", encoding=encoding) as f:
-            f.write(content)
-        with mock.patch.dict(os.environ, {"STRIPES_COMPANY": path}):
-            return zl.load_company_printers()
+EXAMPLE_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "config")
 
-    def test_example_printers_json(self):
-        import os
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples", "printers.example.json")
-        with mock.patch.dict(os.environ, {"STRIPES_COMPANY": path}):
-            printers, _, problems = zl.load_company_printers()
-        self.assertEqual(problems, [])
-        by_name = {p.name: p for p in printers}
+
+class CompanyConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cache = os.path.join(self.tmp, "cache")
+        env = mock.patch.dict(os.environ, {"STRIPES_CACHE": self.cache})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def folder(self, printers=None, stock=None, encoding="utf-8"):
+        d = tempfile.mkdtemp(dir=self.tmp)
+        for name, content in (("printers.json", printers), ("stock.json", stock)):
+            if content is not None:
+                with open(os.path.join(d, name), "w", encoding=encoding) as f:
+                    f.write(content)
+        return d
+
+    def load(self, folder):
+        with mock.patch.dict(os.environ, {"STRIPES_CONFIG": folder}):
+            return zl.load_company_config()
+
+    def test_example_config(self):
+        cfg = self.load(EXAMPLE_CONFIG)
+        self.assertEqual(cfg.problems, [])
+        self.assertEqual([s.id for s in cfg.stock], ["2x1-gap", "3x3-gap", "3x3-mark"])
+        by_name = {p.name: p for p in cfg.printers}
         packing, pallets = by_name["Packing ZD420"], by_name["Pallets ZT410"]
-        self.assertEqual((packing.host, zl.label_dots(packing)), ("192.0.2.10", (406, 203)))
-        self.assertEqual((pallets.host, zl.label_dots(pallets)), ("192.0.2.20", (610, 610)))
-        self.assertTrue(all(p.port == 9100 and not p.windows_name for p in printers))
+        # label size comes from the printer's stock
+        self.assertEqual((packing.stock, zl.label_dots(packing)), ("2x1-gap", (406, 203)))
+        self.assertEqual((pallets.stock, zl.label_dots(pallets)), ("3x3-mark", (610, 610)))
+        self.assertEqual(pallets.expected["media"], "mark")
+        self.assertTrue(all(p.port == 9100 and not p.windows_name for p in cfg.printers))
 
     def test_notepad_bom_and_bad_entries(self):
-        printers, _, problems = self.load(
-            '{"printers": [{"name": "A", "host": "192.0.2.1"}, {"name": "B", "host": "192.0.2.2", "dpi": 200},'
-            ' {"name": "C"}, {"name": "A", "host": "192.0.2.3"}, {"nme": "typo"}]}', encoding="utf-8-sig")
-        self.assertEqual([p.name for p in printers], ["A"])
-        self.assertEqual(len(problems), 4)
+        d = self.folder(
+            printers='{"printers": [{"name": "A", "host": "192.0.2.1", "stock": "s1"},'
+                     ' {"name": "B", "host": "192.0.2.2", "dpi": 200}, {"name": "C"},'
+                     ' {"name": "A", "host": "192.0.2.3"}, {"nme": "typo"}, "junk",'
+                     ' {"name": "D", "host": "192.0.2.4", "stock": "nope"}]}',
+            stock='{"stock": [{"id": "s1", "name": "One", "width_in": 4, "height_in": 6},'
+                  ' {"id": "s2", "name": "Bad", "width_in": 0, "height_in": 1},'
+                  ' {"id": "s3", "name": "Bad media", "width_in": 1, "height_in": 1, "media": "foil"}]}',
+            encoding="utf-8-sig")
+        cfg = self.load(d)
+        self.assertEqual([p.name for p in cfg.printers], ["A", "D"])
+        self.assertEqual(zl.label_dots(cfg.printers[0]), (813, 1219))
+        self.assertEqual(cfg.printers[1].stock, "")  # unknown stock dropped, printer kept
+        self.assertEqual([s.id for s in cfg.stock], ["s1"])
+        self.assertEqual(len(cfg.problems), 8)
 
-    def test_unreadable_file_reported(self):
-        printers, _, problems = self.load("{not json")
-        self.assertEqual(printers, [])
-        self.assertIn("Could not read", problems[0])
+    def test_stock_file_optional(self):
+        cfg = self.load(self.folder(printers='{"printers": [{"name": "A", "host": "192.0.2.1"}]}'))
+        self.assertEqual((cfg.problems, cfg.stock, [p.name for p in cfg.printers]), ([], [], ["A"]))
 
-    def test_missing_file_is_fine(self):
-        import os
-        with mock.patch.dict(os.environ, {"STRIPES_COMPANY": "/nonexistent/printers.json"}):
-            self.assertEqual(zl.load_company_printers(), ([], None, []))
+    def test_server_down_uses_saved_copy(self):
+        d = tempfile.mkdtemp(dir=self.tmp)
+        for name in ("printers.json", "stock.json"):
+            shutil.copy(os.path.join(EXAMPLE_CONFIG, name), d)
+        online = self.load(d)
+        self.assertIsNone(online.cached_at)
+        self.assertTrue(os.path.exists(os.path.join(self.cache, "stock.json")))
+
+        os.remove(os.path.join(d, "printers.json"))  # server unreachable / file gone
+        offline = self.load(d)
+        self.assertIsNotNone(offline.cached_at)
+        self.assertEqual([p.name for p in offline.printers], [p.name for p in online.printers])
+        self.assertEqual(len(offline.stock), 3)
+        self.assertIn("using the copy saved", offline.problems[0])
+
+    def test_server_down_and_no_saved_copy(self):
+        cfg = self.load(os.path.join(self.tmp, "missing"))
+        self.assertEqual(cfg.printers, [])
+        self.assertIn("Couldn't read the company settings", cfg.problems[0])
+
+    def test_no_config_anywhere(self):
+        with mock.patch.dict(os.environ, {"STRIPES_CONFIG": ""}), \
+                mock.patch.object(zl, "local_folders", return_value=[self.tmp]):
+            cfg = zl.load_company_config()
+        self.assertEqual((cfg.printers, cfg.stock, cfg.problems), ([], [], []))
 
     def test_company_printers_win_name_clashes(self):
         company = [zl.Printer(name="Shop", host="192.0.2.214")]
         personal = [zl.Printer(name="Shop", host="1.2.3.4"), zl.Printer(name="Mine", host="5.6.7.8")]
         merged = zl.merge_printers(company, personal)
         self.assertEqual([(p.name, p.host) for p in merged], [("Shop", "192.0.2.214"), ("Mine", "5.6.7.8")])
+
+
+ZD_REPORT = """\x02
+   PRINTER CONFIGURATION
+
+Zebra Technologies
+ZTC ZD420-203dpi ZPL
+  +10.0               DARKNESS
+  6.0 IPS             PRINT SPEED
+  +000                TEAR OFF ADJUST
+  TEAR OFF            PRINT MODE
+  GAP/NOTCH           MEDIA TYPE
+  TRANSMISSIVE        SENSOR SELECT
+  406                 PRINT WIDTH
+  0217                LABEL LENGTH
+  39.0IN   988MM      MAXIMUM LENGTH
+FIRMWARE IN THIS PRINTER IS COPYRIGHTED
+\x03"""
+
+
+class SpecCheckTests(unittest.TestCase):
+    def test_parse_report(self):
+        self.assertEqual(zl.parse_config_report(ZD_REPORT), {
+            "darkness": 10.0, "speed": 6.0, "print_mode": "tear-off", "media": "gap", "print_width": 406})
+
+    def test_unknown_format_means_no_checks(self):
+        self.assertEqual(zl.parse_config_report("garbage\nmore garbage"), {})
+
+    def test_differences(self):
+        actual = zl.parse_config_report(ZD_REPORT)
+        same = {"print_width": 406, "media": "gap", "print_mode": "tear-off", "darkness": 10, "speed": 6,
+                "sensor": "transmissive"}
+        self.assertEqual(zl.spec_differences(same, actual), [])
+        diffs = zl.spec_differences({"darkness": 15, "print_mode": "peel-off", "print_width": 609}, actual)
+        self.assertEqual(diffs, ["Darkness is 10 (spec says 15)", "Print mode is tear-off (spec says peel-off)",
+                                 "Print width is 406 (spec says 609)"])
+
+    def test_check_printer_over_network(self):
+        fake = FakePrinter(config_report=ZD_REPORT.encode())
+        self.addCleanup(fake.close)
+        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port, expected={"darkness": 12, "media": "gap"})
+        self.assertEqual(zl.check_printer(p), ([], ["Darkness is 10 (spec says 12)"]))
+        p.expected = {}
+        self.assertEqual(zl.check_printer(p), ([], None))  # no spec, no check
 
 
 if __name__ == "__main__":

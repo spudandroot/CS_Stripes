@@ -1,0 +1,7 @@
+{
+  "stock": [
+    {"id": "2x1-gap",  "name": "2 x 1 in",              "width_in": 2, "height_in": 1, "media": "gap"},
+    {"id": "3x3-gap",  "name": "3 x 3 in",              "width_in": 3, "height_in": 3, "media": "gap"},
+    {"id": "3x3-mark", "name": "3 x 3 in, black mark",  "width_in": 3, "height_in": 3, "media": "mark"}
+  ]
+}
