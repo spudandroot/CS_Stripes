@@ -1,0 +1,56 @@
+name: Build
+
+# Every push is tested and built. Pushing a version tag (e.g. v1.2.0) also
+# publishes a GitHub Release, which PCs pick up via deploy/Update-Stripes.ps1.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Test
+        run: python -m unittest -v
+
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          "VERSION = `"$v`"" | Out-File -Encoding utf8 stripes_version.py
+          "STRIPES_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Build Stripes.exe
+        run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" stripes.py
+
+      - name: Checksum and version files
+        shell: pwsh
+        run: |
+          (Get-FileHash dist\Stripes.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii -NoNewline dist\Stripes.exe.sha256
+          $env:STRIPES_VERSION | Out-File -Encoding ascii -NoNewline dist\version.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stripes
+          path: dist/*
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --title "Stripes ${{ github.ref_name }}" --generate-notes

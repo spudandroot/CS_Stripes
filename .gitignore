@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+stripes_version.py
+# Company-specific files never go in this public repo
+printers.json
+settings.json

@@ -1,0 +1,7 @@
+{
+  "printers": [
+    {"name": "Packing ZD420", "host": "192.0.2.10", "model": "ZD420", "width_in": 2, "height_in": 1, "dpi": 203},
+    {"name": "Pallets ZT410", "host": "192.0.2.20", "model": "ZT410", "width_in": 3, "height_in": 3, "dpi": 203,
+     "shift_x": 0, "shift_y": 0}
+  ]
+}
