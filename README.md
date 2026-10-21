@@ -60,7 +60,6 @@ See [`examples/config`](examples/config) for the format.
 | `model` | no | e.g. `ZD420`, `ZT410` |
 | `dpi` | no | 203, 300 or 600. Zebra's "200 dpi" is 203 |
 | `stock` | no | `id` of the default label stock |
-| `monitor` | no | `false` leaves it out of the Printer monitor (e.g. office printers). Default `true` |
 | `shift_x`, `shift_y` | no | Nudge the print position, in dots (8 dots = 1 mm at 203 dpi) |
 
 Keep your real files on the internal share, **not in this repo**.
