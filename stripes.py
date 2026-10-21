@@ -1291,8 +1291,10 @@ class App(tk.Tk):
         bottom.pack(fill="x", pady=(12, 0))
         ttk.Label(bottom, text="Copies:", font=("Segoe UI", 11)).pack(side="left")
         self.copies_var = tk.StringVar(value="1")
+        self.copies_var.trace_add("write", lambda *a: self.refresh())  # {copies} on the preview
         ttk.Spinbox(bottom, from_=1, to=MAX_COPIES, width=6, textvariable=self.copies_var,
                     font=("Segoe UI", 11)).pack(side="left", padx=6)
+        self._build_field_menu(bottom).pack(side="left", padx=(12, 0))
         ttk.Button(bottom, text="Exact preview (online)", command=self.exact_preview).pack(side="left", padx=12)
         self.print_btn = ttk.Button(bottom, text="Print", style="Print.TButton", command=self.print_label)
         self.print_btn.pack(side="right")
@@ -1300,11 +1302,62 @@ class App(tk.Tk):
         self.status = ttk.Label(outer, text="Ready. Tip: Ctrl+P prints.", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(8, 0))
 
+    def _build_field_menu(self, parent):
+        """'Insert field' menu: dates, Julian date, copy numbers... filled in when the label prints."""
+        button = ttk.Menubutton(parent, text="Insert field")
+        menu = tk.Menu(button, tearoff=False)
+        for name, (what, example) in ld.FIELDS.items():
+            menu.add_command(label=f"{what}  ({example})", command=lambda n=name: self._insert_field("{%s}" % n))
+        menu.add_separator()
+        menu.add_command(label="Help with fields...", command=self._field_help)
+        button["menu"] = menu
+        self._typing_in = None
+        return button
+
+    def _insert_field(self, token):
+        widget = self._typing_in
+        if self.in_simple_mode() or widget is None:
+            widget = self.simple_box if self.in_simple_mode() else self.value_entry
+        chosen = self.selected_elements()
+        if widget is self.value_entry and (len(chosen) != 1 or chosen[0].kind == "image"):
+            messagebox.showinfo(APP_NAME, "Select a text line, barcode or QR code first.", parent=self)
+            return
+        widget.insert("insert", token)
+        widget.focus_set()
+
+    def _field_help(self):
+        lines = [f"{{{name}}}    {what}, e.g. {example}" for name, (what, example) in ld.FIELDS.items()]
+        messagebox.showinfo(APP_NAME, "Fields are filled in when the label prints:\n\n" + "\n".join(lines) +
+                            "\n\nDates can be moved by days: {date+3} is 3 days from today, {julian-1} is "
+                            "yesterday's Julian date.\n\n{count} numbers each copy, e.g. \"Box {count} of "
+                            "{copies}\". Fields work in text, barcodes and QR codes.", parent=self)
+
+    def _rendered(self, design, label, now=None, count=1, copies=1):
+        """Render a design with its fields filled in. With auto layout, the items' boxes
+        are copied back so selecting and dragging on the preview still lines up."""
+        ready = ld.filled(design, now or datetime.now(), count, copies)
+        rendered = ld.render(ready, label)
+        if design.auto_layout:
+            for e, f in zip(design.elements, ready.elements):
+                e.x, e.y, e.w, e.h = f.x, f.y, f.w, f.h
+        unknown = ld.unknown_fields(design)
+        if unknown:
+            rendered.warnings.append(f"Not a field (prints as typed): {', '.join(unknown)}")
+        return rendered
+
+    def _copies(self):
+        try:
+            copies = int(self.copies_var.get())
+        except ValueError:
+            return None
+        return copies if 1 <= copies <= MAX_COPIES else None
+
     def _build_simple(self, parent):
         ttk.Label(parent, text="Type your label, one line per row:").pack(anchor="w")
         self.simple_box = tk.Text(parent, height=8, width=30, wrap="none", font=("Segoe UI", 14), undo=True)
         self.simple_box.pack(fill="both", expand=True, pady=(4, 0))
         self.simple_box.bind("<<Modified>>", self._simple_modified)
+        self.simple_box.bind("<FocusIn>", lambda e: setattr(self, "_typing_in", self.simple_box))
         self.simple_box.bind("<Control-Return>", lambda e: (self.print_label(), "break")[1])
         ttk.Label(parent, text="Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
                                "size per line, use the Advanced tab.",
@@ -1356,6 +1409,7 @@ class App(tk.Tk):
         self.value_label.pack(side="left")
         self.value_entry = ttk.Entry(self.row_value, textvariable=self.v_value, font=("Segoe UI", 12))
         self.value_entry.pack(side="left", fill="x", expand=True)
+        self.value_entry.bind("<FocusIn>", lambda e: setattr(self, "_typing_in", self.value_entry))
         self.value_entry.bind("<Return>", self._enter_pressed)
         self.value_entry.bind("<Up>", lambda e: self._step_selection(-1))
         self.value_entry.bind("<Down>", lambda e: self._step_selection(1))
@@ -1834,7 +1888,7 @@ class App(tk.Tk):
             self.warn_label.configure(text="")
             return
         design = self.active_design()
-        rendered = ld.render(design, label)
+        rendered = self._rendered(design, label, copies=self._copies() or 1)
         scale = min((cw - 40) / label.width, (ch - 40) / label.height)
         lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
@@ -1960,7 +2014,7 @@ class App(tk.Tk):
         if not p or design.is_empty():
             messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
             return
-        zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
+        zpl = ld.build_zpl(self._rendered(design, label, copies=self._copies() or 1), p.shift_x, p.shift_y)
         self.set_status("Getting exact preview from labelary.com...")
 
         def done(png, error):
@@ -1996,16 +2050,21 @@ class App(tk.Tk):
         if design.is_empty():
             messagebox.showinfo(APP_NAME, "Type something on the label first.", parent=self)
             return
-        rendered = ld.render(design, self.current_label())
-        if rendered.errors:
-            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(rendered.errors), parent=self)
-            return
-        try:
-            copies = int(self.copies_var.get())
-            if not 1 <= copies <= MAX_COPIES:
-                raise ValueError
-        except ValueError:
+        copies = self._copies()
+        if copies is None:
             messagebox.showerror(APP_NAME, f"Copies must be a whole number from 1 to {MAX_COPIES}.", parent=self)
+            return
+        now, label = datetime.now(), self.current_label()
+        rendered = self._rendered(design, label, now, 1, copies)
+        if ld.uses_count(design) and copies > 1:
+            # each copy is different, so send them one by one
+            each = [rendered] + [self._rendered(design, label, now, n, copies) for n in range(2, copies + 1)]
+            errors = list(dict.fromkeys(err for r in each for err in r.errors))
+            rendered.warnings = list(dict.fromkeys(w for r in each for w in r.warnings))
+        else:
+            each, errors = None, rendered.errors
+        if errors:
+            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(errors), parent=self)
             return
         if rendered.warnings and not messagebox.askyesno(
                 APP_NAME, "\n".join(rendered.warnings) + "\n\nPrint anyway?", parent=self):
@@ -2014,7 +2073,10 @@ class App(tk.Tk):
                 APP_NAME, f"Print {copies} labels on {p.name}?", parent=self):
             return
 
-        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
+        if each:
+            zpl = "".join(ld.build_zpl(r, p.shift_x, p.shift_y, 1) for r in each)
+        else:
+            zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
         self.print_btn.configure(state="disabled")
         self.set_status(f"Sending to {p.name}...")
         label_word = "label" if copies == 1 else "labels"

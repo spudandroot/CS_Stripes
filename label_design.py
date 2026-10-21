@@ -10,8 +10,11 @@ on-screen preview.
 """
 
 import base64
+import copy
 import io
+import re
 from dataclasses import dataclass, field, asdict, fields
+from datetime import timedelta
 from math import inf
 
 MARGIN_IN = 0.06      # blank border around the label
@@ -419,6 +422,87 @@ def auto_arrange(design, label):
     for e, h in zip(els, heights):
         e.x, e.y, e.w, e.h = m, int(y), avail_w, h
         y += h + gap
+
+
+# --------------------------------------------------------------------------
+# Automatic fields: {date}, {julian+3}, {count} of {copies}... filled in at print time
+# --------------------------------------------------------------------------
+
+# name: (what it gives, example). Date fields take a day offset: {date+3}, {julian-1}.
+FIELDS = {
+    "date": ("Today's date", "10/21/2026"),
+    "shortdate": ("Today's date, short year", "10/21/26"),
+    "longdate": ("Today's date, written out", "Oct 21, 2026"),
+    "julian": ("Day of the year (Julian date)", "294"),
+    "year": ("Year", "2026"),
+    "yy": ("Year, 2 digits", "26"),
+    "month": ("Month number", "10"),
+    "day": ("Day of the month", "21"),
+    "weekday": ("Day of the week", "Wed"),
+    "week": ("Week of the year", "43"),
+    "time": ("Time printed", "4:42 PM"),
+    "count": ("Which copy this is: 1, 2, 3...", "1"),
+    "copies": ("How many copies are printing", "10"),
+}
+_NOT_DATES = {"time", "count", "copies"}
+_FIELD = re.compile(r"\{([A-Za-z]+)([+-]\d{1,4})?\}")
+
+
+def _field_value(name, offset, now, count, copies):
+    if name == "count":
+        return str(count)
+    if name == "copies":
+        return str(copies)
+    if name == "time":
+        return now.strftime("%I:%M %p").lstrip("0")
+    d = now + timedelta(days=offset)
+    return {
+        "date": f"{d.month:02d}/{d.day:02d}/{d.year}",
+        "shortdate": f"{d.month:02d}/{d.day:02d}/{d.year % 100:02d}",
+        "longdate": f"{d:%b} {d.day}, {d.year}",
+        "julian": f"{d.timetuple().tm_yday:03d}",
+        "year": str(d.year),
+        "yy": f"{d.year % 100:02d}",
+        "month": f"{d.month:02d}",
+        "day": f"{d.day:02d}",
+        "weekday": f"{d:%a}",
+        "week": f"{d.isocalendar()[1]:02d}",
+    }[name]
+
+
+def fill_fields(text, now, count=1, copies=1):
+    """Replace the automatic fields in text. Anything in braces that isn't one is left alone."""
+    def sub(m):
+        name, offset = m.group(1).lower(), m.group(2)
+        if name not in FIELDS or (offset and name in _NOT_DATES):
+            return m.group(0)
+        return _field_value(name, int(offset or 0), now, count, copies)
+    return _FIELD.sub(sub, text)
+
+
+def unknown_fields(design):
+    """Things in braces that look like fields but aren't, e.g. {dat}."""
+    found = []
+    for e in design.elements:
+        for m in _FIELD.finditer(e.value if e.kind != "image" else ""):
+            name = m.group(1).lower()
+            if (name not in FIELDS or (m.group(2) and name in _NOT_DATES)) and m.group(0) not in found:
+                found.append(m.group(0))
+    return found
+
+
+def uses_count(design):
+    """Whether each copy differs ({count}), so copies have to be sent one by one."""
+    return any(e.kind != "image" and re.search(r"\{count\}", e.value, re.I) for e in design.elements)
+
+
+def filled(design, now, count=1, copies=1):
+    """A copy of the design with the automatic fields filled in."""
+    out = copy.deepcopy(design)
+    for e in out.elements:
+        if e.kind != "image":
+            e.value = fill_fields(e.value, now, count, copies)
+    return out
 
 
 # --------------------------------------------------------------------------

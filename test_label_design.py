@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import unittest
+from datetime import datetime
 
 import label_design as ld
 
@@ -227,6 +228,26 @@ class DesignStorageTests(unittest.TestCase):
     def test_from_text_trims_blank_edges(self):
         self.assertEqual([e.value for e in ld.Design.from_text("\n\nOne\n\nTwo\n\n").elements],
                          ["One", "", "Two"])
+
+
+class FieldTests(unittest.TestCase):
+    NOW = datetime(2026, 1, 2, 16, 5)
+
+    def test_dates(self):
+        fill = lambda text: ld.fill_fields(text, self.NOW)
+        self.assertEqual(fill("{date} {shortdate} {longdate}"), "01/02/2026 01/02/26 Jan 2, 2026")
+        self.assertEqual(fill("{yy}{julian} {year}-{month}-{day} {weekday} wk{week}"), "26002 2026-01-02 Fri wk01")
+        self.assertEqual(fill("{date+30} {julian-2} {DATE}"), "02/01/2026 365 01/02/2026")  # back into 2025
+        self.assertEqual(fill("{time}"), "4:05 PM")
+
+    def test_counts_and_unknowns(self):
+        self.assertEqual(ld.fill_fields("Box {count} of {copies}", self.NOW, 3, 12), "Box 3 of 12")
+        design = ld.Design([ld.Element("text", "{dat} {date} {time+1} {}"), ld.Element("barcode", "L{count}")])
+        self.assertEqual(ld.unknown_fields(design), ["{dat}", "{time+1}"])
+        self.assertTrue(ld.uses_count(design))
+        ready = ld.filled(design, self.NOW, 7)
+        self.assertEqual(ready.elements[1].value, "L7")
+        self.assertEqual(design.elements[1].value, "L{count}")  # the design itself keeps its fields
 
 
 if __name__ == "__main__":
