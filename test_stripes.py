@@ -307,7 +307,7 @@ class CompanyConfigTests(unittest.TestCase):
         self.assertIn("Couldn't read the company settings", cfg.problems[0])
 
     def test_no_config_anywhere(self):
-        with mock.patch.dict(os.environ, {"STRIPES_CONFIG": ""}), \
+        with mock.patch.object(zl, "configured_folder", return_value=None), \
                 mock.patch.object(zl, "local_folders", return_value=[self.tmp]):
             cfg = zl.load_company_config()
         self.assertEqual((cfg.printers, cfg.stock, cfg.problems), ([], [], []))
@@ -481,8 +481,9 @@ class DeploymentLogTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "missing")))
 
     def test_status_folder_sits_next_to_config(self):
-        with mock.patch.dict(os.environ, {"STRIPES_STATUS": "", "STRIPES_CONFIG": r"/srv/Software/Stripes/config"}):
-            self.assertEqual(zl.status_folder(), os.path.join("/srv/Software/Stripes", "status"))
+        config = os.path.join(self.dir, "Stripes", "config")
+        with mock.patch.dict(os.environ, {"STRIPES_STATUS": "", "STRIPES_CONFIG": config}):
+            self.assertEqual(zl.status_folder(), os.path.join(self.dir, "Stripes", "status"))
 
 
 if __name__ == "__main__":
