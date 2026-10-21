@@ -387,7 +387,7 @@ class MonitorTests(unittest.TestCase):
         snap = zl.PrinterSnapshot(p, None, reachable=True, status={"label_length_dots": 217},
                                   settings={"print_width": 406, "media": "gap"})
         self.assertEqual(zl.check_stock(p, stock, snap),
-                         ("2 x 1 in · printer measures 2.00 x 1.07 in, gap labels", None))  # within tolerance
+                         ("2.00 x 1.07 in, gap labels", None))  # within tolerance
         snap.status["label_length_dots"] = 320  # a longer label loaded
         snap.settings["media"] = "mark"
         text, problem = zl.check_stock(p, stock, snap)
