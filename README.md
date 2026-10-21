@@ -67,24 +67,26 @@ Keep your real files on the internal share, **not in this repo**.
 
 One computer GPO linked to the OU with the label-printing PCs:
 
-1. **Install and update the app**: *Computer Configuration > Preferences > Control Panel Settings >
-   Scheduled Tasks > New > Scheduled Task (At least Windows 7)*
-   - General: run as `NT AUTHORITY\SYSTEM`, **Run whether user is logged on or not**,
-     **Run with highest privileges**
-   - Triggers: **At startup** (delay 2 minutes) and **Daily** (random delay 1 hour)
-   - Action: Start a program `powershell.exe` with arguments
-     `-NoProfile -ExecutionPolicy Bypass -File "\\SERVER\Share\Stripes\Update-Stripes.ps1"`
+1. **Install and update the app** with [`deploy/Update-Stripes.ps1`](deploy/Update-Stripes.ps1). It
+   downloads the latest release into `C:\Program Files\Stripes`, checks its SHA-256 checksum, and does
+   nothing if it's already up to date (or if Stripes is open). It retries for a few minutes while the
+   network comes up. Log: `C:\ProgramData\Stripes\update.log`.
 
-   [`deploy/Update-Stripes.ps1`](deploy/Update-Stripes.ps1) downloads the latest release into
-   `C:\Program Files\Stripes`, checks its SHA-256 checksum, and does nothing if it's already
-   up to date. If Stripes is open, it tries again next run. Log: `C:\ProgramData\Stripes\update.log`.
+   Keep the script **inside the GPO** so only GPO editors can change it (it runs as SYSTEM on every PC):
+   *Computer Configuration > Policies > Windows Settings > Scripts > Startup > Show Files...*, copy
+   `Update-Stripes.ps1` there, then **Add...** on the *Scripts* tab:
+   - Script Name: `powershell.exe`
+   - Script Parameters: `-NoProfile -ExecutionPolicy Bypass -File "<path of that Show Files folder>\Update-Stripes.ps1"`
+
+   Startup scripts run at boot only. For daily updates without a reboot, run the same command from a
+   *Scheduled Task (At least Windows 7)* preference as `NT AUTHORITY\SYSTEM` instead.
 2. **Company settings location**: *Computer Configuration > Preferences > Windows Settings >
    Registry*, action **Update**: hive `HKEY_LOCAL_MACHINE`, key `SOFTWARE\Policies\Stripes`, value
    `ConfigPath` (REG_SZ) = `\\SERVER\Share\Stripes\config`
 3. **Shortcut**: *Computer Configuration > Preferences > Windows Settings > Shortcuts*, **All Users
    Desktop**, target `C:\Program Files\Stripes\Stripes.exe`
 
-Domain Computers need read access to the script; Domain Users need read access to the config folder.
+Domain Users need read access to the config folder; only IT should be able to change it.
 
 ## Releasing a new version
 
