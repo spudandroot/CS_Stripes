@@ -824,6 +824,48 @@ def save_template(folder, template):
     return path
 
 
+HISTORY_KEEP = 500
+
+
+def history_path():
+    return os.path.join(os.path.dirname(settings_path()), "history.jsonl")
+
+
+def add_history(entry, path=None):
+    """Append one print job to this user's history (one JSON object per line)."""
+    path = path or history_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+    if os.path.getsize(path) > 4_000_000:  # keep it small: drop the oldest
+        keep = read_history(path)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(e) + "\n" for e in reversed(keep[:HISTORY_KEEP // 2]))
+        os.replace(tmp, path)
+
+
+def read_history(path=None):
+    """The most recent print jobs, newest first."""
+    entries = []
+    try:
+        with open(path or history_path(), encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+            datetime.fromisoformat(e["at"])
+            ld.Design.from_dict(e["design"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+        entries.append(e)
+        if len(entries) >= HISTORY_KEEP:
+            break
+    return entries
+
+
 def _now():
     return datetime.now().isoformat(sep=" ", timespec="seconds")
 
@@ -1338,7 +1380,8 @@ class App(tk.Tk):
         self.recent_box = ttk.Combobox(recent_row, state="readonly")
         self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
         self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
-        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
+        ttk.Button(recent_row, text="History...", command=self.open_history).pack(side="left")
+        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left", padx=(4, 0))
         self._fill_recent()
         self._load_templates()
 
@@ -2185,6 +2228,34 @@ class App(tk.Tk):
 
     # ----- printing -----
 
+    def _prepare_job(self, design, p, now, copies, first=1, last=None, parent=None):
+        """Check a print job with the user and build its ZPL; None if they cancel or it can't print.
+
+        Labels with {count} differ per copy, so each is sent on its own: first..last of
+        `copies` (a reprint can redo just some of them). Others print `copies` at once.
+        """
+        parent = parent or self
+        label = printer_label(p)
+        if ld.uses_count(design):
+            numbers = range(first, (last or copies) + 1)
+            each = [self._rendered(design, label, now, n, copies) for n in numbers]
+        else:
+            each = [self._rendered(design, label, now, 1, copies)]
+        errors = list(dict.fromkeys(err for r in each for err in r.errors))
+        warnings = list(dict.fromkeys(w for r in each for w in r.warnings))
+        if errors:
+            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(errors), parent=parent)
+            return None
+        if warnings and not messagebox.askyesno(APP_NAME, "\n".join(warnings) + "\n\nPrint anyway?", parent=parent):
+            return None
+        count = len(each) if ld.uses_count(design) else copies
+        if count > CONFIRM_COPIES_OVER and not messagebox.askyesno(
+                APP_NAME, f"Print {count} labels on {p.name}?", parent=parent):
+            return None
+        if ld.uses_count(design):
+            return "".join(ld.build_zpl(r, p.shift_x, p.shift_y, 1) for r in each), count
+        return ld.build_zpl(each[0], p.shift_x, p.shift_y, copies), count
+
     def print_label(self):
         p = self.current_printer()
         if not p:
@@ -2198,32 +2269,17 @@ class App(tk.Tk):
         if copies is None:
             messagebox.showerror(APP_NAME, f"Copies must be a whole number from 1 to {MAX_COPIES}.", parent=self)
             return
-        now, label = datetime.now(), self.current_label()
-        rendered = self._rendered(design, label, now, 1, copies)
-        if ld.uses_count(design) and copies > 1:
-            # each copy is different, so send them one by one
-            each = [rendered] + [self._rendered(design, label, now, n, copies) for n in range(2, copies + 1)]
-            errors = list(dict.fromkeys(err for r in each for err in r.errors))
-            rendered.warnings = list(dict.fromkeys(w for r in each for w in r.warnings))
-        else:
-            each, errors = None, rendered.errors
-        if errors:
-            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(errors), parent=self)
+        now = datetime.now()
+        job = self._prepare_job(design, p, now, copies)
+        if not job:
             return
-        if rendered.warnings and not messagebox.askyesno(
-                APP_NAME, "\n".join(rendered.warnings) + "\n\nPrint anyway?", parent=self):
-            return
-        if copies > CONFIRM_COPIES_OVER and not messagebox.askyesno(
-                APP_NAME, f"Print {copies} labels on {p.name}?", parent=self):
-            return
-
-        if each:
-            zpl = "".join(ld.build_zpl(r, p.shift_x, p.shift_y, 1) for r in each)
-        else:
-            zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
+        zpl, count = job
+        stock = self.selected_stock()
+        entry = dict(at=now.isoformat(sep=" ", timespec="seconds"), printer=p.name, copies=copies,
+                     stock=stock.name if stock else "", width_in=p.width_in, height_in=p.height_in,
+                     design=design.to_dict())
         self.print_btn.configure(state="disabled")
         self.set_status(f"Sending to {p.name}...")
-        label_word = "label" if copies == 1 else "labels"
 
         def done(_result, error):
             self.print_btn.configure(state="normal")
@@ -2237,11 +2293,115 @@ class App(tk.Tk):
                 self._fill_stock()  # a non-default stock is a one-off; back to the printer's default
                 self.refresh()
                 note = " Label stock is back to the printer's default."
-            self.set_status(f"Sent {copies} {label_word} to {p.name}.{note}", "Ok.TLabel")
+            self.set_status(f"Sent {count} label{'s' if count != 1 else ''} to {p.name}.{note}", "Ok.TLabel")
             self._remember(design)
+            self._quiet(add_history, entry)
             self.check_status(quiet=True)
 
         self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
+
+    def open_history(self):
+        if getattr(self, "history", None) and self.history.winfo_exists():
+            self.history.deiconify()
+            self.history.lift()
+            self.history.refresh()
+            return
+        self.history = HistoryWindow(self)
+
+
+class HistoryWindow(tk.Toplevel):
+    """What this PC has printed, to open again or reprint."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Print history")
+        self.geometry("820x460")
+        self.transient(app)
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Labels printed from this PC, newest first. A reprint uses the original date and time "
+                              "for any date fields.", style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        cols = (("when", "When", 130), ("printer", "Printer", 130), ("copies", "Copies", 60), ("label", "Label", 420))
+        self.tree = ttk.Treeview(table, columns=[c[0] for c in cols], show="headings", selectmode="browse")
+        for key, title, width in cols:
+            self.tree.heading(key, text=title, anchor="w")
+            self.tree.column(key, width=width, anchor="w", stretch=key == "label")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", lambda e: self._open())
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Reprint...", command=self._reprint).pack(side="left")
+        ttk.Button(buttons, text="Open in editor", command=self._open).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        self.entries = []
+        self.refresh()
+
+    def refresh(self):
+        self.entries = read_history()
+        self.tree.delete(*self.tree.get_children())
+        for i, e in enumerate(self.entries):
+            self.tree.insert("", "end", iid=str(i), values=(
+                _short_time(e.get("at")), e.get("printer", ""), e.get("copies", ""),
+                self.app._recent_title(e.get("design") or {})))
+        if self.entries:
+            self.tree.selection_set("0")
+
+    def _selected(self):
+        sel = self.tree.selection()
+        return self.entries[int(sel[0])] if sel else None
+
+    def _open(self):
+        e = self._selected()
+        if e:
+            self.app._open_design(ld.Design.from_dict(copy.deepcopy(e["design"])))
+            self.app.lift()
+
+    def _reprint(self):
+        e = self._selected()
+        if not e:
+            return
+        printer = next((p for p in self.app.all_printers() if p.name == e.get("printer")), None)
+        if not printer:
+            messagebox.showerror(APP_NAME, f"The printer \"{e.get('printer')}\" isn't set up any more.", parent=self)
+            return
+        printer = replace(printer, width_in=e.get("width_in", printer.width_in),
+                          height_in=e.get("height_in", printer.height_in))
+        design = ld.Design.from_dict(copy.deepcopy(e["design"]))
+        copies = int(e.get("copies") or 1)
+        if ld.uses_count(design):
+            first = simpledialog.askinteger(APP_NAME, f"This label numbers its copies (1 to {copies}).\n"
+                                            "Reprint from number:", parent=self, initialvalue=1,
+                                            minvalue=1, maxvalue=copies)
+            if first is None:
+                return
+            last = simpledialog.askinteger(APP_NAME, "Up to number:", parent=self, initialvalue=first,
+                                           minvalue=first, maxvalue=copies)
+            if last is None:
+                return
+            job = self.app._prepare_job(design, printer, datetime.fromisoformat(e["at"]), copies, first, last, self)
+        else:
+            n = simpledialog.askinteger(APP_NAME, "How many copies?", parent=self, initialvalue=copies,
+                                        minvalue=1, maxvalue=MAX_COPIES)
+            if n is None:
+                return
+            job = self.app._prepare_job(design, printer, datetime.fromisoformat(e["at"]), n, parent=self)
+        if not job:
+            return
+        zpl, count = job
+
+        def done(_result, error):
+            if error:
+                messagebox.showerror(APP_NAME, f"Could not print on {printer.name}: {describe_error(error)}",
+                                     parent=self)
+                return
+            self.app.set_status(f"Reprinted {count} label{'s' if count != 1 else ''} on {printer.name}.", "Ok.TLabel")
+        self.app.bg.run(lambda: send_label(printer, zpl.encode("utf-8")), done)
 
 
 class PrinterMonitor(tk.Toplevel):

@@ -438,6 +438,21 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(zl.list_templates(os.path.join(d, "missing")), [])
 
 
+class HistoryTests(unittest.TestCase):
+    def test_add_and_read(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "history.jsonl")
+        design = ld.Design([ld.Element("text", "Box {count}")]).to_dict()
+        for n in range(3):
+            zl.add_history(dict(at=f"2026-10-2{n} 08:00:00", printer="ZTVolmLine", copies=n + 1, design=design), path)
+        with open(path, "a") as f:
+            f.write("{broken\n")
+        entries = zl.read_history(path)
+        self.assertEqual([e["copies"] for e in entries], [3, 2, 1])  # newest first, bad line skipped
+        self.assertEqual(zl.read_history(os.path.join(d, "none.jsonl")), [])
+
+
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
