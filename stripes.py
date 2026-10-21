@@ -73,6 +73,7 @@ class Printer:
     shift_x: int = 0   # nudge everything right (+) or left (-), in dots
     shift_y: int = 0   # nudge everything down (+) or up (-), in dots
     stock: str = ""    # id of the printer's default label stock (company printers)
+    monitor: bool = True  # shown in the Printer monitor (false for office printers)
 
     @property
     def dpmm(self):
@@ -244,6 +245,8 @@ def parse_config(folder):
                 raise ValueError("needs a host (IP address) or windows_name")
             if p.name in names:
                 raise ValueError("duplicate name")
+            if not isinstance(p.monitor, bool):
+                raise ValueError("monitor must be true or false")
         except (TypeError, ValueError) as e:
             problems.append(f"printers.json entry {i + 1} skipped: {e}")
             continue
@@ -2031,7 +2034,7 @@ class PrinterMonitor(tk.Toplevel):
     # ----- refreshing -----
 
     def printers(self):
-        return self.app.all_printers()
+        return [p for p in self.app.all_printers() if p.monitor]
 
     def _build_cards(self):
         for child in self.grid_frame.winfo_children():
@@ -2039,7 +2042,7 @@ class PrinterMonitor(tk.Toplevel):
         self.cards = {}
         printers = self.printers()
         if not printers:
-            tk.Label(self.grid_frame, text="No printers set up yet.", background="#f3f4f6",
+            tk.Label(self.grid_frame, text="No printers to monitor.", background="#f3f4f6",
                      foreground=self.MUTED).grid(row=0, column=0, pady=40)
         for p in printers:
             outer = tk.Frame(self.grid_frame, background=self.COLORS["wait"])

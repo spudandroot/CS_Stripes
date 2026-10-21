@@ -286,6 +286,13 @@ class CompanyConfigTests(unittest.TestCase):
         self.assertEqual([s.id for s in cfg.stock], ["s1"])
         self.assertEqual(len(cfg.problems), 8)
 
+    def test_monitor_flag(self):
+        cfg = self.load(self.folder(printers='{"printers": [{"name": "Office", "host": "192.0.2.1", "monitor": false},'
+                                             ' {"name": "Line", "host": "192.0.2.2"},'
+                                             ' {"name": "Typo", "host": "192.0.2.3", "monitor": "no"}]}'))
+        self.assertEqual([(p.name, p.monitor) for p in cfg.printers], [("Office", False), ("Line", True)])
+        self.assertIn("monitor must be true or false", cfg.problems[0])
+
     def test_stock_file_optional(self):
         cfg = self.load(self.folder(printers='{"printers": [{"name": "A", "host": "192.0.2.1"}]}'))
         self.assertEqual((cfg.problems, cfg.stock, [p.name for p in cfg.printers]), ([], [], ["A"]))
