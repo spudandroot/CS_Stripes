@@ -29,7 +29,7 @@ from datetime import datetime
 
 import tkinter as tk
 import tkinter.font
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 import label_design as ld
 
@@ -765,6 +765,65 @@ def status_folder():
     return os.path.join(os.path.dirname(os.path.normpath(config)), "status") if config else None
 
 
+def templates_folder():
+    """Shared label templates: a "templates" folder next to the config folder, if IT has
+    created it (everyone needs Modify on it to save). Otherwise templates stay on this PC."""
+    override = os.environ.get("STRIPES_TEMPLATES")
+    if override:
+        return override
+    config = configured_folder()
+    shared = os.path.join(os.path.dirname(os.path.normpath(config)), "templates") if config else None
+    if shared and os.path.isdir(shared):
+        return shared
+    return os.path.join(os.path.dirname(settings_path()), "templates")
+
+
+@dataclass
+class Template:
+    """A saved label: its design, and the label stock and copies to print it with."""
+    name: str
+    design: dict
+    stock: str = ""   # stock id, or "" for the printer's default
+    copies: int = 1
+    saved_by: str = ""
+    saved_at: str = ""
+    path: str = ""    # where it was read from (not saved)
+
+    @classmethod
+    def from_dict(cls, d):
+        t = _from_dict(cls, d)
+        if not isinstance(t.name, str) or not t.name.strip() or not isinstance(t.design, dict):
+            raise ValueError("not a template")
+        ld.Design.from_dict(t.design)  # check the design itself can be read
+        return t
+
+
+def list_templates(folder):
+    """Every readable template in the folder, by name. Missing folder: none."""
+    templates = []
+    for path in glob.glob(os.path.join(glob.escape(folder), "*.json")):
+        try:
+            t = Template.from_dict(_read_json(path))
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        t.path = path
+        templates.append(t)
+    return sorted(templates, key=lambda t: t.name.lower())
+
+
+def save_template(folder, template):
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, _safe_name(template.name.strip()) + ".json")
+    data = asdict(template)
+    data.pop("path")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+    template.path = path
+    return path
+
+
 def _now():
     return datetime.now().isoformat(sep=" ", timespec="seconds")
 
@@ -1264,14 +1323,24 @@ class App(tk.Tk):
         self._build_simple(simple)
         self._build_items(advanced)
         self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
+        template_row = ttk.Frame(left)
+        template_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(template_row, text="Template:").pack(side="left")
+        self.template_box = ttk.Combobox(template_row, state="readonly")
+        self.template_box.pack(side="left", fill="x", expand=True, padx=6)
+        self.template_box.bind("<<ComboboxSelected>>", lambda e: self._template_picked())
+        ttk.Button(template_row, text="Save...", command=self._save_template).pack(side="left")
+        ttk.Button(template_row, text="Delete", command=self._delete_template).pack(side="left", padx=(4, 0))
+        self.templates = []
         recent_row = ttk.Frame(left)
-        recent_row.pack(fill="x", pady=(8, 0))
+        recent_row.pack(fill="x", pady=(6, 0))
         ttk.Label(recent_row, text="Recent:").pack(side="left")
         self.recent_box = ttk.Combobox(recent_row, state="readonly")
         self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
         self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
         ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
         self._fill_recent()
+        self._load_templates()
 
         right = self.preview_frame = ttk.LabelFrame(body, text="Preview", padding=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -1850,6 +1919,9 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "That recent label couldn't be loaded.", parent=self)
             return
         self.recent_box.set("")
+        self._open_design(design)
+
+    def _open_design(self, design):
         text = design.simple_text()
         if text is not None:  # plain typed text: open it in the Simple tab
             self.simple_box.delete("1.0", "end")
@@ -1860,6 +1932,78 @@ class App(tk.Tk):
         self.v_auto_layout.set(design.auto_layout)
         self._fill_tree(select=[0] if design.elements else [])
         self.tabs.select(1)
+
+    # ----- templates -----
+
+    def _load_templates(self, select=None):
+        def done(result, error):
+            if error:
+                self.template_box.configure(values=[])
+                self.template_box.set("(couldn't read templates)")
+                return
+            self.templates = result
+            names = [t.name for t in result]
+            self.template_box.configure(values=names)
+            self.template_box.set(select if select in names else "")
+        self.bg.run(lambda: list_templates(templates_folder()), done)
+
+    def _template_picked(self):
+        i = self.template_box.current()
+        if not 0 <= i < len(self.templates):
+            return
+        t = self.templates[i]
+        self._open_design(ld.Design.from_dict(copy.deepcopy(t.design)))
+        for n, st in enumerate(self.stock_options):
+            if st and st.id == t.stock:
+                self.stock_box.current(n)
+                self._stock_changed()
+        self.copies_var.set(str(t.copies))
+        self.set_status(f"Template \"{t.name}\" loaded.")
+
+    def _save_template(self):
+        design = self.active_design()
+        if design.is_empty():
+            messagebox.showinfo(APP_NAME, "Make the label first, then save it as a template.", parent=self)
+            return
+        name = simpledialog.askstring(APP_NAME, "Template name:", parent=self,
+                                      initialvalue=self.template_box.get() if self.template_box.current() >= 0 else "")
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        folder = templates_folder()
+        same_file = os.path.join(folder, _safe_name(name) + ".json")
+        clash = next((t for t in self.templates if t.path == same_file or t.name.lower() == name.lower()), None)
+        if clash and not messagebox.askyesno(APP_NAME, f"Replace the template \"{clash.name}\"?", parent=self):
+            return
+        stock = self.selected_stock()
+        template = Template(name, design.to_dict(), stock.id if stock else "", self._copies() or 1,
+                            os.environ.get("USERNAME") or getpass.getuser(), _now())
+
+        def done(_path, error):
+            if error:
+                messagebox.showerror(APP_NAME, f"Couldn't save the template in {folder}:\n\n"
+                                     f"{describe_error(error)}", parent=self)
+                return
+            self.set_status(f"Saved template \"{name}\".", "Ok.TLabel")
+            self._load_templates(select=name)
+        self.bg.run(lambda: save_template(folder, template), done)
+
+    def _delete_template(self):
+        i = self.template_box.current()
+        if not 0 <= i < len(self.templates):
+            messagebox.showinfo(APP_NAME, "Pick the template to delete first.", parent=self)
+            return
+        t = self.templates[i]
+        if not messagebox.askyesno(APP_NAME, f"Delete the template \"{t.name}\"? Everyone who uses it will lose it.", parent=self):
+            return
+
+        def done(_result, error):
+            if error:
+                messagebox.showerror(APP_NAME, f"Couldn't delete it: {describe_error(error)}", parent=self)
+                return
+            self.set_status(f"Deleted template \"{t.name}\".")
+            self._load_templates()
+        self.bg.run(lambda: os.remove(t.path), done)
 
     def _remember(self, design):
         entry = design.to_dict()

@@ -419,6 +419,25 @@ class CheckPrinterTests(unittest.TestCase):
                          ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
 
+class TemplateTests(unittest.TestCase):
+    def test_save_and_list(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        design = ld.Design([ld.Element("text", "Packed {date}")])
+        zl.save_template(d, zl.Template("Pallet: Volm", design.to_dict(), "3x3-gap", 2, "john", "2026-10-21"))
+        zl.save_template(d, zl.Template("apples", design.to_dict()))
+        with open(os.path.join(d, "broken.json"), "w") as f:
+            f.write("{nope")
+        with open(os.path.join(d, "other.json"), "w") as f:
+            f.write('{"name": "x", "design": {"elements": [{"kind": "rocket"}]}}')
+        found = zl.list_templates(d)
+        self.assertEqual([t.name for t in found], ["apples", "Pallet: Volm"])  # bad files skipped
+        volm = found[1]
+        self.assertEqual((volm.stock, volm.copies, os.path.basename(volm.path)), ("3x3-gap", 2, "Pallet_Volm.json"))
+        self.assertEqual(ld.Design.from_dict(volm.design).elements[0].value, "Packed {date}")
+        self.assertEqual(zl.list_templates(os.path.join(d, "missing")), [])
+
+
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
