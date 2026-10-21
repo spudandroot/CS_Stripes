@@ -603,7 +603,7 @@ class App(tk.Tk):
         titles = ttk.Frame(header)
         titles.pack(side="left")
         ttk.Label(titles, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(titles, text="Arrow Farms label printing", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(titles, text="Zebra label printing", style="Muted.TLabel").pack(anchor="w")
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
         # Printer row
