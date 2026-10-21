@@ -9,9 +9,11 @@ A small Windows app for designing and printing labels on Zebra printers.
 - Barcodes (Code 128, Code 39, EAN-13, UPC-A) and QR codes are made by the printer, so they scan reliably.
 - **Label stock**: each printer has a default stock; pick another for a one-off print.
 - Prints straight to a printer's IP address (port 9100), or through a printer installed in Windows.
-- Shows whether the printer is ready, out of labels, paused or has the head open, and whether its
-  settings match the spec IT set for it. **Stripes never changes printer settings**: labels only
-  carry their content, so other software printing to the same printers isn't affected.
+- Shows whether the printer is ready, out of labels, paused or has the head open, and whether the
+  labels loaded are the size of the label stock. **Stripes never changes printer settings**: labels
+  only carry their content, so other software printing to the same printers isn't affected.
+- **Printer monitor** shows every printer at once: problems and what to do about them first, then
+  which printer it is, with everything else behind **More info**.
 
 Download the latest `Stripes.exe` from **[Releases](../../releases/latest)**. It's a single file;
 nothing to install.
@@ -22,7 +24,7 @@ IT keeps two files in a folder on a server share:
 
 | File | What's in it |
 |---|---|
-| `printers.json` | Each printer: name, IP, model, dpi, default stock, and the settings it should have |
+| `printers.json` | Each printer: name, IP, model, dpi and default label stock |
 | `stock.json` | Each kind of label roll: size and media type |
 
 Stripes finds the folder through a registry value set by Group Policy (so the server's name never
@@ -58,7 +60,6 @@ See [`examples/config`](examples/config) for the format.
 | `model` | no | e.g. `ZD420`, `ZT410` |
 | `dpi` | no | 203, 300 or 600. Zebra's "200 dpi" is 203 |
 | `stock` | no | `id` of the default label stock |
-| `expected` | no | How the printer should be set up: `print_width` (dots), `media`, `print_mode` (`tear-off`, `peel-off`), `darkness`, `speed`. Compared with what the printer reports; never sent to it |
 | `shift_x`, `shift_y` | no | Nudge the print position, in dots (8 dots = 1 mm at 203 dpi) |
 
 Keep your real files on the internal share, **not in this repo**.

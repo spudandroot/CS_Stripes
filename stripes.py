@@ -73,7 +73,6 @@ class Printer:
     shift_x: int = 0   # nudge everything right (+) or left (-), in dots
     shift_y: int = 0   # nudge everything down (+) or up (-), in dots
     stock: str = ""    # id of the printer's default label stock (company printers)
-    expected: dict = field(default_factory=dict)  # how the printer should be set up; checked, never sent
 
     @property
     def dpmm(self):
@@ -245,8 +244,6 @@ def parse_config(folder):
                 raise ValueError("needs a host (IP address) or windows_name")
             if p.name in names:
                 raise ValueError("duplicate name")
-            if not isinstance(p.expected, dict):
-                raise ValueError("expected must be a {...} object")
         except (TypeError, ValueError) as e:
             problems.append(f"printers.json entry {i + 1} skipped: {e}")
             continue
@@ -421,42 +418,6 @@ def query_status(host, port, timeout=3):
     return status_problems(query_status_details(host, port, timeout))
 
 
-# Lines of the printer's configuration report (^HH) that we compare with the spec.
-_REPORT_FIELDS = {
-    "DARKNESS": "darkness",
-    "PRINT SPEED": "speed",
-    "PRINT MODE": "print_mode",
-    "MEDIA TYPE": "media",
-    "PRINT WIDTH": "print_width",
-}
-_REPORT_MEDIA = {"GAP/NOTCH": "gap", "NON-CONTINUOUS": "gap", "WEB": "gap", "MARK": "mark",
-                 "BLACK MARK": "mark", "CONTINUOUS": "continuous"}
-
-
-def parse_config_report(text):
-    """Pull the settings we care about out of a ^HH configuration report.
-
-    Report lines look like "  +10.0               DARKNESS" (value, then name).
-    Anything unrecognised is skipped, so an unexpected format just means fewer checks.
-    """
-    found = {}
-    for line in text.splitlines():
-        m = re.match(r"^\s*(\S.*?)\s{2,}([A-Z][A-Z0-9 ./-]*?)\s*$", line)
-        if not m or m.group(2) not in _REPORT_FIELDS:
-            continue
-        key, value = _REPORT_FIELDS[m.group(2)], m.group(1).strip().upper()
-        number = re.match(r"[+-]?\d+(\.\d+)?", value)
-        if key in ("darkness", "speed") and number:
-            found[key] = float(number.group())
-        elif key == "print_width" and number:
-            found[key] = int(float(number.group()))
-        elif key == "print_mode":
-            found[key] = value.lower().replace(" ", "-")  # TEAR OFF -> tear-off
-        elif key == "media":
-            found[key] = _REPORT_MEDIA.get(value, value.lower())
-    return found
-
-
 def parse_config_lines(text):
     """Every "value   NAME" line of a ^HH configuration report, in order, as (name, value)."""
     found = []
@@ -481,11 +442,6 @@ def query_config_report(host, port, timeout=4):
         except socket.timeout:
             pass
     return reply.decode("ascii", "replace")
-
-
-def query_config(host, port, timeout=4):
-    """The settings we compare with the spec, from the configuration report."""
-    return parse_config_report(query_config_report(host, port, timeout))
 
 
 # Device details that Link-OS printers (ZD, ZT, ...) report over Set-Get-Do. Read-only.
@@ -527,42 +483,16 @@ def query_sgd(host, port, names, timeout=4):
             for name, value in zip(names, values)}
 
 
-_SPEC_LABELS = {"darkness": "Darkness", "speed": "Speed", "print_mode": "Print mode",
-                "media": "Media type", "print_width": "Print width"}
+def check_printer(printer, stock=None):
+    """Status problems, and whether the labels loaded look like `stock`.
 
-
-def spec_differences(expected, actual):
-    """Human-readable differences between a printer's spec and what it reports."""
-    diffs = []
-    for key, label in _SPEC_LABELS.items():
-        if key not in expected or key not in actual:
-            continue
-        want, have = expected[key], actual[key]
-        if isinstance(have, (int, float)):
-            try:
-                same = abs(float(want) - have) < 0.05
-            except (TypeError, ValueError):
-                same = False
-        else:
-            same = str(want).strip().lower().replace(" ", "-") == have
-        if not same:
-            diffs.append(f"{label} is {have:g}" if isinstance(have, float) else f"{label} is {have}")
-            diffs[-1] += f" (spec says {want})"
-    return diffs
-
-
-def check_printer(printer):
-    """Status problems, plus spec differences for company printers with a spec.
-
-    Returns (problems, differences); differences is None when not checked.
+    Returns (problems, label problem or None). Only printers we know the IP of can say
+    how long their labels are.
     """
-    problems = printer_problems(printer)
-    if not (printer.expected and printer.host):
-        return problems, None
-    try:
-        return problems, spec_differences(printer.expected, query_config(printer.host, printer.port))
-    except OSError:
-        return problems, None
+    if not printer.host:
+        return windows_printer_problems(printer.windows_name), None
+    details = query_status_details(printer.host, printer.port)
+    return status_problems(details), check_label_length(printer, stock, details.get("label_length_dots"))
 
 
 def describe_error(exc):
@@ -702,8 +632,6 @@ class PrinterSnapshot:
     status: dict = field(default_factory=dict)    # from ~HS
     problems: list = field(default_factory=list)
     report: list = field(default_factory=list)    # (name, value) lines of the configuration report
-    settings: dict = field(default_factory=dict)  # the ones compared with the spec
-    diffs: list = None                             # None when there's no spec to compare with
     info: dict = field(default_factory=dict)      # Set-Get-Do device details
     queue_jobs: int = None                         # jobs in the Windows print queue
     response_ms: int = None
@@ -728,41 +656,24 @@ class PrinterSnapshot:
             return self.problems[0], "bad"
         if self.status.get("labels_remaining") or self.status.get("formats_waiting"):
             return "Printing", "busy"
-        if self.diffs:
-            return "Ready (differs from spec)", "warn"
         return "Ready", "ok"
 
 
-STOCK_TOLERANCE_IN = 0.25  # measured label sizes vary a little (gaps, calibration)
-_MEDIA_NAMES = {"gap": "gap labels", "mark": "black mark labels", "continuous": "continuous media"}
+# Zebras measure labels from the start of one to the start of the next, so the length they
+# report includes the gap: 1 in labels on a 0.07 in gap measure 1.07 in.
+LABEL_GAP_ALLOWANCE_IN = 0.25
+LABEL_SHORT_ALLOWANCE_IN = 0.1  # calibration varies a little
 
 
-def check_stock(printer, stock, snap):
-    """Compare the label stock a printer should have with what the printer itself reports.
-
-    Returns (what the printer measured, problem or None), e.g.
-    ("3.00 x 3.07 in, gap labels", None).
-    """
-    dots_per_inch = printer.dpmm * 25.4
-    width = snap.settings.get("print_width")
-    length = snap.status.get("label_length_dots")
-    media = snap.settings.get("media")
-    measured = []
-    if width and length:
-        measured.append(f"{width / dots_per_inch:.2f} x {length / dots_per_inch:.2f} in")
-    if media:
-        measured.append(_MEDIA_NAMES.get(media, media))
-    measured = ", ".join(measured)
-    if not stock:
-        return measured, None
-    off = []
-    if width and abs(width / dots_per_inch - stock.width_in) > STOCK_TOLERANCE_IN:
-        off.append(f"printer is set {width / dots_per_inch:.2f} in wide")
-    if length and media != "continuous" and abs(length / dots_per_inch - stock.height_in) > STOCK_TOLERANCE_IN:
-        off.append(f"printer measures labels {length / dots_per_inch:.2f} in long")
-    if media and stock.media and media != stock.media and "media" not in printer.expected:
-        off.append(f"printer is set for {_MEDIA_NAMES.get(media, media)}")
-    return measured, (f"Doesn't look like {stock.name}: " + "; ".join(off)) if off else None
+def check_label_length(printer, stock, length_dots):
+    """Whether the labels a printer measured look like `stock`: None if so (or we can't tell),
+    otherwise what's wrong, e.g. "Labels loaded are 1.57 in long, not 2 x 1 in"."""
+    if not (stock and length_dots) or stock.media == "continuous":
+        return None
+    length = length_dots / (printer.dpmm * 25.4)
+    if -LABEL_SHORT_ALLOWANCE_IN <= length - stock.height_in <= LABEL_GAP_ALLOWANCE_IN:
+        return None
+    return f"Labels loaded are {length:.2f} in long, not {stock.name}"
 
 
 def windows_queue_jobs(windows_name):
@@ -797,11 +708,9 @@ def inspect_printer(printer):
     snap.problems = status_problems(snap.status)
     try:
         text = query_config_report(printer.host, printer.port)
-        snap.report, snap.settings = parse_config_lines(text), parse_config_report(text)
+        snap.report = parse_config_lines(text)
     except OSError:
         pass
-    if printer.expected and snap.settings:
-        snap.diffs = spec_differences(printer.expected, snap.settings)
     if is_link_os(printer):
         try:
             snap.info = query_sgd(printer.host, printer.port, SGD_INFO)
@@ -1497,6 +1406,7 @@ class App(tk.Tk):
 
     def _stock_changed(self):
         self._update_info()
+        self.check_status(quiet=True)  # are those labels the ones loaded?
         self.refresh()
 
     def _update_info(self):
@@ -1540,19 +1450,16 @@ class App(tk.Tk):
                 if not quiet:
                     messagebox.showwarning(APP_NAME, f"{p.name}: {describe_error(error)}", parent=self)
                 return
-            problems, diffs = result
+            problems, wrong_labels = result
             if problems:
                 self.printer_status.configure(text=", ".join(problems), style="Bad.TLabel")
-            elif diffs:
-                self.printer_status.configure(text="Ready (differs from spec)", style="Warn.TLabel")
+            elif wrong_labels:
+                self.printer_status.configure(text=wrong_labels, style="Warn.TLabel")
             else:
                 self.printer_status.configure(text="Ready", style="Ok.TLabel")
-            if diffs and not quiet:
-                messagebox.showinfo(APP_NAME, f"{p.name}'s settings differ from its spec:\n\n- "
-                                    + "\n- ".join(diffs) + "\n\nLabels still print; tell IT if they look wrong.",
-                                    parent=self)
 
-        self.bg.run(lambda: check_printer(p), done)
+        stock = self.selected_stock()
+        self.bg.run(lambda: check_printer(p, stock), done)
 
     def open_monitor(self):
         if getattr(self, "monitor", None) and self.monitor.winfo_exists():
@@ -2066,8 +1973,7 @@ class PrinterMonitor(tk.Toplevel):
              "Receive buffer full": "Wait for it to finish, or turn it off and on.",
              "Printer memory error": "Turn the printer off and on.",
              "Not reachable": "Check that it's turned on and its network cable is plugged in."}
-    SPEC_FIX = "Change it on the printer's menu (Stripes never changes printer settings)."
-    STOCK_FIX = "Load the right roll, then calibrate the printer so it measures it again."
+    LABEL_FIX = "Load the right roll, then calibrate the printer so it measures it again."
     URGENCY = {"bad": 0, "off": 1, "warn": 2}  # cards with problems go first; the rest keep their order
 
     REFRESH = {"Every 5 seconds": 5, "Every 10 seconds": 10, "Every 30 seconds": 30, "Every minute": 60, "Off": 0}
@@ -2213,10 +2119,11 @@ class PrinterMonitor(tk.Toplevel):
         for child in body.winfo_children():
             child.destroy()
         stock = next((st for st in self.app.cfg.stock if st.id == p.stock), None)
-        stock_problem = check_stock(p, stock, snap)[1] if snap and snap.reachable else None
+        wrong_labels = (check_label_length(p, stock, snap.status.get("label_length_dots"))
+                        if snap and snap.reachable else None)
         state, kind = snap.state if snap else ("Checking...", "wait")
-        if stock_problem and kind == "ok":
-            state, kind = "Check label stock", "warn"
+        if wrong_labels and kind == "ok":
+            state, kind = "Wrong labels?", "warn"
         outer.configure(background=self.COLORS[kind])
         self.kinds[p.name] = kind
 
@@ -2230,11 +2137,8 @@ class PrinterMonitor(tk.Toplevel):
         if snap is not None:
             # Each problem, then what to do about it
             issues = [(t, "bad", "bold", self.FIXES.get(t)) for t in snap.problems]
-            issues += [(t, "warn", "normal", None) for t in (snap.diffs or [])]
-            if snap.diffs:
-                issues[-1] = issues[-1][:3] + (self.SPEC_FIX,)
-            if stock_problem:
-                issues.append((stock_problem, "warn", "normal", self.STOCK_FIX))
+            if wrong_labels:
+                issues.append((wrong_labels, "warn", "normal", self.LABEL_FIX))
             if not snap.reachable:
                 issues.append((snap.error or "No answer.", "off", "normal", self.FIXES["Not reachable"]))
             for text, color, weight, fix in issues:
@@ -2328,15 +2232,12 @@ class PrinterMonitor(tk.Toplevel):
             rows.append(("Sensor", sensor.title()))
         if st:
             rows.append(("Printing method", "Ribbon" if st.get("thermal_transfer") else "Direct thermal"))
-        width = snap.settings.get("print_width")
+        width = re.match(r"\d+", report.get("PRINT WIDTH", "").strip())
         if width:
-            rows.append(("Print width", f"{width} dots ({width / dots_per_inch:.2f} in)"))
+            rows.append(("Print width", f"{int(width.group()) / dots_per_inch:.2f} in"))
         length = st.get("label_length_dots")
         if length:
-            rows.append(("Label length", f"{length} dots ({length / dots_per_inch:.2f} in)"))
-        measured = check_stock(p, None, snap)[0]
-        if measured:
-            rows.append(("Printer measures", measured))
+            rows.append(("Label length", f"{length / dots_per_inch:.2f} in, with the gap"))
         for key, label in (("appl.name", "Firmware"), ("device.uptime", "Up for"),
                            ("interface.network.active.mac_addr", "MAC address"),
                            ("device.friendly_name", "Name on printer")):
@@ -2344,8 +2245,6 @@ class PrinterMonitor(tk.Toplevel):
                 rows.append((label, info[key]))
         if "appl.name" not in info and report.get("FIRMWARE"):
             rows.append(("Firmware", report["FIRMWARE"].replace("<-", "").strip()))
-        if snap.diffs == []:
-            rows.append(("Spec", "Matches"))
         return rows
 
     @staticmethod
