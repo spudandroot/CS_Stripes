@@ -10,7 +10,6 @@ import gc
 import getpass
 import glob
 import hashlib
-import io
 import json
 import os
 import platform
@@ -25,13 +24,12 @@ import time
 import queue
 import urllib.error
 import urllib.request
-import zipfile
 from dataclasses import dataclass, asdict, field, fields, replace
 from datetime import datetime
 
 import tkinter as tk
 import tkinter.font
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, filedialog
 
 import label_design as ld
 
@@ -157,7 +155,6 @@ def load_settings():
         "printers": printers,
         "last_printer": data.get("last_printer"),
         "recent": data.get("recent", []),
-        "alerts": data.get("alerts") is True,
     }
 
 
@@ -768,107 +765,6 @@ def status_folder():
     return os.path.join(os.path.dirname(os.path.normpath(config)), "status") if config else None
 
 
-def templates_folder():
-    """Shared label templates: a "templates" folder next to the config folder, if IT has
-    created it (everyone needs Modify on it to save). Otherwise templates stay on this PC."""
-    override = os.environ.get("STRIPES_TEMPLATES")
-    if override:
-        return override
-    config = configured_folder()
-    shared = os.path.join(os.path.dirname(os.path.normpath(config)), "templates") if config else None
-    if shared and os.path.isdir(shared):
-        return shared
-    return os.path.join(os.path.dirname(settings_path()), "templates")
-
-
-@dataclass
-class Template:
-    """A saved label: its design, and the label stock and copies to print it with."""
-    name: str
-    design: dict
-    stock: str = ""   # stock id, or "" for the printer's default
-    copies: int = 1
-    saved_by: str = ""
-    saved_at: str = ""
-    path: str = ""    # where it was read from (not saved)
-
-    @classmethod
-    def from_dict(cls, d):
-        t = _from_dict(cls, d)
-        if not isinstance(t.name, str) or not t.name.strip() or not isinstance(t.design, dict):
-            raise ValueError("not a template")
-        ld.Design.from_dict(t.design)  # check the design itself can be read
-        return t
-
-
-def list_templates(folder):
-    """Every readable template in the folder, by name. Missing folder: none."""
-    templates = []
-    for path in glob.glob(os.path.join(glob.escape(folder), "*.json")):
-        try:
-            t = Template.from_dict(_read_json(path))
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-        t.path = path
-        templates.append(t)
-    return sorted(templates, key=lambda t: t.name.lower())
-
-
-def save_template(folder, template):
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, _safe_name(template.name.strip()) + ".json")
-    data = asdict(template)
-    data.pop("path")
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
-    template.path = path
-    return path
-
-
-HISTORY_KEEP = 500
-
-
-def history_path():
-    return os.path.join(os.path.dirname(settings_path()), "history.jsonl")
-
-
-def add_history(entry, path=None):
-    """Append one print job to this user's history (one JSON object per line)."""
-    path = path or history_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
-    if os.path.getsize(path) > 4_000_000:  # keep it small: drop the oldest
-        keep = read_history(path)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(e) + "\n" for e in reversed(keep[:HISTORY_KEEP // 2]))
-        os.replace(tmp, path)
-
-
-def read_history(path=None):
-    """The most recent print jobs, newest first."""
-    entries = []
-    try:
-        with open(path or history_path(), encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
-        return []
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-            datetime.fromisoformat(e["at"])
-            ld.Design.from_dict(e["design"])
-        except (ValueError, TypeError, KeyError, AttributeError):
-            continue
-        entries.append(e)
-        if len(entries) >= HISTORY_KEEP:
-            break
-    return entries
-
-
 def _now():
     return datetime.now().isoformat(sep=" ", timespec="seconds")
 
@@ -928,7 +824,7 @@ class DeploymentLog:
     def started(self, version, exe):
         previous = self.read().get("version")
         fields = dict(version=version, exe=exe, last_start=_now(), running=True, pending_update=None,
-                      windows=platform.platform(), layout=running_layout())
+                      windows=platform.platform())
         if previous is None:
             event = f"Installed ({version})"
         elif previous != version:
@@ -1059,117 +955,32 @@ def folder_is_writable(folder):
         return False
 
 
-# Releases come two ways: Stripes.exe on its own (unpacks itself to a temp folder on
-# every start, which is slow) and Stripes-app.zip: the same program already unpacked, as
-# Stripes.exe plus a "Stripes-<version>" folder next to it, which starts much faster.
-# Copies install the zip when there is one; the single exe is what Group Policy hands out
-# and what older copies know how to download.
-APP_ZIP = "Stripes-app.zip"
-CONTENTS_PREFIX = "Stripes-"
+def install_update(version, exe_path, fetch=_fetch):
+    """Download a release and put it in place of exe_path, for the next start.
 
-
-def running_layout():
-    """'onedir' (the fast, unpacked install), 'onefile', or None when run from source."""
-    if not getattr(sys, "frozen", False):
-        return None
-    unpacked = os.path.dirname(os.path.normpath(getattr(sys, "_MEIPASS", "")))
-    same = os.path.normcase(unpacked) == os.path.normcase(os.path.dirname(sys.executable))
-    return "onedir" if same else "onefile"
-
-
-def _download_checked(base, name, fetch):
-    data = fetch(f"{base}/{name}", timeout=600)
-    expected = fetch(f"{base}/{name}.sha256").decode("ascii", "replace").strip().upper()
+    Windows lets a running program be renamed but not overwritten, so the
+    running exe is moved aside (Stripes.exe.old-...) and the new one takes its
+    name. Old copies are cleaned up on a later start.
+    """
+    base = f"{UPDATE_URL}/download/{version}"
+    data = fetch(f"{base}/Stripes.exe", timeout=600)
+    expected = fetch(f"{base}/Stripes.exe.sha256").decode("ascii", "replace").strip().upper()
     if hashlib.sha256(data).hexdigest().upper() != expected:
         raise ValueError("the download was damaged (checksum mismatch)")
-    return data
-
-
-def _swap_exe(new, exe_path):
-    """Windows lets a running program be renamed but not overwritten, so the running exe
-    is moved aside (Stripes.exe.old-...) and the new one takes its name. Old copies are
-    cleaned up on a later start."""
+    new = exe_path + ".new"
+    with open(new, "wb") as f:
+        f.write(data)
     if os.path.exists(exe_path):
         os.replace(exe_path, f"{exe_path}.old-{int(time.time() * 1000)}")
     os.replace(new, exe_path)
 
 
-def _remove_folder(path):
-    """Delete a folder, but only if nothing in it is in use: renaming fails on Windows
-    while a program is running from it, so a copy still open is left alone."""
-    doomed = f"{path}.delete-{int(time.time() * 1000)}"
-    os.rename(path, doomed)
-    shutil.rmtree(doomed, ignore_errors=True)
-
-
-def install_update(version, exe_path, fetch=_fetch, layout_only=False):
-    """Download a release and put it in place of exe_path, for the next start.
-
-    Uses the unpacked build (Stripes-app.zip) when the release has one. layout_only:
-    only install that (to switch this version to the faster layout); returns False
-    if the release doesn't have it.
-    """
-    base = f"{UPDATE_URL}/download/{version}"
-    try:
-        data = _download_checked(base, APP_ZIP, fetch)
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-        data = None  # an older release: single exe only
-    folder = os.path.dirname(exe_path)
-    if data is None:
-        if layout_only:
-            return False
-        data = _download_checked(base, "Stripes.exe", fetch)
-        new = exe_path + ".new"
-        with open(new, "wb") as f:
-            f.write(data)
-        _swap_exe(new, exe_path)
-        return True
-
-    staging = os.path.join(folder, f".staging-{int(time.time() * 1000)}")
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            root = os.path.realpath(staging)
-            for name in z.namelist():
-                if not os.path.realpath(os.path.join(staging, name)).startswith(root + os.sep):
-                    raise ValueError("the download isn't a Stripes build")
-            z.extractall(staging)
-        contents = [d for d in os.listdir(staging)
-                    if d.startswith(CONTENTS_PREFIX) and os.path.isdir(os.path.join(staging, d))]
-        new = os.path.join(staging, "Stripes.exe")
-        if len(contents) != 1 or not os.path.isfile(new):
-            raise ValueError("the download isn't a Stripes build")
-        target = os.path.join(folder, contents[0])
-        if os.path.exists(target):
-            _remove_folder(target)  # a half-finished earlier attempt
-        os.replace(os.path.join(staging, contents[0]), target)
-        _swap_exe(new, exe_path)
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    return True
-
-
-def remove_old_versions(exe_path, keep=None):
-    """Clean up what earlier updates left behind: old exes, and unpacked versions
-    other than `keep` (the one running) that nothing is using any more."""
-    folder = os.path.dirname(exe_path)
+def remove_old_versions(exe_path):
     for old in glob.glob(glob.escape(exe_path) + ".old-*") + [exe_path + ".new"]:
         try:
             os.remove(old)
         except OSError:
             pass  # still running in another window; next time
-    for path in glob.glob(os.path.join(glob.escape(folder), CONTENTS_PREFIX + "*")) + \
-            glob.glob(os.path.join(glob.escape(folder), ".staging-*")):
-        if not os.path.isdir(path) or (keep and os.path.normcase(path) == os.path.normcase(keep)):
-            continue
-        try:
-            if ".delete-" in os.path.basename(path) or os.path.basename(path).startswith(".staging-"):
-                shutil.rmtree(path)
-            else:
-                _remove_folder(path)
-        except OSError:
-            pass
 
 
 # --------------------------------------------------------------------------
@@ -1274,8 +1085,7 @@ class App(tk.Tk):
         self._updates_started = not getattr(sys, "frozen", False)  # only the built .exe updates itself
         if not self._updates_started:
             remove_download_mark(sys.executable)
-            remove_old_versions(sys.executable,
-                                keep=getattr(sys, "_MEIPASS", None) if running_layout() == "onedir" else None)
+            remove_old_versions(sys.executable)
             if not self.config_folder:
                 self.after(3000, self._start_updates)
             # otherwise once the server's settings arrive, since they say who's on beta
@@ -1283,9 +1093,6 @@ class App(tk.Tk):
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
-        self.alerts = PrinterAlerts(self)
-        if self.settings["alerts"]:
-            self.after(5000, self.alerts.start)  # once the server's printer list is in
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ----- deployment log -----
@@ -1328,11 +1135,6 @@ class App(tk.Tk):
         def work():
             latest = check_for_update(beta=beta)
             if not latest:
-                # Nothing newer: switch a single-exe copy to the faster unpacked layout
-                if running_layout() == "onefile" and parse_version(VERSION) and \
-                        folder_is_writable(os.path.dirname(exe)) and \
-                        install_update(VERSION, exe, layout_only=True):
-                    return "faster", VERSION
                 return None
             if not folder_is_writable(os.path.dirname(exe)):
                 return "available", latest
@@ -1347,12 +1149,7 @@ class App(tk.Tk):
                 self.after(UPDATE_CHECK_HOURS * 3600 * 1000, self._check_for_update)
                 return
             kind, version = result
-            if kind == "faster":
-                self._log(lambda log: log.write("Set up to start faster; finishes when Stripes restarts",
-                                                pending_update=version, last_update_error=None))
-                self.update_label.configure(text="Stripes will start faster after a restart.", style="Ok.TLabel")
-                self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
-            elif kind == "installed":
+            if kind == "installed":
                 self._log(lambda log: log.write(f"Downloaded {version}; finishes when Stripes restarts",
                                                 pending_update=version, last_update_error=None))
                 self.update_label.configure(text=f"Stripes {display_version(version)} is ready.", style="Ok.TLabel")
@@ -1467,25 +1264,14 @@ class App(tk.Tk):
         self._build_simple(simple)
         self._build_items(advanced)
         self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
-        template_row = ttk.Frame(left)
-        template_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(template_row, text="Template:").pack(side="left")
-        self.template_box = ttk.Combobox(template_row, state="readonly")
-        self.template_box.pack(side="left", fill="x", expand=True, padx=6)
-        self.template_box.bind("<<ComboboxSelected>>", lambda e: self._template_picked())
-        ttk.Button(template_row, text="Save...", command=self._save_template).pack(side="left")
-        ttk.Button(template_row, text="Delete", command=self._delete_template).pack(side="left", padx=(4, 0))
-        self.templates = []
         recent_row = ttk.Frame(left)
-        recent_row.pack(fill="x", pady=(6, 0))
+        recent_row.pack(fill="x", pady=(8, 0))
         ttk.Label(recent_row, text="Recent:").pack(side="left")
         self.recent_box = ttk.Combobox(recent_row, state="readonly")
         self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
         self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
-        ttk.Button(recent_row, text="History...", command=self.open_history).pack(side="left")
-        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left", padx=(4, 0))
+        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
         self._fill_recent()
-        self._load_templates()
 
         right = self.preview_frame = ttk.LabelFrame(body, text="Preview", padding=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -1505,10 +1291,8 @@ class App(tk.Tk):
         bottom.pack(fill="x", pady=(12, 0))
         ttk.Label(bottom, text="Copies:", font=("Segoe UI", 11)).pack(side="left")
         self.copies_var = tk.StringVar(value="1")
-        self.copies_var.trace_add("write", lambda *a: self.refresh())  # {copies} on the preview
         ttk.Spinbox(bottom, from_=1, to=MAX_COPIES, width=6, textvariable=self.copies_var,
                     font=("Segoe UI", 11)).pack(side="left", padx=6)
-        self._build_field_menu(bottom).pack(side="left", padx=(12, 0))
         ttk.Button(bottom, text="Exact preview (online)", command=self.exact_preview).pack(side="left", padx=12)
         self.print_btn = ttk.Button(bottom, text="Print", style="Print.TButton", command=self.print_label)
         self.print_btn.pack(side="right")
@@ -1516,62 +1300,11 @@ class App(tk.Tk):
         self.status = ttk.Label(outer, text="Ready. Tip: Ctrl+P prints.", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(8, 0))
 
-    def _build_field_menu(self, parent):
-        """'Insert field' menu: dates, Julian date, copy numbers... filled in when the label prints."""
-        button = ttk.Menubutton(parent, text="Insert field")
-        menu = tk.Menu(button, tearoff=False)
-        for name, (what, example) in ld.FIELDS.items():
-            menu.add_command(label=f"{what}  ({example})", command=lambda n=name: self._insert_field("{%s}" % n))
-        menu.add_separator()
-        menu.add_command(label="Help with fields...", command=self._field_help)
-        button["menu"] = menu
-        self._typing_in = None
-        return button
-
-    def _insert_field(self, token):
-        widget = self._typing_in
-        if self.in_simple_mode() or widget is None:
-            widget = self.simple_box if self.in_simple_mode() else self.value_entry
-        chosen = self.selected_elements()
-        if widget is self.value_entry and (len(chosen) != 1 or chosen[0].kind == "image"):
-            messagebox.showinfo(APP_NAME, "Select a text line, barcode or QR code first.", parent=self)
-            return
-        widget.insert("insert", token)
-        widget.focus_set()
-
-    def _field_help(self):
-        lines = [f"{{{name}}}    {what}, e.g. {example}" for name, (what, example) in ld.FIELDS.items()]
-        messagebox.showinfo(APP_NAME, "Fields are filled in when the label prints:\n\n" + "\n".join(lines) +
-                            "\n\nDates can be moved by days: {date+3} is 3 days from today, {julian-1} is "
-                            "yesterday's Julian date.\n\n{count} numbers each copy, e.g. \"Box {count} of "
-                            "{copies}\". Fields work in text, barcodes and QR codes.", parent=self)
-
-    def _rendered(self, design, label, now=None, count=1, copies=1):
-        """Render a design with its fields filled in. With auto layout, the items' boxes
-        are copied back so selecting and dragging on the preview still lines up."""
-        ready = ld.filled(design, now or datetime.now(), count, copies)
-        rendered = ld.render(ready, label)
-        if design.auto_layout:
-            for e, f in zip(design.elements, ready.elements):
-                e.x, e.y, e.w, e.h = f.x, f.y, f.w, f.h
-        unknown = ld.unknown_fields(design)
-        if unknown:
-            rendered.warnings.append(f"Not a field (prints as typed): {', '.join(unknown)}")
-        return rendered
-
-    def _copies(self):
-        try:
-            copies = int(self.copies_var.get())
-        except ValueError:
-            return None
-        return copies if 1 <= copies <= MAX_COPIES else None
-
     def _build_simple(self, parent):
         ttk.Label(parent, text="Type your label, one line per row:").pack(anchor="w")
         self.simple_box = tk.Text(parent, height=8, width=30, wrap="none", font=("Segoe UI", 14), undo=True)
         self.simple_box.pack(fill="both", expand=True, pady=(4, 0))
         self.simple_box.bind("<<Modified>>", self._simple_modified)
-        self.simple_box.bind("<FocusIn>", lambda e: setattr(self, "_typing_in", self.simple_box))
         self.simple_box.bind("<Control-Return>", lambda e: (self.print_label(), "break")[1])
         ttk.Label(parent, text="Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
                                "size per line, use the Advanced tab.",
@@ -1623,7 +1356,6 @@ class App(tk.Tk):
         self.value_label.pack(side="left")
         self.value_entry = ttk.Entry(self.row_value, textvariable=self.v_value, font=("Segoe UI", 12))
         self.value_entry.pack(side="left", fill="x", expand=True)
-        self.value_entry.bind("<FocusIn>", lambda e: setattr(self, "_typing_in", self.value_entry))
         self.value_entry.bind("<Return>", self._enter_pressed)
         self.value_entry.bind("<Up>", lambda e: self._step_selection(-1))
         self.value_entry.bind("<Down>", lambda e: self._step_selection(1))
@@ -1805,14 +1537,6 @@ class App(tk.Tk):
 
         stock = self.selected_stock()
         self.bg.run(lambda: check_printer(p, stock), done)
-
-    def set_alerts(self, on):
-        self.settings["alerts"] = on
-        self.save()
-        if on:
-            self.alerts.start()
-        else:
-            self.alerts.stop()
 
     def open_monitor(self):
         if getattr(self, "monitor", None) and self.monitor.winfo_exists():
@@ -2072,9 +1796,6 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, "That recent label couldn't be loaded.", parent=self)
             return
         self.recent_box.set("")
-        self._open_design(design)
-
-    def _open_design(self, design):
         text = design.simple_text()
         if text is not None:  # plain typed text: open it in the Simple tab
             self.simple_box.delete("1.0", "end")
@@ -2085,78 +1806,6 @@ class App(tk.Tk):
         self.v_auto_layout.set(design.auto_layout)
         self._fill_tree(select=[0] if design.elements else [])
         self.tabs.select(1)
-
-    # ----- templates -----
-
-    def _load_templates(self, select=None):
-        def done(result, error):
-            if error:
-                self.template_box.configure(values=[])
-                self.template_box.set("(couldn't read templates)")
-                return
-            self.templates = result
-            names = [t.name for t in result]
-            self.template_box.configure(values=names)
-            self.template_box.set(select if select in names else "")
-        self.bg.run(lambda: list_templates(templates_folder()), done)
-
-    def _template_picked(self):
-        i = self.template_box.current()
-        if not 0 <= i < len(self.templates):
-            return
-        t = self.templates[i]
-        self._open_design(ld.Design.from_dict(copy.deepcopy(t.design)))
-        for n, st in enumerate(self.stock_options):
-            if st and st.id == t.stock:
-                self.stock_box.current(n)
-                self._stock_changed()
-        self.copies_var.set(str(t.copies))
-        self.set_status(f"Template \"{t.name}\" loaded.")
-
-    def _save_template(self):
-        design = self.active_design()
-        if design.is_empty():
-            messagebox.showinfo(APP_NAME, "Make the label first, then save it as a template.", parent=self)
-            return
-        name = simpledialog.askstring(APP_NAME, "Template name:", parent=self,
-                                      initialvalue=self.template_box.get() if self.template_box.current() >= 0 else "")
-        if not name or not name.strip():
-            return
-        name = name.strip()
-        folder = templates_folder()
-        same_file = os.path.join(folder, _safe_name(name) + ".json")
-        clash = next((t for t in self.templates if t.path == same_file or t.name.lower() == name.lower()), None)
-        if clash and not messagebox.askyesno(APP_NAME, f"Replace the template \"{clash.name}\"?", parent=self):
-            return
-        stock = self.selected_stock()
-        template = Template(name, design.to_dict(), stock.id if stock else "", self._copies() or 1,
-                            os.environ.get("USERNAME") or getpass.getuser(), _now())
-
-        def done(_path, error):
-            if error:
-                messagebox.showerror(APP_NAME, f"Couldn't save the template in {folder}:\n\n"
-                                     f"{describe_error(error)}", parent=self)
-                return
-            self.set_status(f"Saved template \"{name}\".", "Ok.TLabel")
-            self._load_templates(select=name)
-        self.bg.run(lambda: save_template(folder, template), done)
-
-    def _delete_template(self):
-        i = self.template_box.current()
-        if not 0 <= i < len(self.templates):
-            messagebox.showinfo(APP_NAME, "Pick the template to delete first.", parent=self)
-            return
-        t = self.templates[i]
-        if not messagebox.askyesno(APP_NAME, f"Delete the template \"{t.name}\"? Everyone who uses it will lose it.", parent=self):
-            return
-
-        def done(_result, error):
-            if error:
-                messagebox.showerror(APP_NAME, f"Couldn't delete it: {describe_error(error)}", parent=self)
-                return
-            self.set_status(f"Deleted template \"{t.name}\".")
-            self._load_templates()
-        self.bg.run(lambda: os.remove(t.path), done)
 
     def _remember(self, design):
         entry = design.to_dict()
@@ -2185,7 +1834,7 @@ class App(tk.Tk):
             self.warn_label.configure(text="")
             return
         design = self.active_design()
-        rendered = self._rendered(design, label, copies=self._copies() or 1)
+        rendered = ld.render(design, label)
         scale = min((cw - 40) / label.width, (ch - 40) / label.height)
         lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
@@ -2311,7 +1960,7 @@ class App(tk.Tk):
         if not p or design.is_empty():
             messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
             return
-        zpl = ld.build_zpl(self._rendered(design, label, copies=self._copies() or 1), p.shift_x, p.shift_y)
+        zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
         self.set_status("Getting exact preview from labelary.com...")
 
         def done(png, error):
@@ -2338,34 +1987,6 @@ class App(tk.Tk):
 
     # ----- printing -----
 
-    def _prepare_job(self, design, p, now, copies, first=1, last=None, parent=None):
-        """Check a print job with the user and build its ZPL; None if they cancel or it can't print.
-
-        Labels with {count} differ per copy, so each is sent on its own: first..last of
-        `copies` (a reprint can redo just some of them). Others print `copies` at once.
-        """
-        parent = parent or self
-        label = printer_label(p)
-        if ld.uses_count(design):
-            numbers = range(first, (last or copies) + 1)
-            each = [self._rendered(design, label, now, n, copies) for n in numbers]
-        else:
-            each = [self._rendered(design, label, now, 1, copies)]
-        errors = list(dict.fromkeys(err for r in each for err in r.errors))
-        warnings = list(dict.fromkeys(w for r in each for w in r.warnings))
-        if errors:
-            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(errors), parent=parent)
-            return None
-        if warnings and not messagebox.askyesno(APP_NAME, "\n".join(warnings) + "\n\nPrint anyway?", parent=parent):
-            return None
-        count = len(each) if ld.uses_count(design) else copies
-        if count > CONFIRM_COPIES_OVER and not messagebox.askyesno(
-                APP_NAME, f"Print {count} labels on {p.name}?", parent=parent):
-            return None
-        if ld.uses_count(design):
-            return "".join(ld.build_zpl(r, p.shift_x, p.shift_y, 1) for r in each), count
-        return ld.build_zpl(each[0], p.shift_x, p.shift_y, copies), count
-
     def print_label(self):
         p = self.current_printer()
         if not p:
@@ -2375,21 +1996,28 @@ class App(tk.Tk):
         if design.is_empty():
             messagebox.showinfo(APP_NAME, "Type something on the label first.", parent=self)
             return
-        copies = self._copies()
-        if copies is None:
+        rendered = ld.render(design, self.current_label())
+        if rendered.errors:
+            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(rendered.errors), parent=self)
+            return
+        try:
+            copies = int(self.copies_var.get())
+            if not 1 <= copies <= MAX_COPIES:
+                raise ValueError
+        except ValueError:
             messagebox.showerror(APP_NAME, f"Copies must be a whole number from 1 to {MAX_COPIES}.", parent=self)
             return
-        now = datetime.now()
-        job = self._prepare_job(design, p, now, copies)
-        if not job:
+        if rendered.warnings and not messagebox.askyesno(
+                APP_NAME, "\n".join(rendered.warnings) + "\n\nPrint anyway?", parent=self):
             return
-        zpl, count = job
-        stock = self.selected_stock()
-        entry = dict(at=now.isoformat(sep=" ", timespec="seconds"), printer=p.name, copies=copies,
-                     stock=stock.name if stock else "", width_in=p.width_in, height_in=p.height_in,
-                     design=design.to_dict())
+        if copies > CONFIRM_COPIES_OVER and not messagebox.askyesno(
+                APP_NAME, f"Print {copies} labels on {p.name}?", parent=self):
+            return
+
+        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
         self.print_btn.configure(state="disabled")
         self.set_status(f"Sending to {p.name}...")
+        label_word = "label" if copies == 1 else "labels"
 
         def done(_result, error):
             self.print_btn.configure(state="normal")
@@ -2403,206 +2031,11 @@ class App(tk.Tk):
                 self._fill_stock()  # a non-default stock is a one-off; back to the printer's default
                 self.refresh()
                 note = " Label stock is back to the printer's default."
-            self.set_status(f"Sent {count} label{'s' if count != 1 else ''} to {p.name}.{note}", "Ok.TLabel")
+            self.set_status(f"Sent {copies} {label_word} to {p.name}.{note}", "Ok.TLabel")
             self._remember(design)
-            self._quiet(add_history, entry)
             self.check_status(quiet=True)
 
         self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
-
-    def open_history(self):
-        if getattr(self, "history", None) and self.history.winfo_exists():
-            self.history.deiconify()
-            self.history.lift()
-            self.history.refresh()
-            return
-        self.history = HistoryWindow(self)
-
-
-class HistoryWindow(tk.Toplevel):
-    """What this PC has printed, to open again or reprint."""
-
-    def __init__(self, app):
-        super().__init__(app)
-        self.app = app
-        self.title("Print history")
-        self.geometry("820x460")
-        self.transient(app)
-        frame = ttk.Frame(self, padding=12)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="Labels printed from this PC, newest first. A reprint uses the original date and time "
-                              "for any date fields.", style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
-        table = ttk.Frame(frame)
-        table.pack(fill="both", expand=True)
-        cols = (("when", "When", 130), ("printer", "Printer", 130), ("copies", "Copies", 60), ("label", "Label", 420))
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in cols], show="headings", selectmode="browse")
-        for key, title, width in cols:
-            self.tree.heading(key, text=title, anchor="w")
-            self.tree.column(key, width=width, anchor="w", stretch=key == "label")
-        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        self.tree.bind("<Double-1>", lambda e: self._open())
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(buttons, text="Reprint...", command=self._reprint).pack(side="left")
-        ttk.Button(buttons, text="Open in editor", command=self._open).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
-        self.entries = []
-        self.refresh()
-
-    def refresh(self):
-        self.entries = read_history()
-        self.tree.delete(*self.tree.get_children())
-        for i, e in enumerate(self.entries):
-            self.tree.insert("", "end", iid=str(i), values=(
-                _short_time(e.get("at")), e.get("printer", ""), e.get("copies", ""),
-                self.app._recent_title(e.get("design") or {})))
-        if self.entries:
-            self.tree.selection_set("0")
-
-    def _selected(self):
-        sel = self.tree.selection()
-        return self.entries[int(sel[0])] if sel else None
-
-    def _open(self):
-        e = self._selected()
-        if e:
-            self.app._open_design(ld.Design.from_dict(copy.deepcopy(e["design"])))
-            self.app.lift()
-
-    def _reprint(self):
-        e = self._selected()
-        if not e:
-            return
-        printer = next((p for p in self.app.all_printers() if p.name == e.get("printer")), None)
-        if not printer:
-            messagebox.showerror(APP_NAME, f"The printer \"{e.get('printer')}\" isn't set up any more.", parent=self)
-            return
-        printer = replace(printer, width_in=e.get("width_in", printer.width_in),
-                          height_in=e.get("height_in", printer.height_in))
-        design = ld.Design.from_dict(copy.deepcopy(e["design"]))
-        copies = int(e.get("copies") or 1)
-        if ld.uses_count(design):
-            first = simpledialog.askinteger(APP_NAME, f"This label numbers its copies (1 to {copies}).\n"
-                                            "Reprint from number:", parent=self, initialvalue=1,
-                                            minvalue=1, maxvalue=copies)
-            if first is None:
-                return
-            last = simpledialog.askinteger(APP_NAME, "Up to number:", parent=self, initialvalue=first,
-                                           minvalue=first, maxvalue=copies)
-            if last is None:
-                return
-            job = self.app._prepare_job(design, printer, datetime.fromisoformat(e["at"]), copies, first, last, self)
-        else:
-            n = simpledialog.askinteger(APP_NAME, "How many copies?", parent=self, initialvalue=copies,
-                                        minvalue=1, maxvalue=MAX_COPIES)
-            if n is None:
-                return
-            job = self.app._prepare_job(design, printer, datetime.fromisoformat(e["at"]), n, parent=self)
-        if not job:
-            return
-        zpl, count = job
-
-        def done(_result, error):
-            if error:
-                messagebox.showerror(APP_NAME, f"Could not print on {printer.name}: {describe_error(error)}",
-                                     parent=self)
-                return
-            self.app.set_status(f"Reprinted {count} label{'s' if count != 1 else ''} on {printer.name}.", "Ok.TLabel")
-        self.app.bg.run(lambda: send_label(printer, zpl.encode("utf-8")), done)
-
-
-class PrinterAlerts:
-    """While Stripes is open, check every printer now and then and pop up a notice when
-    one runs into a problem (out of labels, head open...). Off unless the user turns it on."""
-
-    SECONDS = 30
-    MISSES = 2  # don't cry wolf over one dropped check
-
-    def __init__(self, app):
-        self.app = app
-        self.known, self.misses, self.pending, self.toasts = {}, {}, set(), []
-        self._timer = None
-
-    def start(self):
-        if self._timer is None:
-            self._tick()
-
-    def stop(self):
-        if self._timer is not None:
-            self.app.after_cancel(self._timer)
-            self._timer = None
-        self.known.clear()
-        self.misses.clear()
-
-    def _tick(self):
-        self._timer = self.app.after(self.SECONDS * 1000, self._tick)
-        for p in self.app.all_printers():
-            if p.name not in self.pending:
-                self.pending.add(p.name)
-                self.app.bg.run(lambda p=p: printer_problems(p),
-                                lambda problems, error, p=p: self._arrived(p, problems, error))
-
-    def _arrived(self, p, problems, error):
-        self.pending.discard(p.name)
-        if self._timer is None:
-            return  # turned off meanwhile
-        before = self.known.get(p.name, set())
-        if error:
-            self.misses[p.name] = self.misses.get(p.name, 0) + 1
-            problems = ["Not reachable"] if self.misses[p.name] >= self.MISSES else list(before)
-        else:
-            self.misses[p.name] = 0
-        new = [x for x in problems if x not in before]
-        self.known[p.name] = set(problems)
-        if new:
-            self.notify(p.name, new)
-
-    def notify(self, name, problems):
-        self.app.bell()
-        self.toasts = [t for t in self.toasts if t.winfo_exists()]
-        # stack upwards from the bottom right corner, starting again if they'd reach the top
-        bottom = min([t.winfo_y() - 10 for t in self.toasts] + [self.app.winfo_screenheight() - 60])
-        if bottom < 250:
-            bottom = self.app.winfo_screenheight() - 60
-        self.toasts.append(AlertToast(self.app, name, problems, bottom))
-
-
-class AlertToast(tk.Toplevel):
-    """A small notice in the corner of the screen that stays on top until dismissed."""
-
-    def __init__(self, app, name, problems, bottom):
-        super().__init__(app)
-        self.app = app
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        self.configure(background="#b91c1c")
-        body = tk.Frame(self, background="white", padx=12, pady=10)
-        body.pack(fill="both", expand=True, padx=(6, 1), pady=1)
-        tk.Label(body, text=f"{name} needs attention", font=("Segoe UI", 11, "bold"), background="white",
-                 foreground="#111827").pack(anchor="w")
-        for problem in problems:
-            tk.Label(body, text=f"● {problem}", font=("Segoe UI", 10, "bold"), background="white",
-                     foreground="#b91c1c").pack(anchor="w", pady=(4, 0))
-            fix = PrinterMonitor.FIXES.get(problem)
-            if fix:
-                tk.Label(body, text=fix, font=("Segoe UI", 9), background="white", foreground="#111827",
-                         wraplength=300, justify="left").pack(anchor="w", padx=(14, 0))
-        buttons = tk.Frame(body, background="white")
-        buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(buttons, text="Dismiss", command=self.destroy).pack(side="right")
-        ttk.Button(buttons, text="Printer monitor", command=self._open_monitor).pack(side="right", padx=(0, 6))
-        self.update_idletasks()
-        w, h = max(self.winfo_reqwidth(), 340), self.winfo_reqheight()
-        x = self.winfo_screenwidth() - w - 16
-        self.geometry(f"{w}x{h}+{x}+{bottom - h}")
-        self.update_idletasks()
-
-    def _open_monitor(self):
-        self.app.open_monitor()
-        self.destroy()
 
 
 class PrinterMonitor(tk.Toplevel):
@@ -2651,10 +2084,6 @@ class PrinterMonitor(tk.Toplevel):
         ttk.Label(titles, text="Printer monitor", font=("Segoe UI", 15, "bold")).pack(anchor="w")
         self.summary = ttk.Label(titles, text="Checking printers...", style="Muted.TLabel")
         self.summary.pack(anchor="w")
-        self.alerts_var = tk.BooleanVar(value=app.settings["alerts"])
-        ttk.Checkbutton(titles, text="Alert me when a printer has a problem (while Stripes is open)",
-                        variable=self.alerts_var, command=lambda: app.set_alerts(self.alerts_var.get())
-                        ).pack(anchor="w", pady=(4, 0))
 
         # Scrollable grid of printer cards
         holder = tk.Frame(self, background="#f3f4f6")
@@ -3422,27 +2851,7 @@ class PrinterDialog(tk.Toplevel):
         self._run(p, "Calibrating", lambda: send_label(p, b"~JC"), ("Calibration started.", "Ok.TLabel"))
 
 
-def self_check(out_path):
-    """Used by the release build: prove a built copy can load everything it needs
-    (Tk, Pillow, QR codes, its icon), then write what it is to out_path and exit."""
-    from PIL import Image, ImageTk  # noqa: F401 (the preview needs both)
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        ImageTk.PhotoImage(Image.new("1", (8, 8)), master=root)
-        ld.qr_matrix("Stripes")
-        with open(resource_path(os.path.join("assets", "icon.ico")), "rb"):
-            pass
-    finally:
-        root.destroy()
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"ok {VERSION} {running_layout()}\n")
-
-
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
-        self_check(sys.argv[2])
-        return
     if sys.platform == "win32":
         try:  # sharp text on high-DPI screens
             import ctypes

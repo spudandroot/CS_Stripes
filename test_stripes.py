@@ -1,8 +1,5 @@
 """Tests for the non-UI parts of stripes. Run: python -m unittest -v"""
 
-import glob
-import io
-import zipfile
 import os
 import re
 import shutil
@@ -422,59 +419,6 @@ class CheckPrinterTests(unittest.TestCase):
                          ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
 
-class TemplateTests(unittest.TestCase):
-    def test_save_and_list(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        design = ld.Design([ld.Element("text", "Packed {date}")])
-        zl.save_template(d, zl.Template("Pallet: Volm", design.to_dict(), "3x3-gap", 2, "john", "2026-10-21"))
-        zl.save_template(d, zl.Template("apples", design.to_dict()))
-        with open(os.path.join(d, "broken.json"), "w") as f:
-            f.write("{nope")
-        with open(os.path.join(d, "other.json"), "w") as f:
-            f.write('{"name": "x", "design": {"elements": [{"kind": "rocket"}]}}')
-        found = zl.list_templates(d)
-        self.assertEqual([t.name for t in found], ["apples", "Pallet: Volm"])  # bad files skipped
-        volm = found[1]
-        self.assertEqual((volm.stock, volm.copies, os.path.basename(volm.path)), ("3x3-gap", 2, "Pallet_Volm.json"))
-        self.assertEqual(ld.Design.from_dict(volm.design).elements[0].value, "Packed {date}")
-        self.assertEqual(zl.list_templates(os.path.join(d, "missing")), [])
-
-
-class HistoryTests(unittest.TestCase):
-    def test_add_and_read(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        path = os.path.join(d, "history.jsonl")
-        design = ld.Design([ld.Element("text", "Box {count}")]).to_dict()
-        for n in range(3):
-            zl.add_history(dict(at=f"2026-10-2{n} 08:00:00", printer="ZTVolmLine", copies=n + 1, design=design), path)
-        with open(path, "a") as f:
-            f.write("{broken\n")
-        entries = zl.read_history(path)
-        self.assertEqual([e["copies"] for e in entries], [3, 2, 1])  # newest first, bad line skipped
-        self.assertEqual(zl.read_history(os.path.join(d, "none.jsonl")), [])
-
-
-class AlertTests(unittest.TestCase):
-    def test_only_new_problems_alert(self):
-        alerts = zl.PrinterAlerts(app=None)
-        alerts._timer = "running"
-        told = []
-        alerts.notify = lambda name, problems: told.append((name, problems))
-        p = zl.Printer(name="ZDDown", host="x")
-        alerts._arrived(p, [], None)
-        alerts._arrived(p, ["Out of labels", "Paused"], None)
-        alerts._arrived(p, ["Out of labels", "Paused"], None)  # still the same: no repeat
-        alerts._arrived(p, ["Out of labels", "Paused", "Print head open"], None)
-        alerts._arrived(p, [], None)
-        alerts._arrived(p, ["Paused"], None)  # came back after clearing: alert again
-        alerts._arrived(p, None, OSError("timed out"))  # one missed check is ignored
-        alerts._arrived(p, None, OSError("timed out"))
-        self.assertEqual(told, [("ZDDown", ["Out of labels", "Paused"]), ("ZDDown", ["Print head open"]),
-                                ("ZDDown", ["Paused"]), ("ZDDown", ["Not reachable"])])
-
-
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -488,7 +432,7 @@ class SelfUpdateTests(unittest.TestCase):
             for suffix, data in files.items():
                 if url.endswith(suffix):
                     return data
-            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+            raise OSError(f"404 {url}")
         return fetch
 
     def test_versions(self):
@@ -507,9 +451,15 @@ class SelfUpdateTests(unittest.TestCase):
 
     def beta_github(self, latest, beta=None):
         files = {"/latest/download/version.txt": latest.encode()}
-        if beta:
-            files["/download/beta/version.txt"] = beta.encode()
-        return self.fake_github(files)
+        fetch = self.fake_github(files)
+        if beta is None:
+            def without_beta(url, timeout=60):
+                if url.endswith("/download/beta/version.txt"):
+                    raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+                return fetch(url, timeout)
+            return without_beta
+        files["/download/beta/version.txt"] = beta.encode()
+        return fetch
 
     def test_beta_channel(self):
         fetch = self.beta_github("v1.3.0", "v1.4.0-beta.2")
@@ -538,44 +488,6 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertFalse(zl.on_beta(["ARROW01"], "ARROW07", "jdoe"))
         self.assertFalse(zl.on_beta([], "ARROW01", "jdoe"))
         self.assertIsNone(zl.on_beta(None, "ARROW01", "jdoe"))
-
-    def app_zip(self, version, extra=None):
-        import hashlib
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("Stripes.exe", b"fast exe")
-            z.writestr(f"Stripes-{version}/base_library.zip", b"python")
-            for name, data in (extra or {}).items():
-                z.writestr(name, data)
-        data = buf.getvalue()
-        return {f"/download/{version}/Stripes-app.zip": data,
-                f"/download/{version}/Stripes-app.zip.sha256": hashlib.sha256(data).hexdigest().encode()}
-
-    def test_install_unpacked_build(self):
-        fetch = self.fake_github(self.app_zip("v1.4.0"))
-        self.assertTrue(zl.install_update("v1.4.0", self.exe, fetch))
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), b"fast exe")
-        self.assertTrue(os.path.isfile(os.path.join(self.dir, "Stripes-v1.4.0", "base_library.zip")))
-        self.assertFalse(glob.glob(os.path.join(self.dir, ".staging-*")))
-        # the next version's folder goes next to it; cleanup keeps only the running one
-        zl.install_update("v1.5.0", self.exe, self.fake_github(self.app_zip("v1.5.0")))
-        zl.remove_old_versions(self.exe, keep=os.path.join(self.dir, "Stripes-v1.5.0"))
-        self.assertEqual(sorted(os.listdir(self.dir)), ["Stripes-v1.5.0", "Stripes.exe"])
-
-    def test_layout_only_needs_the_zip(self):
-        fetch = self.fake_github({})  # an older release without Stripes-app.zip
-        self.assertFalse(zl.install_update("v1.3.0", self.exe, fetch, layout_only=True))
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), b"old version")
-
-    def test_zip_must_stay_in_its_folder(self):
-        fetch = self.fake_github(self.app_zip("v1.4.0", {"../evil.txt": b"x"}))
-        with self.assertRaises(ValueError):
-            zl.install_update("v1.4.0", self.exe, fetch)
-        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.dir), "evil.txt")))
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), b"old version")
 
     def test_install_swaps_the_exe(self):
         import hashlib
