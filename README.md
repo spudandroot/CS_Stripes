@@ -2,29 +2,52 @@
 
 # Stripes
 
-A small Windows app for printing text labels on Zebra printers. Type the text, pick the printer,
-set copies, click **Print** (or Ctrl+P).
+A small Windows app for designing and printing labels on Zebra printers.
 
-- Prints straight to a printer's IP address (port 9100), or through a printer installed in Windows
-- Text is sized automatically to fill the label, or set a fixed point size
-- Live preview, "Bigger first line", left/center/right alignment, recent labels
-- Shows whether the printer is ready, out of labels, paused or has the head open
-- A company printer list (`printers.json`) that IT manages for every PC
+- **Text, barcodes, QR codes and pictures.** Each text line has its own size and alignment.
+- **Auto layout** stacks items to fill the label; drag items on the preview to place them by hand.
+- Barcodes (Code 128, Code 39, EAN-13, UPC-A) and QR codes are made by the printer, so they scan reliably.
+- **Label stock**: each printer has a default stock; pick another for a one-off print.
+- Prints straight to a printer's IP address (port 9100), or through a printer installed in Windows.
+- Shows whether the printer is ready, out of labels, paused or has the head open, and whether its
+  settings match the spec IT set for it. **Stripes never changes printer settings**: labels only
+  carry their content, so other software printing to the same printers isn't affected.
 
 Download the latest `Stripes.exe` from **[Releases](../../releases/latest)**. It's a single file;
 nothing to install.
 
-## Company printer list
+## Company settings (printers and label stock)
 
-Stripes reads `C:\ProgramData\Stripes\printers.json` (or a `printers.json` next to the exe).
-Those printers appear for every user, marked "company", and can't be edited in the app.
-See [`examples/printers.example.json`](examples/printers.example.json):
+IT keeps two files in a folder on a server share:
 
-```json
-{"printers": [
-  {"name": "Packing ZD420", "host": "192.0.2.10", "model": "ZD420", "width_in": 2, "height_in": 1, "dpi": 203}
-]}
+| File | What's in it |
+|---|---|
+| `printers.json` | Each printer: name, IP, model, dpi, default stock, and the settings it should have |
+| `stock.json` | Each kind of label roll: size and media type |
+
+Stripes finds the folder through a registry value set by Group Policy (so the server's name never
+appears in this repo):
+
 ```
+HKLM\SOFTWARE\Policies\Stripes   ConfigPath (REG_SZ) = \\SERVER\Share\Stripes\config
+```
+
+It reads the folder each time it starts and keeps a copy in the user's profile, so it still works if
+the server is down. Users need **read** access to the folder. Without the registry value, Stripes looks
+for the files in `C:\ProgramData\Stripes` or next to the exe.
+
+See [`examples/config`](examples/config) for the format.
+
+**stock.json**
+
+| Field | Notes |
+|---|---|
+| `id` | Short name the printers refer to, e.g. `2x1-gap` |
+| `name` | Shown in the app |
+| `width_in`, `height_in` | Label size in inches |
+| `media` | `gap`, `mark` (black mark) or `continuous` |
+
+**printers.json**
 
 | Field | Required | Notes |
 |---|---|---|
@@ -32,12 +55,13 @@ See [`examples/printers.example.json`](examples/printers.example.json):
 | `host` | yes* | Printer IP address |
 | `windows_name` | yes* | Print through this installed Windows printer instead (*one of `host`/`windows_name`) |
 | `port` | no | Default 9100 |
-| `model` | no | `ZD420`, `ZT410` or `Other` |
-| `width_in`, `height_in` | no | Label size in inches |
+| `model` | no | e.g. `ZD420`, `ZT410` |
 | `dpi` | no | 203, 300 or 600. Zebra's "200 dpi" is 203 |
+| `stock` | no | `id` of the default label stock |
+| `expected` | no | How the printer should be set up: `print_width` (dots), `media`, `print_mode` (`tear-off`, `peel-off`), `darkness`, `speed`. Compared with what the printer reports; never sent to it |
 | `shift_x`, `shift_y` | no | Nudge the print position, in dots (8 dots = 1 mm at 203 dpi) |
 
-Keep your real `printers.json` on an internal share, **not in this repo** (it's git-ignored).
+Keep your real files on the internal share, **not in this repo**.
 
 ## Deploying to domain PCs (Group Policy)
 
@@ -54,12 +78,13 @@ One computer GPO linked to the OU with the label-printing PCs:
    [`deploy/Update-Stripes.ps1`](deploy/Update-Stripes.ps1) downloads the latest release into
    `C:\Program Files\Stripes`, checks its SHA-256 checksum, and does nothing if it's already
    up to date. If Stripes is open, it tries again next run. Log: `C:\ProgramData\Stripes\update.log`.
-2. **Printer list**: *Computer Configuration > Preferences > Windows Settings > Files*, action
-   **Update**: `\\SERVER\Share\Stripes\printers.json` to `C:\ProgramData\Stripes\printers.json`
+2. **Company settings location**: *Computer Configuration > Preferences > Windows Settings >
+   Registry*, action **Update**: hive `HKEY_LOCAL_MACHINE`, key `SOFTWARE\Policies\Stripes`, value
+   `ConfigPath` (REG_SZ) = `\\SERVER\Share\Stripes\config`
 3. **Shortcut**: *Computer Configuration > Preferences > Windows Settings > Shortcuts*, **All Users
    Desktop**, target `C:\Program Files\Stripes\Stripes.exe`
 
-Domain Computers need read access to the share.
+Domain Computers need read access to the script; Domain Users need read access to the config folder.
 
 ## Releasing a new version
 

@@ -5,6 +5,7 @@ Windows (via the print spooler) or straight to an IP address on port 9100.
 Needs pywin32 for Windows printers; everything else is standard library.
 """
 
+import copy
 import gc
 import json
 import os
@@ -18,11 +19,12 @@ import queue
 import urllib.request
 from dataclasses import dataclass, asdict, field, fields, replace
 from datetime import datetime
-from math import inf
 
 import tkinter as tk
 import tkinter.font
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+
+import label_design as ld
 
 APP_NAME = "Stripes"
 try:
@@ -40,10 +42,6 @@ MODELS = {
     "Other": (4.0, 6.0),
 }
 
-MARGIN_IN = 0.06       # blank border around the text
-LINE_GAP = 0.18        # space between lines, as a fraction of text height
-EMPHASIS = 1.5         # size of the first line when "Bigger first line" is on
-WIDTH_SAFETY = 1.08    # fudge factor on the character width estimate
 MAX_RECENT = 20
 MAX_COPIES = 9999
 CONFIRM_COPIES_OVER = 50
@@ -331,145 +329,13 @@ def save_settings(settings):
 # Layout and ZPL
 # --------------------------------------------------------------------------
 
-# Rough character widths for Zebra font 0 (CG Triumvirate Bold Condensed),
-# as a fraction of the character height. Used to keep lines inside the label.
-_NARROW = set("il.,:;'!|`")
-_SEMI = set("fjrtI-()[]/\\\" ")
-_WIDE_LOWER = set("mw")
-_WIDE_UPPER = set("MW@%")
-
-
-def char_em(c):
-    if c in _NARROW:
-        return 0.25
-    if c in _SEMI:
-        return 0.33
-    if c in _WIDE_UPPER:
-        return 0.82
-    if c in _WIDE_LOWER:
-        return 0.75
-    if c.isdigit():
-        return 0.52
-    if c.islower():
-        return 0.50
-    if c.isupper():
-        return 0.60
-    return 0.60
-
-
-def text_em(s):
-    return sum(char_em(c) for c in s)
-
-
-@dataclass
-class PlacedLine:
-    text: str
-    y: int   # top of the line, in dots
-    h: int   # character height, in dots
-
-
-@dataclass
-class Layout:
-    width: int        # label width, dots
-    height: int       # label height, dots
-    margin: int       # dots
-    lines: list
-    warnings: list
-
-    @property
-    def inner_width(self):
-        return self.width - 2 * self.margin
-
-
 def label_dots(printer):
     dots_per_inch = printer.dpmm * 25.4
     return round(printer.width_in * dots_per_inch), round(printer.height_in * dots_per_inch)
 
 
-def layout_label(text, printer, size_pt=None, emphasize_first=False):
-    """Work out the size and position of each line.
-
-    size_pt=None means auto: make the text as large as fits.
-    """
-    dots_per_inch = printer.dpmm * 25.4
-    width, height = label_dots(printer)
-    margin = round(MARGIN_IN * dots_per_inch)
-    avail_w = width - 2 * margin
-    avail_h = height - 2 * margin
-
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines:
-        return Layout(width, height, margin, [], [])
-
-    n = len(lines)
-    weights = [EMPHASIS if (emphasize_first and i == 0 and n > 1) else 1.0 for i in range(n)]
-
-    def total(hs):
-        return sum(hs) + LINE_GAP * sum(hs[:-1])
-
-    def width_cap(line):
-        em = text_em(line) * WIDTH_SAFETY
-        return avail_w / em if em else inf
-
-    if size_pt is None:
-        unit = avail_h / total(weights)
-        body = min([unit] + [width_cap(ln) for ln, w in zip(lines, weights) if w == 1.0])
-        hs = [min(unit * w, width_cap(ln)) if w != 1.0 else body for ln, w in zip(lines, weights)]
-    else:
-        body = size_pt / 72 * dots_per_inch
-        hs = [body * w for w in weights]
-    hs = [max(1, int(h)) for h in hs]
-
-    warnings = []
-    if total(hs) > avail_h + 0.5:
-        warnings.append("Text is too tall for the label. Use fewer lines or a smaller size.")
-    for i, (ln, h) in enumerate(zip(lines, hs)):
-        if text_em(ln) * WIDTH_SAFETY * h > avail_w + 0.5:
-            warnings.append(f"Line {i + 1} is probably too wide for the label.")
-    if min(hs) < 0.06 * dots_per_inch:
-        warnings.append("Text is very small and may be hard to read.")
-
-    y = margin + max(0.0, (avail_h - total(hs)) / 2)
-    placed = []
-    for ln, h in zip(lines, hs):
-        placed.append(PlacedLine(ln, round(y), h))
-        y += h * (1 + LINE_GAP)
-    return Layout(width, height, margin, placed, warnings)
-
-
-def zpl_escape(s):
-    # ^FH turns _XX into the byte 0xXX, which lets us print ^ ~ and _ safely.
-    s = "".join(c for c in s if c >= " ")
-    return s.replace("_", "_5F").replace("^", "_5E").replace("~", "_7E")
-
-
-def build_zpl(layout, printer, align="center", copies=1, border=False):
-    """The label format. It only places text: no printer settings (width, length,
-    media, darkness...) are sent, because those stay in effect on the printer and
-    would change how other software's labels print."""
-    just = {"left": "L", "center": "C", "right": "R"}[align]
-    sx, sy = printer.shift_x, printer.shift_y
-    out = ["^XA"]
-    if any(ord(c) > 126 for ln in layout.lines for c in ln.text):
-        out.append("^CI28")  # UTF-8, only when needed: it also stays in effect
-    if border:
-        out.append(f"^FO{max(0, sx)},{max(0, sy)}^GB{layout.width},{layout.height},3^FS")
-    for ln in layout.lines:
-        if not ln.text.strip():
-            continue
-        x = max(0, layout.margin + sx)
-        y = max(0, ln.y + sy)
-        out.append(
-            f"^FO{x},{y}^A0N,{ln.h},{ln.h}"
-            f"^FB{layout.inner_width},1,0,{just},0^FH^FD{zpl_escape(ln.text)}^FS"
-        )
-    out.append(f"^PQ{int(copies)}")
-    out.append("^XZ")
-    return "\n".join(out) + "\n"
+def printer_label(printer):
+    return ld.Label(*label_dots(printer), printer.dpmm)
 
 
 # --------------------------------------------------------------------------
@@ -806,7 +672,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} {VERSION}")
-        self.minsize(820, 580)
+        self.minsize(900, 640)
         try:
             self.iconbitmap(default=resource_path(os.path.join("assets", "icon.ico")))
         except tk.TclError:
@@ -825,6 +691,13 @@ class App(tk.Tk):
         self.measure_font = tkinter.font.Font(self, family=self.preview_family, weight="bold")
         self._refresh_pending = False
         self._status_seq = 0
+        self.design = ld.Design([ld.Element("text")])
+        self.selected = []
+        self._loading_props = False
+        self._syncing = False
+        self._drag = None
+        self._view = None
+        self._preview_images = []
 
         style = ttk.Style(self)
         style.configure("Print.TButton", font=("Segoe UI", 12, "bold"), padding=(24, 8))
@@ -837,7 +710,8 @@ class App(tk.Tk):
         self._load_printer_list(select=self.settings.get("last_printer"))
         self.bind_all("<Control-p>", lambda e: self.print_label())
         self.bind_all("<Control-Return>", lambda e: self.print_label())
-        self.text.focus_set()
+        self._fill_tree(select=[0])
+        self.value_entry.focus_set()
         if self.config_folder:
             self.bg.run(load_company_config, self._config_loaded)
         else:
@@ -913,64 +787,25 @@ class App(tk.Tk):
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1, uniform="cols")
-        body.columnconfigure(1, weight=1, uniform="cols")
+        body.columnconfigure(0, weight=2, uniform="cols")
+        body.columnconfigure(1, weight=3, uniform="cols")
         body.rowconfigure(0, weight=1)
 
-        # Left: text + options
-        left = ttk.LabelFrame(body, text="Label text (one line per row)", padding=8)
+        left = ttk.LabelFrame(body, text="Label items", padding=8)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.text = tk.Text(left, height=6, width=30, wrap="none", font=("Segoe UI", 13), undo=True)
-        self.text.pack(fill="both", expand=True)
-        self.text.bind("<<Modified>>", self._text_modified)
+        self._build_items(left)
 
-        opts = ttk.Frame(left)
-        opts.pack(fill="x", pady=(8, 0))
-
-        ttk.Label(opts, text="Text size:").grid(row=0, column=0, sticky="w")
-        self.auto_size = tk.BooleanVar(value=True)
-        ttk.Radiobutton(opts, text="Auto (as big as fits)", variable=self.auto_size, value=True,
-                        command=self._size_mode_changed).grid(row=0, column=1, sticky="w")
-        size_row = ttk.Frame(opts)
-        size_row.grid(row=1, column=1, sticky="w")
-        ttk.Radiobutton(size_row, text="Fixed:", variable=self.auto_size, value=False,
-                        command=self._size_mode_changed).pack(side="left")
-        self.size_var = tk.StringVar(value="14")
-        self.size_spin = ttk.Spinbox(size_row, from_=4, to=200, width=5, textvariable=self.size_var,
-                                     command=self.refresh)
-        self.size_spin.pack(side="left", padx=4)
-        self.size_spin.bind("<KeyRelease>", lambda e: self.refresh())
-        ttk.Label(size_row, text="pt").pack(side="left")
-
-        ttk.Label(opts, text="Alignment:").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.align_var = tk.StringVar(value="center")
-        align_row = ttk.Frame(opts)
-        align_row.grid(row=2, column=1, sticky="w", pady=(6, 0))
-        for value, label in (("left", "Left"), ("center", "Center"), ("right", "Right")):
-            ttk.Radiobutton(align_row, text=label, variable=self.align_var, value=value,
-                            command=self.refresh).pack(side="left", padx=(0, 8))
-
-        self.emphasize = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Bigger first line", variable=self.emphasize,
-                        command=self.refresh).grid(row=3, column=1, sticky="w", pady=(6, 0))
-
-        ttk.Label(opts, text="Recent:").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        recent_row = ttk.Frame(opts)
-        recent_row.grid(row=4, column=1, sticky="we", pady=(10, 0))
-        self.recent_box = ttk.Combobox(recent_row, state="readonly", width=24)
-        self.recent_box.pack(side="left")
-        self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
-        ttk.Button(recent_row, text="Clear text", command=self._clear_text).pack(side="left", padx=6)
-        self._fill_recent()
-        self._size_mode_changed(refresh=False)
-
-        # Right: preview
-        right = ttk.LabelFrame(body, text="Preview", padding=8)
+        right = ttk.LabelFrame(body, text="Preview: drag items to move them, drag the corner to resize",
+                               padding=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        self.canvas = tk.Canvas(right, background="#e5e7eb", highlightthickness=0, width=380, height=280)
+        self.canvas = tk.Canvas(right, background="#e5e7eb", highlightthickness=0, width=420, height=300)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self.refresh())
-        self.warn_label = ttk.Label(right, text="", style="Warn.TLabel", wraplength=360, justify="left")
+        self.canvas.bind("<ButtonPress-1>", self._canvas_press)
+        self.canvas.bind("<B1-Motion>", self._canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<Delete>", lambda e: self._delete_items())
+        self.warn_label = ttk.Label(right, text="", style="Warn.TLabel", wraplength=420, justify="left")
         self.warn_label.pack(fill="x", pady=(6, 0))
         ttk.Label(right, text="On-screen preview is approximate.", style="Muted.TLabel").pack(anchor="w")
 
@@ -987,6 +822,100 @@ class App(tk.Tk):
 
         self.status = ttk.Label(outer, text="Ready. Tip: Ctrl+P prints.", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(8, 0))
+
+    def _build_items(self, parent):
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tree_frame, columns=("item", "size", "align"), show="headings",
+                                 selectmode="extended", height=6)
+        for col, title, width, stretch in (("item", "Item", 200, True), ("size", "Size", 60, False),
+                                           ("align", "Align", 60, False)):
+            self.tree.heading(col, text=title, anchor="w")
+            self.tree.column(col, width=width, stretch=stretch, anchor="w")
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._tree_selected)
+        self.tree.bind("<Delete>", lambda e: self._delete_items())
+
+        add_row = ttk.Frame(parent)
+        add_row.pack(fill="x", pady=(6, 0))
+        for text, kind in (("+ Text", "text"), ("+ Barcode", "barcode"), ("+ QR code", "qr"), ("+ Picture", "image")):
+            ttk.Button(add_row, text=text, command=lambda k=kind: self._add_item(k)).pack(side="left", padx=(0, 4))
+        move_row = ttk.Frame(parent)
+        move_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(move_row, text="Move up", command=lambda: self._move_items(-1)).pack(side="left")
+        ttk.Button(move_row, text="Move down", command=lambda: self._move_items(1)).pack(side="left", padx=4)
+        ttk.Button(move_row, text="Delete", command=self._delete_items).pack(side="left")
+
+        ttk.Separator(parent).pack(fill="x", pady=8)
+
+        # Settings for the selected item(s); rows are shown to suit what's selected.
+        self.props = ttk.Frame(parent)
+        self.props.pack(fill="x")
+        self.v_value = tk.StringVar()
+        self.v_size_auto = tk.BooleanVar(value=True)
+        self.v_size = tk.StringVar(value="14")
+        self.v_align = tk.StringVar(value="center")
+        self.v_symbology = tk.StringVar()
+        self.v_show_text = tk.BooleanVar(value=True)
+        self.v_dither = tk.BooleanVar(value=False)
+        for name in ("value", "size_auto", "size", "align", "symbology", "show_text", "dither"):
+            getattr(self, f"v_{name}").trace_add("write", lambda *a, n=name: self._prop_changed(n))
+
+        self.row_value = ttk.Frame(self.props)
+        self.value_label = ttk.Label(self.row_value, text="Text:", width=7)
+        self.value_label.pack(side="left")
+        self.value_entry = ttk.Entry(self.row_value, textvariable=self.v_value, font=("Segoe UI", 12))
+        self.value_entry.pack(side="left", fill="x", expand=True)
+        self.value_entry.bind("<Return>", self._enter_pressed)
+        self.value_entry.bind("<Up>", lambda e: self._step_selection(-1))
+        self.value_entry.bind("<Down>", lambda e: self._step_selection(1))
+
+        self.row_size = ttk.Frame(self.props)
+        ttk.Label(self.row_size, text="Size:", width=7).pack(side="left")
+        ttk.Radiobutton(self.row_size, text="Fit", variable=self.v_size_auto, value=True).pack(side="left")
+        ttk.Radiobutton(self.row_size, text="Fixed:", variable=self.v_size_auto, value=False).pack(side="left",
+                                                                                                  padx=(8, 0))
+        self.size_spin = ttk.Spinbox(self.row_size, from_=4, to=200, width=5, textvariable=self.v_size)
+        self.size_spin.pack(side="left", padx=4)
+        ttk.Label(self.row_size, text="pt").pack(side="left")
+
+        self.row_code = ttk.Frame(self.props)
+        ttk.Label(self.row_code, text="Type:", width=7).pack(side="left")
+        ttk.Combobox(self.row_code, textvariable=self.v_symbology, values=list(ld.SYMBOLOGIES.values()),
+                     state="readonly", width=10).pack(side="left")
+        ttk.Checkbutton(self.row_code, text="Show digits", variable=self.v_show_text).pack(side="left", padx=8)
+
+        self.row_picture = ttk.Frame(self.props)
+        ttk.Label(self.row_picture, text="Picture:", width=7).pack(side="left")
+        ttk.Button(self.row_picture, text="Change...", command=self._change_picture).pack(side="left")
+        ttk.Checkbutton(self.row_picture, text="Dither (for photos)", variable=self.v_dither).pack(side="left",
+                                                                                                padx=8)
+
+        self.row_align = ttk.Frame(self.props)
+        ttk.Label(self.row_align, text="Align:", width=7).pack(side="left")
+        for value, text in (("left", "Left"), ("center", "Center"), ("right", "Right")):
+            ttk.Radiobutton(self.row_align, text=text, variable=self.v_align, value=value).pack(side="left",
+                                                                                                padx=(0, 8))
+        self.props_hint = ttk.Label(self.props, text="Add an item, or select one to change it.\n"
+                                                     "Ctrl+click or Shift+click to select several.",
+                                    style="Muted.TLabel")
+
+        options = ttk.Frame(parent)
+        options.pack(fill="x", pady=(10, 0))
+        self.v_auto_layout = tk.BooleanVar(value=True)
+        ttk.Checkbutton(options, text="Auto layout (stack items to fill the label)", variable=self.v_auto_layout,
+                        command=self._auto_layout_toggled).pack(side="left")
+        recent_row = ttk.Frame(parent)
+        recent_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(recent_row, text="Recent:").pack(side="left")
+        self.recent_box = ttk.Combobox(recent_row, state="readonly")
+        self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
+        self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
+        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
+        self._fill_recent()
 
     # ----- helpers -----
 
@@ -1016,23 +945,9 @@ class App(tk.Tk):
         p, st = self.base_printer(), self.selected_stock()
         return not (p and p.stock and st and st.id != p.stock)
 
-    def current_text(self):
-        return self.text.get("1.0", "end-1c")
-
-    def current_size(self):
-        if self.auto_size.get():
-            return None
-        try:
-            size = float(self.size_var.get())
-        except ValueError:
-            return None
-        return size if size > 0 else None
-
-    def current_layout(self):
+    def current_label(self):
         p = self.current_printer()
-        if p is None:
-            return None
-        return layout_label(self.current_text(), p, self.current_size(), self.emphasize.get())
+        return printer_label(p) if p else None
 
     def set_status(self, text, style="Muted.TLabel"):
         self.status.configure(text=text, style=style)
@@ -1142,21 +1057,203 @@ class App(tk.Tk):
         gc.collect()  # free the dialog's Tk objects on this thread (see Background.run)
         self._load_printer_list(select=self.printer_var.get())
 
-    # ----- text / options -----
+    # ----- label items -----
 
-    def _text_modified(self, _event):
-        if self.text.edit_modified():
-            self.text.edit_modified(False)
+    KIND_NAMES = {"text": "Text", "barcode": "Barcode", "qr": "QR code", "image": "Picture"}
+    NEW_ITEM_IN = {"text": 0.25, "barcode": 0.5, "qr": 0.8, "image": 0.6}  # starting height, manual layout
+
+    def selected_elements(self):
+        return [self.design.elements[i] for i in self.selected if i < len(self.design.elements)]
+
+    def _row_values(self, e):
+        if e.kind == "text":
+            item = e.value or "(blank line)"
+            size = "Fit" if e.size_pt is None else f"{e.size_pt:g} pt"
+        else:
+            item, size = f"{self.KIND_NAMES[e.kind]}: {e.value}" if e.kind != "image" else "Picture", ""
+        return item, size, e.align.capitalize()
+
+    def _fill_tree(self, select=None):
+        if select is not None:
+            self.selected = [i for i in select if 0 <= i < len(self.design.elements)]
+        self.tree.delete(*self.tree.get_children())
+        for i, e in enumerate(self.design.elements):
+            self.tree.insert("", "end", iid=str(i), values=self._row_values(e))
+        self._sync_tree_selection()
+
+    def _sync_tree_selection(self):
+        self._syncing = True
+        self.tree.selection_set([str(i) for i in self.selected])
+        if self.selected:
+            self.tree.see(str(self.selected[0]))
+        self._syncing = False
+        self._show_props()
+        self.refresh()
+
+    def _tree_selected(self, _event):
+        chosen = sorted(int(i) for i in self.tree.selection())
+        if chosen == self.selected:
+            return
+        self.selected = chosen
+        self._show_props()
+        self.refresh()
+
+    def _show_props(self):
+        for row in (self.row_value, self.row_size, self.row_code, self.row_picture, self.row_align,
+                    self.props_hint):
+            row.pack_forget()
+        els = self.selected_elements()
+        if not els:
+            self.props_hint.pack(anchor="w")
+            return
+        first, single = els[0], len(els) == 1
+        self._loading_props = True
+        try:
+            if single and first.kind != "image":
+                self.value_label.configure(text="Text:" if first.kind == "text" else "Data:")
+                self.v_value.set(first.value)
+                self.row_value.pack(fill="x", pady=2)
+            if all(e.kind == "text" for e in els):
+                self.v_size_auto.set(first.size_pt is None)
+                if first.size_pt:
+                    self.v_size.set(f"{first.size_pt:g}")
+                self.size_spin.configure(state="disabled" if first.size_pt is None else "normal")
+                self.row_size.pack(fill="x", pady=2)
+            if single and first.kind == "barcode":
+                self.v_symbology.set(ld.SYMBOLOGIES[first.symbology])
+                self.v_show_text.set(first.show_text)
+                self.row_code.pack(fill="x", pady=2)
+            if single and first.kind == "image":
+                self.v_dither.set(first.dither)
+                self.row_picture.pack(fill="x", pady=2)
+            self.v_align.set(first.align)
+            self.row_align.pack(fill="x", pady=2)
+        finally:
+            self._loading_props = False
+
+    def _prop_changed(self, name):
+        if self._loading_props:
+            return
+        els = self.selected_elements()
+        if not els:
+            return
+        if name == "value" and len(els) == 1:
+            els[0].value = self.v_value.get()
+        elif name in ("size_auto", "size"):
+            auto = self.v_size_auto.get()
+            self.size_spin.configure(state="disabled" if auto else "normal")
+            try:
+                size = None if auto else float(self.v_size.get())
+            except ValueError:
+                return  # still typing
+            if size is not None and not 1 <= size <= 500:
+                return
+            for e in els:
+                if e.kind == "text":
+                    e.size_pt = size
+        elif name == "align":
+            for e in els:
+                e.align = self.v_align.get()
+        elif name == "symbology":
+            names = {v: k for k, v in ld.SYMBOLOGIES.items()}
+            els[0].symbology = names.get(self.v_symbology.get(), "code128")
+        elif name == "show_text":
+            els[0].show_text = self.v_show_text.get()
+        elif name == "dither":
+            els[0].dither = self.v_dither.get()
+        for i in self.selected:
+            self.tree.item(str(i), values=self._row_values(self.design.elements[i]))
+        self.refresh()
+
+    def _choose_picture(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Choose a picture",
+            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff"), ("All files", "*.*")])
+        if not path:
+            return None
+        try:
+            return ld.load_picture(path)
+        except Exception as e:  # any unreadable file
+            messagebox.showerror(APP_NAME, f"Couldn't open that picture:\n{e}", parent=self)
+            return None
+
+    def _add_item(self, kind, focus=True):
+        element = ld.Element(kind)
+        if kind == "image":
+            element.image_png = self._choose_picture()
+            if not element.image_png:
+                return
+        label = self.current_label()
+        if not self.design.auto_layout and label:
+            m = label.margin
+            h = int(min(label.dots(self.NEW_ITEM_IN[kind]), label.height - 2 * m))
+            element.x, element.y, element.w, element.h = m, m, label.width - 2 * m, h
+            if kind == "qr":
+                element.w = h
+        at = max(self.selected) + 1 if self.selected else len(self.design.elements)
+        self.design.elements.insert(at, element)
+        self._fill_tree(select=[at])
+        if focus and kind != "image":
+            self.value_entry.focus_set()
+
+    def _enter_pressed(self, event):
+        if event.state & 0x4:  # Ctrl+Enter prints instead
+            return None
+        self._add_item("text")
+        return "break"
+
+    def _step_selection(self, delta):
+        if len(self.selected) == 1:
+            i = self.selected[0] + delta
+            if 0 <= i < len(self.design.elements):
+                self._fill_tree(select=[i])
+                self.value_entry.focus_set()
+                self.value_entry.icursor("end")
+        return "break"
+
+    def _move_items(self, delta):
+        els, chosen = self.design.elements, sorted(self.selected)
+        if not chosen or (delta < 0 and chosen[0] == 0) or (delta > 0 and chosen[-1] == len(els) - 1):
+            return
+        for i in (chosen if delta < 0 else reversed(chosen)):
+            els[i], els[i + delta] = els[i + delta], els[i]
+        self._fill_tree(select=[i + delta for i in chosen])
+
+    def _delete_items(self):
+        if not self.selected:
+            return
+        first = min(self.selected)
+        for i in sorted(self.selected, reverse=True):
+            del self.design.elements[i]
+        self._fill_tree(select=[min(first, len(self.design.elements) - 1)] if self.design.elements else [])
+
+    def _change_picture(self):
+        els = self.selected_elements()
+        png = self._choose_picture() if els else None
+        if png:
+            els[0].image_png = png
             self.refresh()
 
-    def _size_mode_changed(self, refresh=True):
-        self.size_spin.configure(state="disabled" if self.auto_size.get() else "normal")
-        if refresh:
-            self.refresh()
+    def _auto_layout_toggled(self):
+        if self.v_auto_layout.get():
+            self.design.auto_layout = True
+        else:
+            self._switch_to_manual()
+        self.refresh()
 
-    def _clear_text(self):
-        self.text.delete("1.0", "end")
-        self.text.focus_set()
+    def _switch_to_manual(self):
+        """Keep everything exactly where auto layout put it, in boxes that fit the content."""
+        label = self.current_label()
+        if label and self.design.auto_layout:
+            ld.tighten(self.design, ld.render(self.design, label))
+        self.design.auto_layout = False
+        self.v_auto_layout.set(False)
+
+    def _new_label(self):
+        self.design = ld.Design([ld.Element("text")])
+        self.v_auto_layout.set(True)
+        self._fill_tree(select=[0])
+        self.value_entry.focus_set()
 
     def _fill_recent(self):
         self.recent_box["values"] = [self._recent_title(r) for r in self.settings["recent"]]
@@ -1164,32 +1261,29 @@ class App(tk.Tk):
 
     @staticmethod
     def _recent_title(r):
-        lines = [ln for ln in r["text"].splitlines() if ln.strip()]
-        title = " / ".join(lines)
-        return title if len(title) <= 40 else title[:39] + "..."
+        try:
+            design = ld.Design.from_dict(r)
+        except (TypeError, ValueError, AttributeError):
+            return "(unreadable)"
+        parts = [e.title for e in design.elements if e.kind != "text" or e.value.strip()]
+        title = " / ".join(parts) or "(empty)"
+        return title if len(title) <= 50 else title[:49] + "..."
 
     def _load_recent(self):
         i = self.recent_box.current()
         if i < 0:
             return
-        r = self.settings["recent"][i]
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", r["text"])
-        self.auto_size.set(r.get("size_pt") is None)
-        if r.get("size_pt") is not None:
-            self.size_var.set(f"{r['size_pt']:g}")
-        self.align_var.set(r.get("align", "center"))
-        self.emphasize.set(bool(r.get("emphasize")))
-        self._size_mode_changed()
+        try:
+            self.design = ld.Design.from_dict(copy.deepcopy(self.settings["recent"][i]))
+        except (TypeError, ValueError, AttributeError):
+            messagebox.showerror(APP_NAME, "That recent label couldn't be loaded.", parent=self)
+            return
+        self.v_auto_layout.set(self.design.auto_layout)
+        self._fill_tree(select=[0] if self.design.elements else [])
         self.recent_box.set("")
 
     def _remember(self):
-        entry = {
-            "text": self.current_text().strip("\n"),
-            "size_pt": self.current_size(),
-            "align": self.align_var.get(),
-            "emphasize": self.emphasize.get(),
-        }
+        entry = self.design.to_dict()
         recent = [r for r in self.settings["recent"] if r != entry]
         self.settings["recent"] = [entry] + recent[: MAX_RECENT - 1]
         self.save()
@@ -1206,51 +1300,141 @@ class App(tk.Tk):
         self._refresh_pending = False
         c = self.canvas
         c.delete("all")
-        p = self.current_printer()
+        self._preview_images = []
         cw, ch = max(c.winfo_width(), 50), max(c.winfo_height(), 50)
-        if p is None:
+        label = self.current_label()
+        if label is None:
+            self._view = None
             c.create_text(cw / 2, ch / 2, text="Add a printer to get started", fill="#6b7280")
             self.warn_label.configure(text="")
             return
-        lay = self.current_layout()
-        scale = min((cw - 40) / lay.width, (ch - 40) / lay.height)
-        lw, lh = lay.width * scale, lay.height * scale
+        rendered = ld.render(self.design, label)
+        scale = min((cw - 40) / label.width, (ch - 40) / label.height)
+        lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
+        self._view = (x0, y0, scale)
         c.create_rectangle(x0, y0, x0 + lw, y0 + lh, fill="white", outline="#6b7280")
-        m = lay.margin * scale
-        c.create_rectangle(x0 + m, y0 + m, x0 + lw - m, y0 + lh - m, outline="#d1d5db", dash=(2, 3))
+        m = label.margin * scale
+        c.create_rectangle(x0 + m, y0 + m, x0 + lw - m, y0 + lh - m, outline="#e5e7eb", dash=(2, 3))
+        for mark in rendered.marks:
+            self._draw_mark(mark, x0, y0, scale)
 
-        align = self.align_var.get()
-        anchor, tx = {"left": ("nw", x0 + m), "center": ("n", x0 + lw / 2), "right": ("ne", x0 + lw - m)}[align]
-        for ln in lay.lines:
-            if not ln.text.strip():
-                continue
-            px = max(1, round(ln.h * scale))
-            # Screen fonts are wider than the printer's condensed font, so shrink
-            # to the width the printer will actually use.
-            printed_w = text_em(ln.text) * ln.h * scale
-            self.measure_font.configure(size=-px)
-            screen_w = self.measure_font.measure(ln.text)
-            if screen_w > printed_w > 0:
-                px = max(1, int(px * printed_w / screen_w))
-            c.create_text(tx, y0 + ln.y * scale, text=ln.text, anchor=anchor,
-                          font=(self.preview_family, -px, "bold"), fill="black")
         # Anything outside the label won't print, so hide it.
         bg = c.cget("background")
         for box in ((0, 0, cw, y0), (0, y0 + lh, cw, ch), (0, y0, x0, y0 + lh), (x0 + lw, y0, cw, y0 + lh)):
             c.create_rectangle(*box, fill=bg, outline="")
         c.create_rectangle(x0, y0, x0 + lw, y0 + lh, outline="#6b7280")
-        if not lay.lines:
+
+        for i in self.selected:
+            if i >= len(self.design.elements):
+                continue
+            e = self.design.elements[i]
+            bx, by, bw, bh = x0 + e.x * scale, y0 + e.y * scale, e.w * scale, e.h * scale
+            c.create_rectangle(bx, by, bx + bw, by + bh, outline="#2563eb", dash=(4, 2))
+            if len(self.selected) == 1:
+                c.create_rectangle(bx + bw - 4, by + bh - 4, bx + bw + 4, by + bh + 4, fill="#2563eb", outline="")
+        if self.design.is_empty():
             c.create_text(cw / 2, ch / 2, text="Type your label text on the left", fill="#9ca3af")
-        self.warn_label.configure(text="\n".join(lay.warnings))
+        problems = rendered.errors + rendered.warnings
+        self.warn_label.configure(text="\n".join(problems), style="Bad.TLabel" if rendered.errors else "Warn.TLabel")
+
+    def _draw_mark(self, mark, x0, y0, scale):
+        from PIL import Image, ImageTk
+        c = self.canvas
+        x, y = x0 + mark.x * scale, y0 + mark.y * scale
+        if mark.kind == "text":
+            px = max(1, round(mark.text_h * scale))
+            # Screen fonts are wider than the printer's condensed font, so shrink
+            # to the width the printer will actually use.
+            printed_w = ld.text_em(mark.text) * mark.text_h * scale
+            self.measure_font.configure(size=-px)
+            screen_w = self.measure_font.measure(mark.text)
+            if screen_w > printed_w > 0:
+                px = max(1, int(px * printed_w / screen_w))
+            anchor, tx = {"left": ("nw", x), "center": ("n", x + mark.w * scale / 2),
+                          "right": ("ne", x + mark.w * scale)}[mark.align]
+            c.create_text(tx, y, text=mark.text, anchor=anchor, font=(self.preview_family, -px, "bold"),
+                          fill="black")
+        elif mark.kind == "bars":
+            start = None
+            for i, bar in enumerate(mark.pattern + [False]):
+                if bar and start is None:
+                    start = i
+                elif not bar and start is not None:
+                    c.create_rectangle(x + start * mark.module * scale, y, x + i * mark.module * scale,
+                                       y + mark.h * scale, fill="black", outline="")
+                    start = None
+        else:
+            if mark.kind == "qr":
+                n = len(mark.pattern)
+                img = Image.new("L", (n, n), 255)
+                img.putdata([0 if v else 255 for row in mark.pattern for v in row])
+                resample = Image.NEAREST
+            else:
+                img, resample = mark.bitmap.convert("L"), Image.BILINEAR
+            size = (max(1, round(mark.w * scale)), max(1, round(mark.h * scale)))
+            photo = ImageTk.PhotoImage(img.resize(size, resample), master=c)
+            self._preview_images.append(photo)  # Tk only keeps a weak reference
+            c.create_image(x, y, image=photo, anchor="nw")
+
+    # ----- dragging on the preview -----
+
+    def _canvas_press(self, event):
+        self._drag = None
+        if not self._view:
+            return
+        self.canvas.focus_set()
+        x0, y0, scale = self._view
+        x, y = (event.x - x0) / scale, (event.y - y0) / scale
+        els = self.design.elements
+        if len(self.selected) == 1 and self.selected[0] < len(els):
+            e = els[self.selected[0]]
+            if abs(x - (e.x + e.w)) <= 8 / scale and abs(y - (e.y + e.h)) <= 8 / scale:
+                self._drag = ("resize", x, y, {self.selected[0]: (e.x, e.y, e.w, e.h)})
+                return
+        hit = next((i for i in reversed(range(len(els)))
+                    if els[i].x <= x <= els[i].x + els[i].w and els[i].y <= y <= els[i].y + els[i].h), None)
+        if hit is None:
+            return
+        if event.state & 0x5:  # Shift or Ctrl: add to / remove from the selection
+            self.selected = sorted(set(self.selected) ^ {hit})
+        elif hit not in self.selected:
+            self.selected = [hit]
+        self._sync_tree_selection()
+        self._drag = ("move", x, y, {i: (els[i].x, els[i].y, els[i].w, els[i].h) for i in self.selected})
+
+    def _canvas_drag(self, event):
+        if not self._drag or not self._view:
+            return
+        x0, y0, scale = self._view
+        mode, sx, sy, start = self._drag
+        dx, dy = round((event.x - x0) / scale - sx), round((event.y - y0) / scale - sy)
+        if not (dx or dy):
+            return
+        if self.design.auto_layout:  # moving something by hand: keep everything where it is from now on
+            self._switch_to_manual()
+            start = {i: (e.x, e.y, e.w, e.h) for i, e in
+                     ((i, self.design.elements[i]) for i in start)}
+            self._drag = (mode, sx, sy, start)
+        label = self.current_label()
+        for i, (ex, ey, ew, eh) in start.items():
+            e = self.design.elements[i]
+            if mode == "move":
+                e.x = min(max(0, ex + dx), label.width - e.w)
+                e.y = min(max(0, ey + dy), label.height - e.h)
+                if len(start) == 1 and abs(e.x + e.w / 2 - label.width / 2) < 6:
+                    e.x = round((label.width - e.w) / 2)  # snap to the middle of the label
+            else:
+                e.w = min(max(12, ew + dx), label.width - e.x)
+                e.h = min(max(12, eh + dy), label.height - e.y)
+        self.refresh()
 
     def exact_preview(self):
-        p = self.current_printer()
-        lay = self.current_layout()
-        if not p or not lay or not lay.lines:
-            messagebox.showinfo(APP_NAME, "Pick a printer and type some text first.", parent=self)
+        p, label = self.current_printer(), self.current_label()
+        if not p or self.design.is_empty():
+            messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
             return
-        zpl = build_zpl(lay, p, self.align_var.get(), copies=1)
+        zpl = ld.build_zpl(ld.render(self.design, label), p.shift_x, p.shift_y)
         self.set_status("Getting exact preview from labelary.com...")
 
         def done(png, error):
@@ -1282,9 +1466,12 @@ class App(tk.Tk):
         if not p:
             messagebox.showinfo(APP_NAME, "Add a printer first (Manage printers...).", parent=self)
             return
-        lay = self.current_layout()
-        if not lay.lines:
-            messagebox.showinfo(APP_NAME, "Type the label text first.", parent=self)
+        if self.design.is_empty():
+            messagebox.showinfo(APP_NAME, "Add something to the label first.", parent=self)
+            return
+        rendered = ld.render(self.design, self.current_label())
+        if rendered.errors:
+            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(rendered.errors), parent=self)
             return
         try:
             copies = int(self.copies_var.get())
@@ -1293,14 +1480,14 @@ class App(tk.Tk):
         except ValueError:
             messagebox.showerror(APP_NAME, f"Copies must be a whole number from 1 to {MAX_COPIES}.", parent=self)
             return
-        if lay.warnings and not messagebox.askyesno(
-                APP_NAME, "\n".join(lay.warnings) + "\n\nPrint anyway?", parent=self):
+        if rendered.warnings and not messagebox.askyesno(
+                APP_NAME, "\n".join(rendered.warnings) + "\n\nPrint anyway?", parent=self):
             return
         if copies > CONFIRM_COPIES_OVER and not messagebox.askyesno(
                 APP_NAME, f"Print {copies} labels on {p.name}?", parent=self):
             return
 
-        zpl = build_zpl(lay, p, self.align_var.get(), copies)
+        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
         self.print_btn.configure(state="disabled")
         self.set_status(f"Sending to {p.name}...")
         label_word = "label" if copies == 1 else "labels"
@@ -1679,7 +1866,9 @@ class PrinterDialog(tk.Toplevel):
         if not p:
             return
         text = f"{p.name}\n{p.width_in:g} x {p.height_in:g} in, {p.dpi} dpi"
-        zpl = build_zpl(layout_label(text, p), p, "center", 1, border=True)
+        label = printer_label(p)
+        zpl = ld.build_zpl(ld.render(ld.Design.from_text(text), label), p.shift_x, p.shift_y, 1,
+                           border=(label.width, label.height))
         self._run(p, "Printing a test label on", lambda: send_label(p, zpl.encode("utf-8")),
                   ("Test label sent. The box should line up with the label's edges. "
                    "If it's off, adjust Shift and save.", "Ok.TLabel"))

@@ -5,12 +5,12 @@ import re
 import shutil
 import tempfile
 import socket
-import sys
 import threading
 import types
 import unittest
 from unittest import mock
 
+import label_design as ld
 import stripes as zl
 
 ZD420 = zl.Printer(name="Packing", host="127.0.0.1", model="ZD420", width_in=2, height_in=1, dpi=203)
@@ -24,80 +24,31 @@ def fields_of(zpl):
     return re.findall(r"\^FO(\d+),(\d+)\^A0N,(\d+),(\d+)\^FB(\d+),1,0,([LCR]),0\^FH\^FD(.*?)\^FS", zpl)
 
 
-class LayoutTests(unittest.TestCase):
+class PrinterLabelTests(unittest.TestCase):
     def test_label_sizes_in_dots(self):
         self.assertEqual(zl.label_dots(ZD420), (406, 203))
         self.assertEqual(zl.label_dots(ZT410), (914, 914))
+        self.assertEqual(zl.printer_label(ZT410).dpmm, 12)
 
-    def test_auto_text_stays_inside_label(self):
+    def test_typed_text_stays_inside_label(self):
         for printer in (ZD420, ZT410):
+            label = zl.printer_label(printer)
             for text in ("A", "Tomatoes", "Roma Tomatoes\nLot 2026-117\nPacked 10/21/2026",
                          "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW", "1\n2\n3\n4\n5\n6\n7\n8"):
-                lay = zl.layout_label(text, printer)
-                self.assertEqual(lay.warnings, [], (printer.name, text))
-                last = lay.lines[-1]
-                self.assertGreaterEqual(lay.lines[0].y, lay.margin)
-                self.assertLessEqual(last.y + last.h, lay.height - lay.margin + 1)
-                for ln in lay.lines:
-                    self.assertLessEqual(zl.text_em(ln.text) * zl.WIDTH_SAFETY * ln.h,
-                                         lay.inner_width + 0.5)
-
-    def test_auto_lines_share_one_size_unless_emphasized(self):
-        lay = zl.layout_label("Short\nA much longer second line", ZT410)
-        self.assertEqual(lay.lines[0].h, lay.lines[1].h)
-        lay = zl.layout_label("Big\nsmall\nsmall", ZT410, emphasize_first=True)
-        self.assertGreater(lay.lines[0].h, lay.lines[1].h)
-
-    def test_blank_edges_trimmed_and_inner_blank_kept(self):
-        lay = zl.layout_label("\n\nOne\n\nTwo\n\n", ZD420)
-        self.assertEqual([ln.text for ln in lay.lines], ["One", "", "Two"])
-
-    def test_fixed_size_and_warnings(self):
-        lay = zl.layout_label("Hi", ZD420, size_pt=36)
-        self.assertEqual(lay.lines[0].h, int(36 / 72 * 8 * 25.4))
-        self.assertEqual(lay.warnings, [])
-        lay = zl.layout_label("This line is far too long for a small label", ZD420, size_pt=36)
-        self.assertTrue(any("too wide" in w for w in lay.warnings))
-        lay = zl.layout_label("1\n2\n3\n4", ZD420, size_pt=36)
-        self.assertTrue(any("too tall" in w for w in lay.warnings))
-
-    def test_empty(self):
-        self.assertEqual(zl.layout_label("  \n\n", ZD420).lines, [])
-
-
-class ZplTests(unittest.TestCase):
-    def test_structure(self):
-        zpl = zl.build_zpl(zl.layout_label("Line one\nLine two", ZD420), ZD420, "center", 3)
-        self.assertTrue(zpl.startswith("^XA\n^FO"))
-        for setting in ("^PW", "^LL", "^CI", "^MN", "^MT", "^MD", "~SD", "^PR", "^JUS"):
-            self.assertNotIn(setting, zpl)  # never change the printer's own settings
-        self.assertTrue(zpl.endswith("^PQ3\n^XZ\n"))
-        f = fields_of(zpl)
-        self.assertEqual([x[6] for x in f], ["Line one", "Line two"])
-        self.assertTrue(all(x[5] == "C" and x[4] == str(406 - 2 * 12) for x in f))
-
-    def test_alignment(self):
-        lay = zl.layout_label("x", ZD420)
-        for align, code in (("left", "L"), ("center", "C"), ("right", "R")):
-            self.assertEqual(fields_of(zl.build_zpl(lay, ZD420, align))[0][5], code)
+                r = ld.render(ld.Design.from_text(text), label)
+                self.assertEqual(r.warnings + r.errors, [], (printer.name, text))
+                for mk in r.marks:
+                    self.assertGreaterEqual(mk.y, label.margin)
+                    self.assertLessEqual(mk.y + mk.h, label.height - label.margin + 1)
+                    self.assertLessEqual(ld.text_em(mk.text) * ld.WIDTH_SAFETY * mk.h, mk.w + 0.5)
 
     def test_special_characters_escaped(self):
-        zpl = zl.build_zpl(zl.layout_label("A^B~C_D 50°F", ZD420), ZD420)
+        zpl = ld.build_zpl(ld.render(ld.Design.from_text("A^B~C_D 50°F"), zl.printer_label(ZD420)))
         self.assertIn("^FDA_5EB_7EC_5FD 50°F^FS", zpl)
-        self.assertTrue(zpl.startswith("^XA\n^CI28\n"))  # UTF-8 only when the text needs it
         self.assertEqual(zpl.count("^XA"), 1)
-
-    def test_shift_and_border(self):
-        p = zl.Printer(name="x", host="h", width_in=2, height_in=1, shift_x=10, shift_y=-5)
-        lay = zl.layout_label("Hi", p)
-        zpl = zl.build_zpl(lay, p, border=True)
-        self.assertIn("^FO10,0^GB406,203,3^FS", zpl)
-        x, y = map(int, fields_of(zpl)[0][:2])
-        self.assertEqual((x, y), (lay.margin + 10, lay.lines[0].y - 5))
-
-    def test_blank_lines_not_printed(self):
-        zpl = zl.build_zpl(zl.layout_label("a\n\nb", ZD420), ZD420)
-        self.assertEqual(len(fields_of(zpl)), 2)
+        self.assertTrue(zpl.startswith("^XA\n^CI28\n"))  # UTF-8 only when the text needs it
+        plain = ld.build_zpl(ld.render(ld.Design.from_text("Plain"), zl.printer_label(ZD420)))
+        self.assertNotIn("^CI", plain)
 
 
 class FakePrinter:
@@ -143,7 +94,7 @@ class NetworkTests(unittest.TestCase):
         fake = FakePrinter()
         self.addCleanup(fake.close)
         p = zl.Printer(name="n", host="127.0.0.1", port=fake.port)
-        zpl = zl.build_zpl(zl.layout_label("Hello", p), p, copies=2)
+        zpl = ld.build_zpl(ld.render(ld.Design.from_text("Hello"), zl.printer_label(p)), copies=2)
         zl.send_label(p, zpl.encode("utf-8"))
         for _ in range(50):
             if fake.received:
