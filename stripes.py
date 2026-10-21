@@ -778,7 +778,7 @@ class App(tk.Tk):
         self.bind_all("<Control-p>", lambda e: self.print_label())
         self.bind_all("<Control-Return>", lambda e: self.print_label())
         self._fill_tree(select=[0])
-        self.value_entry.focus_set()
+        self.simple_box.focus_set()
         if self.config_folder:
             self.bg.run(load_company_config, self._config_loaded)
         else:
@@ -818,7 +818,7 @@ class App(tk.Tk):
         self.bg.run(work, done)
 
     def _restart_to_update(self):
-        if not self.design.is_empty() and not messagebox.askyesno(
+        if not self.active_design().is_empty() and not messagebox.askyesno(
                 APP_NAME, "Restart Stripes now? The label you're working on will be cleared.", parent=self):
             return
         # PYINSTALLER_RESET_ENVIRONMENT makes the new copy start fresh rather
@@ -903,12 +903,27 @@ class App(tk.Tk):
         body.columnconfigure(1, weight=3, uniform="cols")
         body.rowconfigure(0, weight=1)
 
-        left = ttk.LabelFrame(body, text="Label items", padding=8)
+        # Left: Simple tab (just type) and Advanced tab (items, barcodes, pictures...)
+        left = ttk.Frame(body)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self._build_items(left)
+        self.tabs = ttk.Notebook(left)
+        self.tabs.pack(fill="both", expand=True)
+        simple, advanced = ttk.Frame(self.tabs, padding=8), ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(simple, text="  Simple  ")
+        self.tabs.add(advanced, text="  Advanced  ")
+        self._build_simple(simple)
+        self._build_items(advanced)
+        self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
+        recent_row = ttk.Frame(left)
+        recent_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(recent_row, text="Recent:").pack(side="left")
+        self.recent_box = ttk.Combobox(recent_row, state="readonly")
+        self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
+        self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
+        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
+        self._fill_recent()
 
-        right = ttk.LabelFrame(body, text="Preview: drag items to move them, drag the corner to resize",
-                               padding=8)
+        right = self.preview_frame = ttk.LabelFrame(body, text="Preview", padding=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self.canvas = tk.Canvas(right, background="#e5e7eb", highlightthickness=0, width=420, height=300)
         self.canvas.pack(fill="both", expand=True)
@@ -934,6 +949,16 @@ class App(tk.Tk):
 
         self.status = ttk.Label(outer, text="Ready. Tip: Ctrl+P prints.", style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(8, 0))
+
+    def _build_simple(self, parent):
+        ttk.Label(parent, text="Type your label, one line per row:").pack(anchor="w")
+        self.simple_box = tk.Text(parent, height=8, width=30, wrap="none", font=("Segoe UI", 14), undo=True)
+        self.simple_box.pack(fill="both", expand=True, pady=(4, 0))
+        self.simple_box.bind("<<Modified>>", self._simple_modified)
+        self.simple_box.bind("<Control-Return>", lambda e: (self.print_label(), "break")[1])
+        ttk.Label(parent, text="Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
+                               "size per line, use the Advanced tab.",
+                  style="Muted.TLabel", wraplength=330, justify="left").pack(anchor="w", pady=(6, 0))
 
     def _build_items(self, parent):
         tree_frame = ttk.Frame(parent)
@@ -1020,14 +1045,6 @@ class App(tk.Tk):
         self.v_auto_layout = tk.BooleanVar(value=True)
         ttk.Checkbutton(options, text="Auto layout (stack items to fill the label)", variable=self.v_auto_layout,
                         command=self._auto_layout_toggled).pack(side="left")
-        recent_row = ttk.Frame(parent)
-        recent_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(recent_row, text="Recent:").pack(side="left")
-        self.recent_box = ttk.Combobox(recent_row, state="readonly")
-        self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
-        self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
-        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
-        self._fill_recent()
 
     # ----- helpers -----
 
@@ -1056,6 +1073,15 @@ class App(tk.Tk):
     def stock_is_default(self):
         p, st = self.base_printer(), self.selected_stock()
         return not (p and p.stock and st and st.id != p.stock)
+
+    def in_simple_mode(self):
+        return self.tabs.index(self.tabs.select()) == 0
+
+    def active_design(self):
+        """What would print right now: the Simple tab's text, or the Advanced tab's items."""
+        if self.in_simple_mode():
+            return ld.Design.from_text(self.simple_box.get("1.0", "end-1c"))
+        return self.design
 
     def current_label(self):
         p = self.current_printer()
@@ -1362,10 +1388,34 @@ class App(tk.Tk):
         self.v_auto_layout.set(False)
 
     def _new_label(self):
+        if self.in_simple_mode():
+            self.simple_box.delete("1.0", "end")
+            self.simple_box.focus_set()
+            return
         self.design = ld.Design([ld.Element("text")])
         self.v_auto_layout.set(True)
         self._fill_tree(select=[0])
         self.value_entry.focus_set()
+
+    def _simple_modified(self, _event):
+        if self.simple_box.edit_modified():
+            self.simple_box.edit_modified(False)
+            self.refresh()
+
+    def _tab_changed(self, _event=None):
+        if self.in_simple_mode():
+            self.preview_frame.configure(text="Preview")
+            self.simple_box.focus_set()
+        else:
+            # First time in Advanced: start from what was typed, to refine it.
+            typed = ld.Design.from_text(self.simple_box.get("1.0", "end-1c"))
+            if self.design.is_empty() and not typed.is_empty():
+                self.design = typed
+                self.v_auto_layout.set(True)
+                self._fill_tree(select=[0])
+            self.preview_frame.configure(text="Preview: drag items to move them, drag the corner to resize")
+            self.value_entry.focus_set()
+        self.refresh()
 
     def _fill_recent(self):
         self.recent_box["values"] = [self._recent_title(r) for r in self.settings["recent"]]
@@ -1386,16 +1436,24 @@ class App(tk.Tk):
         if i < 0:
             return
         try:
-            self.design = ld.Design.from_dict(copy.deepcopy(self.settings["recent"][i]))
+            design = ld.Design.from_dict(copy.deepcopy(self.settings["recent"][i]))
         except (TypeError, ValueError, AttributeError):
             messagebox.showerror(APP_NAME, "That recent label couldn't be loaded.", parent=self)
             return
-        self.v_auto_layout.set(self.design.auto_layout)
-        self._fill_tree(select=[0] if self.design.elements else [])
         self.recent_box.set("")
+        text = design.simple_text()
+        if text is not None:  # plain typed text: open it in the Simple tab
+            self.simple_box.delete("1.0", "end")
+            self.simple_box.insert("1.0", text)
+            self.tabs.select(0)
+            return
+        self.design = design
+        self.v_auto_layout.set(design.auto_layout)
+        self._fill_tree(select=[0] if design.elements else [])
+        self.tabs.select(1)
 
-    def _remember(self):
-        entry = self.design.to_dict()
+    def _remember(self, design):
+        entry = design.to_dict()
         recent = [r for r in self.settings["recent"] if r != entry]
         self.settings["recent"] = [entry] + recent[: MAX_RECENT - 1]
         self.save()
@@ -1420,7 +1478,8 @@ class App(tk.Tk):
             c.create_text(cw / 2, ch / 2, text="Add a printer to get started", fill="#6b7280")
             self.warn_label.configure(text="")
             return
-        rendered = ld.render(self.design, label)
+        design = self.active_design()
+        rendered = ld.render(design, label)
         scale = min((cw - 40) / label.width, (ch - 40) / label.height)
         lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
@@ -1437,7 +1496,7 @@ class App(tk.Tk):
             c.create_rectangle(*box, fill=bg, outline="")
         c.create_rectangle(x0, y0, x0 + lw, y0 + lh, outline="#6b7280")
 
-        for i in self.selected:
+        for i in ([] if self.in_simple_mode() else self.selected):
             if i >= len(self.design.elements):
                 continue
             e = self.design.elements[i]
@@ -1445,7 +1504,7 @@ class App(tk.Tk):
             c.create_rectangle(bx, by, bx + bw, by + bh, outline="#2563eb", dash=(4, 2))
             if len(self.selected) == 1:
                 c.create_rectangle(bx + bw - 4, by + bh - 4, bx + bw + 4, by + bh + 4, fill="#2563eb", outline="")
-        if self.design.is_empty():
+        if design.is_empty():
             c.create_text(cw / 2, ch / 2, text="Type your label text on the left", fill="#9ca3af")
         problems = rendered.errors + rendered.warnings
         self.warn_label.configure(text="\n".join(problems), style="Bad.TLabel" if rendered.errors else "Warn.TLabel")
@@ -1493,7 +1552,7 @@ class App(tk.Tk):
 
     def _canvas_press(self, event):
         self._drag = None
-        if not self._view:
+        if not self._view or self.in_simple_mode():
             return
         self.canvas.focus_set()
         x0, y0, scale = self._view
@@ -1542,11 +1601,11 @@ class App(tk.Tk):
         self.refresh()
 
     def exact_preview(self):
-        p, label = self.current_printer(), self.current_label()
-        if not p or self.design.is_empty():
+        p, label, design = self.current_printer(), self.current_label(), self.active_design()
+        if not p or design.is_empty():
             messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
             return
-        zpl = ld.build_zpl(ld.render(self.design, label), p.shift_x, p.shift_y)
+        zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
         self.set_status("Getting exact preview from labelary.com...")
 
         def done(png, error):
@@ -1578,10 +1637,11 @@ class App(tk.Tk):
         if not p:
             messagebox.showinfo(APP_NAME, "Add a printer first (Manage printers...).", parent=self)
             return
-        if self.design.is_empty():
-            messagebox.showinfo(APP_NAME, "Add something to the label first.", parent=self)
+        design = self.active_design()
+        if design.is_empty():
+            messagebox.showinfo(APP_NAME, "Type something on the label first.", parent=self)
             return
-        rendered = ld.render(self.design, self.current_label())
+        rendered = ld.render(design, self.current_label())
         if rendered.errors:
             messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(rendered.errors), parent=self)
             return
@@ -1617,7 +1677,7 @@ class App(tk.Tk):
                 self.refresh()
                 note = " Label stock is back to the printer's default."
             self.set_status(f"Sent {copies} {label_word} to {p.name}.{note}", "Ok.TLabel")
-            self._remember()
+            self._remember(design)
             self.check_status(quiet=True)
 
         self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
@@ -1662,32 +1722,26 @@ class PrinterDialog(tk.Toplevel):
         self.vars = {k: tk.StringVar() for k in ("name", "windows_name", "host", "port", "model",
                                                  "width_in", "height_in", "dpi", "shift_x", "shift_y")}
 
-        def row(r, label, widget, hint=""):
+        def row(r, label, widget):
             ttk.Label(form, text=label).grid(row=r, column=0, sticky="w", pady=3)
             widget.grid(row=r, column=1, sticky="w", pady=3)
             self.form_widgets.append(widget)
-            if hint:
-                ttk.Label(form, text=hint, style="Muted.TLabel").grid(row=r, column=2, sticky="w", padx=6)
 
-        row(0, "Name", ttk.Entry(form, textvariable=self.vars["name"], width=30), "what you'll see in the list")
+        row(0, "Name", ttk.Entry(form, textvariable=self.vars["name"], width=30))
         self.windows_box = ttk.Combobox(form, textvariable=self.vars["windows_name"], state="readonly", width=40)
         self.windows_box.bind("<<ComboboxSelected>>", lambda e: self._windows_printer_picked())
         row(1, "Windows printer", self.windows_box)
-        row(2, "IP address", ttk.Entry(form, textvariable=self.vars["host"], width=18),
-            "optional with a Windows printer;\nused for the ready/out-of-labels check")
-        row(3, "Port", ttk.Entry(form, textvariable=self.vars["port"], width=8), "normally 9100")
+        row(2, "IP address", ttk.Entry(form, textvariable=self.vars["host"], width=18))
+        row(3, "Port", ttk.Entry(form, textvariable=self.vars["port"], width=8))
         model = ttk.Combobox(form, textvariable=self.vars["model"], values=list(MODELS), state="readonly", width=10)
         model.bind("<<ComboboxSelected>>", lambda e: self._model_changed())
-        row(4, "Model", model, "fills in the label size")
+        row(4, "Model", model)
         row(5, "Label width (in)", ttk.Entry(form, textvariable=self.vars["width_in"], width=8))
         row(6, "Label height (in)", ttk.Entry(form, textvariable=self.vars["height_in"], width=8))
         row(7, "Resolution (dpi)", ttk.Combobox(form, textvariable=self.vars["dpi"],
-                                                values=[str(d) for d in DPI_TO_DPMM], state="readonly", width=8),
-            "on the printer's sticker")
-        row(8, "Shift right (dots)", ttk.Entry(form, textvariable=self.vars["shift_x"], width=8),
-            "use negative to move left")
-        row(9, "Shift down (dots)", ttk.Entry(form, textvariable=self.vars["shift_y"], width=8),
-            "use negative to move up")
+                                                values=[str(d) for d in DPI_TO_DPMM], state="readonly", width=8))
+        row(8, "Shift right (dots)", ttk.Entry(form, textvariable=self.vars["shift_x"], width=8))
+        row(9, "Shift down (dots)", ttk.Entry(form, textvariable=self.vars["shift_y"], width=8))
 
         actions = ttk.Frame(form)
         actions.grid(row=10, column=0, columnspan=3, sticky="w", pady=(12, 0))

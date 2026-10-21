@@ -96,6 +96,13 @@ class Design:
             lines.pop()
         return cls([Element("text", ln, size_pt=size_pt, align=align) for ln in lines])
 
+    def simple_text(self):
+        """The design as plain typed lines, if that's all it is (Simple tab); otherwise None."""
+        if not self.auto_layout or any(e.kind != "text" or e.size_pt is not None or e.align != "center"
+                                       for e in self.elements):
+            return None
+        return "\n".join(e.value for e in self.elements)
+
     def is_empty(self):
         return not any(e.value.strip() or e.image_png for e in self.elements)
 

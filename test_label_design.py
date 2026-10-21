@@ -217,6 +217,13 @@ class DesignStorageTests(unittest.TestCase):
         self.assertEqual([(e.kind, e.value, e.align) for e in d.elements],
                          [("text", "One", "left"), ("text", "Two", "left")])
 
+    def test_simple_text(self):
+        self.assertEqual(ld.Design.from_text("One\nTwo").simple_text(), "One\nTwo")
+        self.assertIsNone(ld.Design([text("Big", size_pt=20)]).simple_text())
+        self.assertIsNone(ld.Design([text("Left", align="left")]).simple_text())
+        self.assertIsNone(ld.Design([text("A"), ld.Element("qr", "Q")]).simple_text())
+        self.assertIsNone(ld.Design([text("A")], auto_layout=False).simple_text())
+
     def test_from_text_trims_blank_edges(self):
         self.assertEqual([e.value for e in ld.Design.from_text("\n\nOne\n\nTwo\n\n").elements],
                          ["One", "", "Two"])
