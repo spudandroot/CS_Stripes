@@ -3,6 +3,10 @@ name: Build
 # Every push is tested and built. To publish a release (which every copy of
 # Stripes then updates itself to), either push a version tag like v1.2.0, or use
 # Actions > Build > Run workflow and type the version.
+#
+# A version like v1.4.0-beta.1 is a beta: it's published as a pre-release, and the
+# "beta" release (which only holds version.txt) is pointed at it. Only PCs and users
+# listed in beta.json follow it. Betas can be run from any branch.
 on:
   push:
     branches: [main]
@@ -11,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Version to release, e.g. v1.2.0 (leave empty to just build)"
+        description: "Version to release, e.g. v1.2.0, or v1.3.0-beta.1 for beta PCs only (empty: just build)"
         required: false
         default: ""
 
@@ -42,7 +46,9 @@ jobs:
           $v = if ($env:RELEASE) { $env:RELEASE }
                elseif ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
                else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
-          if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.2.0" }
+          if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
+            throw "Version must look like v1.2.0 or v1.2.0-beta.1"
+          }
           "VERSION = `"$v`"" | Out-File -Encoding utf8 stripes_version.py
           "STRIPES_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
@@ -61,7 +67,25 @@ jobs:
           path: dist/*
 
       - name: Publish release
-        if: github.ref_type == 'tag' || inputs.release != ''
+        if: (github.ref_type == 'tag' || inputs.release != '') && !contains(env.STRIPES_VERSION, '-beta.')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes
+        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes --latest
+
+      - name: Publish beta
+        if: (github.ref_type == 'tag' || inputs.release != '') && contains(env.STRIPES_VERSION, '-beta.')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ env.STRIPES_VERSION }}
+        run: |
+          gh release create $env:V dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes $env:V" --generate-notes --prerelease
+          if ($LASTEXITCODE) { exit 1 }
+          # Point the beta channel at it: beta PCs read beta/version.txt, then download from the release above
+          gh release view beta *> $null
+          if ($LASTEXITCODE) {
+            gh release create beta dist/version.txt --target "${{ github.sha }}" --prerelease --title "Beta channel" --notes "Holds the version beta PCs should run. Don't delete."
+          } else {
+            gh release upload beta dist/version.txt --clobber
+          }
+          if ($LASTEXITCODE) { exit 1 }

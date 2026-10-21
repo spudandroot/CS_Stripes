@@ -24,6 +24,7 @@ IT keeps two files in a folder on a server share:
 |---|---|
 | `printers.json` | Each printer: name, IP, model, dpi, default stock, and the settings it should have |
 | `stock.json` | Each kind of label roll: size and media type |
+| `beta.json` | Optional: computers and users who get beta versions (see [Beta versions](#beta-versions)) |
 
 Stripes finds the folder through a registry value set by Group Policy (so the server's name never
 appears in this repo):
@@ -100,6 +101,28 @@ the run's artifacts). To ship to all PCs, publish a release: on GitHub go to
 Pushing a tag (`git tag v1.1.0 && git push origin v1.1.0`) does the same.
 
 That publishes a Release; each copy of Stripes picks it up the next time it starts (or within a few hours).
+
+### Beta versions
+
+To try a version on a few PCs first, list them in `beta.json` next to `printers.json`:
+
+```json
+{"beta": ["ARROW01", "jsmith"]}
+```
+
+Each entry is a computer name (anyone on that PC) or a Windows username (that person on any PC).
+Then run the workflow with a beta version, e.g. `v1.4.0-beta.1`. It can be run from any branch.
+It's published as a pre-release, which ordinary copies of Stripes ignore. Copies on listed PCs move
+to it the next time they start (or within a few hours), and show "Beta" next to the version.
+
+- Release the same code to everyone with `v1.4.0`; beta PCs move to it too.
+- Beta PCs always run the newest of the latest release and the current beta, even if that's
+  older than what they have, so publishing a fixed beta (or re-pointing `beta`) rolls them back.
+- Take a PC off the list and it goes back to the latest release.
+- **Deployment status** shows who is on beta.
+
+A copy older than v1.4.0 doesn't know about betas: to start one on beta, download the beta's
+`Stripes.exe` from Releases into `%LocalAppData%\Programs\Stripes` once (with Stripes closed).
 
 ## Development
 
