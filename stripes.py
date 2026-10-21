@@ -7,10 +7,12 @@ Needs pywin32 for Windows printers; everything else is standard library.
 
 import copy
 import gc
+import getpass
 import glob
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
@@ -51,6 +53,7 @@ MAX_COPIES = 9999
 CONFIRM_COPIES_OVER = 50
 UPDATE_URL = "https://github.com/spudandroot/CS_Stripes/releases"
 UPDATE_CHECK_HOURS = 6
+HEARTBEAT_MINUTES = 15
 
 
 # --------------------------------------------------------------------------
@@ -625,6 +628,131 @@ def labelary_png(zpl, printer):
 
 
 # --------------------------------------------------------------------------
+# Deployment log
+# --------------------------------------------------------------------------
+
+def status_folder():
+    """Where each copy of Stripes reports in: a "status" folder next to the config
+    folder. It's only used if IT has created it."""
+    override = os.environ.get("STRIPES_STATUS")
+    if override:
+        return override
+    config = configured_folder()
+    return os.path.join(os.path.dirname(os.path.normpath(config)), "status") if config else None
+
+
+def _now():
+    return datetime.now().isoformat(sep=" ", timespec="seconds")
+
+
+def _short_time(stamp):
+    """'2026-10-21 16:42:05' -> 'Oct 21, 4:42 PM' for display."""
+    try:
+        return datetime.fromisoformat(stamp).strftime("%b %d, %I:%M %p").replace(" 0", " ")
+    except (TypeError, ValueError):
+        return stamp or ""
+
+
+def _safe_name(text):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text or "unknown")
+
+
+class DeploymentLog:
+    """One small JSON file per PC and user in the shared status folder, recording
+    the installed version, updates and a heartbeat while Stripes is open."""
+
+    MAX_EVENTS = 50
+
+    def __init__(self, folder, computer=None, user=None):
+        self.folder = folder
+        self.computer = computer or os.environ.get("COMPUTERNAME") or socket.gethostname()
+        self.user = user or os.environ.get("USERNAME") or getpass.getuser()
+        self.path = os.path.join(folder, f"{_safe_name(self.computer)}_{_safe_name(self.user)}.json")
+        self._lock = threading.Lock()
+
+    def read(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def write(self, event=None, **fields):
+        """Merge fields into this PC/user's record (and log an event).
+        Returns False when the status folder isn't there or can't be reached."""
+        with self._lock:
+            if not os.path.isdir(self.folder):
+                return False
+            record = self.read()
+            now = _now()
+            record.setdefault("first_seen", now)
+            record.update(computer=self.computer, user=self.user, last_seen=now, **fields)
+            if event:
+                events = record.get("events") if isinstance(record.get("events"), list) else []
+                record["events"] = (events + [{"at": now, "event": event}])[-self.MAX_EVENTS:]
+            tmp = f"{self.path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+            os.replace(tmp, self.path)
+            return True
+
+    def started(self, version, exe):
+        previous = self.read().get("version")
+        fields = dict(version=version, exe=exe, last_start=_now(), running=True, pending_update=None,
+                      windows=platform.platform())
+        if previous is None:
+            event = f"Installed ({version})"
+        elif previous != version:
+            event = f"Updated {previous} -> {version}"
+            fields["last_update"] = {"from": previous, "to": version, "at": _now()}
+        else:
+            event = None
+        return self.write(event, **fields)
+
+    def update_failed(self, message):
+        last = self.read().get("last_update_error") or {}
+        event = None if last.get("message") == message else f"Update check failed: {message}"
+        return self.write(event, last_update_error={"at": _now(), "message": message})
+
+
+def read_deployment(folder):
+    """All the records in the status folder, newest first."""
+    records = []
+    for path in glob.glob(os.path.join(glob.escape(folder), "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("computer"):
+            records.append(data)
+    return sorted(records, key=lambda r: r.get("last_seen", ""), reverse=True)
+
+
+def is_open_now(record, now=None):
+    """Open if it reported a heartbeat recently and didn't report closing."""
+    try:
+        seen = datetime.fromisoformat(record.get("last_seen", ""))
+    except ValueError:
+        return False
+    age = ((now or datetime.now()) - seen).total_seconds()
+    return bool(record.get("running")) and age < HEARTBEAT_MINUTES * 60 * 2
+
+
+def remove_download_mark(path):
+    """Remove Windows' "downloaded from the internet" mark from our own exe, so the
+    "Do you want to run this file?" warning doesn't come back on every start."""
+    if sys.platform != "win32":
+        return False
+    try:
+        os.remove(path + ":Zone.Identifier")
+        return True
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------
 # Self-update
 # --------------------------------------------------------------------------
 
@@ -785,8 +913,40 @@ class App(tk.Tk):
             self._show_config_problems()
             self._maybe_first_run()
         if getattr(sys, "frozen", False):  # only the built .exe updates itself
+            remove_download_mark(sys.executable)
             remove_old_versions(sys.executable)
             self.after(3000, self._check_for_update)
+        folder = status_folder()
+        self.deployment = DeploymentLog(folder) if folder else None
+        self._log(lambda log: log.started(VERSION, sys.executable))
+        self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ----- deployment log -----
+
+    def _log(self, write):
+        """Update this PC's record in the shared status folder, off the UI thread."""
+        if self.deployment:
+            self.bg.run(lambda: write(self.deployment), lambda result, error: None)
+
+    def _heartbeat(self):
+        self._log(lambda log: log.write(running=True))
+        self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
+
+    def _on_close(self, event="Closed"):
+        if self.deployment:  # don't let a slow share hold up closing
+            t = threading.Thread(target=lambda: self._quiet(self.deployment.write, running=False,
+                                                            last_closed=_now()), daemon=True)
+            t.start()
+            t.join(2)
+        self.destroy()
+
+    @staticmethod
+    def _quiet(func, *args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except OSError:
+            pass
 
     # ----- self-update -----
 
@@ -803,12 +963,16 @@ class App(tk.Tk):
             return "installed", latest
 
         def done(result, error):
+            if error:
+                self._log(lambda log: log.update_failed(describe_error(error)))
             if error or not result:
                 # offline or nothing new: look again later
                 self.after(UPDATE_CHECK_HOURS * 3600 * 1000, self._check_for_update)
                 return
             kind, version = result
             if kind == "installed":
+                self._log(lambda log: log.write(f"Downloaded {version}; finishes when Stripes restarts",
+                                                pending_update=version, last_update_error=None))
                 self.update_label.configure(text=f"Stripes {version} is ready.", style="Ok.TLabel")
                 self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
             else:
@@ -825,7 +989,7 @@ class App(tk.Tk):
         # than reuse this one's unpacked files.
         env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
         subprocess.Popen([sys.executable], env=env, close_fds=True)
-        self.destroy()
+        self._on_close()
 
     @property
     def company(self):
@@ -839,6 +1003,8 @@ class App(tk.Tk):
         if error is None:
             self.cfg = cfg
             self._load_printer_list(select=self.printer_var.get() or self.settings.get("last_printer"))
+            source = "saved copy (server unreachable)" if cfg.cached_at else "server" if cfg.source else "none"
+            self._log(lambda log: log.write(config=source, printers=len(cfg.printers)))
         self._show_config_problems()
         self._maybe_first_run()
 
@@ -1683,6 +1849,97 @@ class App(tk.Tk):
         self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
 
 
+class DeploymentWindow(tk.Toplevel):
+    """Every PC/user running Stripes, from the shared status folder."""
+
+    COLUMNS = (("computer", "Computer", 110), ("user", "User", 100), ("version", "Version", 70),
+               ("status", "Status", 85), ("last_seen", "Last seen", 125), ("last_update", "Last update", 230),
+               ("first_seen", "Installed", 125), ("notes", "Notes", 280))
+
+    def __init__(self, app, folder):
+        super().__init__(app)
+        self.app, self.folder = app, folder
+        self.title("Deployment status")
+        self.geometry("1100x480")
+        self.transient(app)
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        self.summary = ttk.Label(frame, text="Loading...", font=("Segoe UI", 11, "bold"))
+        self.summary.pack(anchor="w")
+        ttk.Label(frame, text=f"From {folder}. Double-click a row for its history.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(table, columns=[c[0] for c in self.COLUMNS], show="headings")
+        for key, title, width in self.COLUMNS:
+            self.tree.heading(key, text=title, anchor="w")
+            self.tree.column(key, width=width, anchor="w", stretch=key == "notes")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.tag_configure("behind", foreground="#b45309")
+        self.tree.tag_configure("problem", foreground="#b91c1c")
+        self.tree.bind("<Double-1>", lambda e: self._show_history())
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side="left")
+        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        self.records = []
+        self.refresh()
+
+    def refresh(self):
+        self.summary.configure(text="Loading...")
+        self.app.bg.run(lambda: read_deployment(self.folder), self._loaded)
+
+    def _loaded(self, records, error):
+        if not self.winfo_exists():
+            return
+        if error:
+            self.summary.configure(text=f"Couldn't read {self.folder}: {describe_error(error)}")
+            return
+        self.records = records
+        versions = [parse_version(r.get("version")) for r in records]
+        latest = max([v for v in versions if v] + [parse_version(VERSION) or (0, 0, 0)])
+        latest_text = "v" + ".".join(map(str, latest))
+        self.tree.delete(*self.tree.get_children())
+        behind = open_now = 0
+        for i, (r, v) in enumerate(zip(records, versions)):
+            is_open = is_open_now(r)
+            open_now += is_open
+            notes, tag = [], ()
+            if v and v < latest:
+                behind += 1
+                tag = ("behind",)
+            if r.get("pending_update"):
+                notes.append(f"{r['pending_update']} downloaded, waiting for restart")
+            error = r.get("last_update_error")
+            if isinstance(error, dict) and error.get("message"):
+                notes.append(f"Update problem: {error['message']}")
+                tag = ("problem",)
+            if r.get("config", "server") != "server":
+                notes.append(f"Settings: {r.get('config')}")
+            update = r.get("last_update") or {}
+            last_update = (f"{update.get('from')} → {update.get('to')}  ({_short_time(update.get('at'))})"
+                           if update else "")
+            self.tree.insert("", "end", iid=str(i), tags=tag, values=(
+                r.get("computer", ""), r.get("user", ""), r.get("version", ""),
+                "Open now" if is_open else "Closed", _short_time(r.get("last_seen")), last_update,
+                _short_time(r.get("first_seen")), "; ".join(notes)))
+        self.summary.configure(text=f"{len(records)} installs  ·  {open_now} open now  ·  "
+                                    f"{len(records) - behind} on {latest_text}  ·  {behind} behind")
+
+    def _show_history(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        r = self.records[int(sel[0])]
+        lines = [f"{e.get('at', '')}   {e.get('event', '')}" for e in reversed(r.get("events") or [])]
+        details = (f"{r.get('computer')} / {r.get('user')}\nVersion {r.get('version')}  ·  {r.get('windows', '')}\n"
+                   f"{r.get('exe', '')}\n\n" + ("\n".join(lines) or "No events yet."))
+        messagebox.showinfo("History", details, parent=self)
+
+
 NO_WINDOWS_PRINTER = "(none - send straight to the IP address)"
 
 
@@ -1756,8 +2013,12 @@ class PrinterDialog(tk.Toplevel):
         self.msg.grid(row=11, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         bottom = ttk.Frame(frame)
-        bottom.grid(row=1, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(bottom, text="Close", command=self.destroy).pack()
+        bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        folder = status_folder()
+        if folder:
+            ttk.Button(bottom, text="Deployment status...",
+                       command=lambda: self._open_deployment(folder)).pack(side="left")
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
 
         self._fill_list()
         if self._rows():
@@ -1864,6 +2125,15 @@ class PrinterDialog(tk.Toplevel):
         win.wait_window()
 
     # ----- list and form -----
+
+    def _open_deployment(self, folder):
+        self.grab_release()  # this dialog is modal; hand input to the new window while it's open
+        win = DeploymentWindow(self.app, folder)
+        win.transient(self)
+        win.grab_set()
+        self.wait_window(win)
+        if self.winfo_exists():
+            self.grab_set()
 
     def _rows(self):
         return ([("company", p) for p in self.app.company] +

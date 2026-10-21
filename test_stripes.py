@@ -415,5 +415,75 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertFalse(zl.folder_is_writable(os.path.join(self.dir, "missing")))
 
 
+class DeploymentLogTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def log(self, computer="ARROW01", user="John"):
+        return zl.DeploymentLog(self.dir, computer, user)
+
+    def test_install_update_heartbeat_close(self):
+        log = self.log()
+        self.assertTrue(log.started("v1.2.0", r"C:\Users\John\AppData\Local\Programs\Stripes\Stripes.exe"))
+        r = log.read()
+        self.assertEqual((r["computer"], r["user"], r["version"], r["running"]), ("ARROW01", "John", "v1.2.0", True))
+        self.assertEqual([e["event"] for e in r["events"]], ["Installed (v1.2.0)"])
+        first_seen = r["first_seen"]
+
+        log.started("v1.2.0", "x")  # plain restart: no new event
+        log.write("Downloaded v1.3.0; finishes when Stripes restarts", pending_update="v1.3.0")
+        log.started("v1.3.0", "x")
+        r = log.read()
+        self.assertEqual(r["first_seen"], first_seen)
+        self.assertEqual((r["version"], r["pending_update"]), ("v1.3.0", None))
+        self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.2.0", "v1.3.0"))
+        self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v1.2.0 -> v1.3.0")
+
+        self.assertTrue(zl.is_open_now(r))
+        log.write(running=False, last_closed=zl._now())
+        self.assertFalse(zl.is_open_now(log.read()))
+
+    def test_stale_heartbeat_is_not_open(self):
+        from datetime import datetime, timedelta
+        old = (datetime.now() - timedelta(hours=2)).isoformat(sep=" ", timespec="seconds")
+        self.assertFalse(zl.is_open_now({"running": True, "last_seen": old}))
+
+    def test_repeated_update_errors_logged_once(self):
+        log = self.log()
+        log.update_failed("No answer")
+        log.update_failed("No answer")
+        log.update_failed("Something else")
+        self.assertEqual(len(log.read()["events"]), 2)
+
+    def test_events_are_capped(self):
+        log = self.log()
+        for i in range(zl.DeploymentLog.MAX_EVENTS + 10):
+            log.write(f"event {i}")
+        events = log.read()["events"]
+        self.assertEqual(len(events), zl.DeploymentLog.MAX_EVENTS)
+        self.assertEqual(events[-1]["event"], f"event {zl.DeploymentLog.MAX_EVENTS + 9}")
+
+    def test_read_all_skips_junk(self):
+        self.log("PC1", "Ann").started("v1.2.0", "x")
+        self.log("PC2", "Bob/Smith").started("v1.3.0", "x")  # odd characters are made safe for file names
+        with open(os.path.join(self.dir, "junk.json"), "w") as f:
+            f.write("{not json")
+        with open(os.path.join(self.dir, "other.txt"), "w") as f:
+            f.write("ignored")
+        records = zl.read_deployment(self.dir)
+        self.assertEqual(sorted(r["computer"] for r in records), ["PC1", "PC2"])
+        self.assertIn("PC2_Bob_Smith.json", os.listdir(self.dir))
+
+    def test_no_status_folder_means_no_writes(self):
+        log = zl.DeploymentLog(os.path.join(self.dir, "missing"), "PC", "U")
+        self.assertFalse(log.started("v1.2.0", "x"))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "missing")))
+
+    def test_status_folder_sits_next_to_config(self):
+        with mock.patch.dict(os.environ, {"STRIPES_STATUS": "", "STRIPES_CONFIG": r"/srv/Software/Stripes/config"}):
+            self.assertEqual(zl.status_folder(), os.path.join("/srv/Software/Stripes", "status"))
+
+
 if __name__ == "__main__":
     unittest.main()

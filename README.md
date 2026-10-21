@@ -84,6 +84,14 @@ One GPO, linked to an OU that contains both the users and their PCs:
 4. **Shortcuts**: *User Configuration > Preferences > Windows Settings > Shortcuts*, location
    **Desktop** and **Start Menu**, target `%LocalAppData%\Programs\Stripes\Stripes.exe`
 
+### Deployment log
+
+Create a `status` folder next to `config` (e.g. `\\SERVER\Share\Stripes\status`) and give Domain
+Users **Modify** on it. Each copy of Stripes then keeps one small file there (`COMPUTER_user.json`)
+with its version, when it was installed, its last update, a heartbeat every 15 minutes while open,
+pending updates and update errors. **Manage printers > Deployment status...** shows them all in one
+table. Without the folder, nothing is written.
+
 ## Releasing a new version
 
 Every push to `main` is tested and built by GitHub Actions on Windows (download the build from
