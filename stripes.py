@@ -733,6 +733,39 @@ class PrinterSnapshot:
         return "Ready", "ok"
 
 
+STOCK_TOLERANCE_IN = 0.25  # measured label sizes vary a little (gaps, calibration)
+_MEDIA_NAMES = {"gap": "gap labels", "mark": "black mark labels", "continuous": "continuous media"}
+
+
+def check_stock(printer, stock, snap):
+    """Compare the label stock a printer should have with what the printer itself reports.
+
+    Returns (description, problem or None), e.g.
+    ("3 x 3 in · printer measures 3.00 x 3.07 in", None).
+    """
+    dots_per_inch = printer.dpmm * 25.4
+    width = snap.settings.get("print_width")
+    length = snap.status.get("label_length_dots")
+    media = snap.settings.get("media")
+    name = stock.name if stock else f"{printer.width_in:g} x {printer.height_in:g} in (no stock set)"
+    measured = []
+    if width and length:
+        measured.append(f"{width / dots_per_inch:.2f} x {length / dots_per_inch:.2f} in")
+    if media:
+        measured.append(_MEDIA_NAMES.get(media, media))
+    description = name + (f" · printer measures {', '.join(measured)}" if measured else "")
+    if not stock:
+        return description, None
+    off = []
+    if width and abs(width / dots_per_inch - stock.width_in) > STOCK_TOLERANCE_IN:
+        off.append(f"printer is set {width / dots_per_inch:.2f} in wide")
+    if length and media != "continuous" and abs(length / dots_per_inch - stock.height_in) > STOCK_TOLERANCE_IN:
+        off.append(f"printer measures labels {length / dots_per_inch:.2f} in long")
+    if media and stock.media and media != stock.media and "media" not in printer.expected:
+        off.append(f"printer is set for {_MEDIA_NAMES.get(media, media)}")
+    return description, (f"Doesn't look like {stock.name}: " + "; ".join(off)) if off else None
+
+
 def windows_queue_jobs(windows_name):
     h = win32print.OpenPrinter(windows_name)
     try:
@@ -2037,24 +2070,25 @@ class PrinterMonitor(tk.Toplevel):
         self.geometry("1180x780")
         self.minsize(760, 480)
         self.configure(background="#f3f4f6")
-        self.snapshots, self.pending, self.cards = {}, set(), {}
+        self.snapshots, self.pending, self.cards, self.expanded = {}, set(), {}, set()
         self._timer = None
 
         bar = ttk.Frame(self, padding=(14, 12, 14, 6))
         bar.pack(fill="x")
-        titles = ttk.Frame(bar)
-        titles.pack(side="left")
-        ttk.Label(titles, text="Printer monitor", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        self.summary = ttk.Label(titles, text="Checking printers...", style="Muted.TLabel")
-        self.summary.pack(anchor="w")
         ttk.Button(bar, text="Refresh now", command=self.refresh).pack(side="right")
+        self.all_button = ttk.Button(bar, text="More info for all", command=self._toggle_all)
+        self.all_button.pack(side="right", padx=(0, 8))
         self.refresh_var = tk.StringVar(value="Every 10 seconds")
         box = ttk.Combobox(bar, textvariable=self.refresh_var, values=list(self.REFRESH), state="readonly", width=16)
         box.pack(side="right", padx=8)
         box.bind("<<ComboboxSelected>>", lambda e: self._schedule())
         ttk.Label(bar, text="Auto refresh:").pack(side="right")
-        self.updated = ttk.Label(bar, text="", style="Muted.TLabel")
-        self.updated.pack(side="right", padx=14)
+        # Packed last so the buttons keep their room and a long summary is what gets cut
+        titles = ttk.Frame(bar)
+        titles.pack(side="left", fill="x", expand=True)
+        ttk.Label(titles, text="Printer monitor", font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        self.summary = ttk.Label(titles, text="Checking printers...", style="Muted.TLabel")
+        self.summary.pack(anchor="w")
 
         # Scrollable grid of printer cards
         holder = tk.Frame(self, background="#f3f4f6")
@@ -2091,7 +2125,7 @@ class PrinterMonitor(tk.Toplevel):
                      foreground=self.MUTED).grid(row=0, column=0, pady=40)
         for i, p in enumerate(printers):
             outer = tk.Frame(self.grid_frame, background=self.COLORS["wait"])
-            outer.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6)
+            outer.grid(row=i // 2, column=i % 2, sticky="new", padx=6, pady=6)
             body = tk.Frame(outer, background=self.CARD, padx=12, pady=10)
             body.pack(side="right", fill="both", expand=True, padx=(5, 0))
             self.cards[p.name] = (outer, body)
@@ -2140,16 +2174,20 @@ class PrinterMonitor(tk.Toplevel):
     def _summarize(self):
         snaps = [self.snapshots[p.name] for p in self.printers() if p.name in self.snapshots]
         counts = {}
-        for s in snaps:
-            kind = s.state[1]
+        for snap in snaps:
+            kind = snap.state[1]
+            stock = next((st for st in self.app.cfg.stock if st.id == snap.printer.stock), None)
+            if kind == "ok" and snap.reachable and check_stock(snap.printer, stock, snap)[1]:
+                kind = "warn"
             counts[kind] = counts.get(kind, 0) + 1
-        parts = [f"{len(self.printers())} printers"]
-        for kind, word in (("ok", "ready"), ("busy", "printing"), ("warn", "differ from spec"),
-                           ("bad", "need attention"), ("off", "not reachable")):
+        # Most urgent first, so a narrow window cuts the good news rather than the problems
+        parts = []
+        for kind, word in (("bad", "need attention"), ("off", "not reachable"), ("warn", "to check"),
+                           ("busy", "printing"), ("ok", "ready")):
             if counts.get(kind):
                 parts.append(f"{counts[kind]} {word}")
-        self.summary.configure(text="  ·  ".join(parts))
-        self.updated.configure(text=f"Updated {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}")
+        parts.append(f"updated {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}")
+        self.summary.configure(text=" · ".join(parts))
 
     # ----- one printer card -----
 
@@ -2157,45 +2195,70 @@ class PrinterMonitor(tk.Toplevel):
         outer, body = self.cards[p.name]
         for child in body.winfo_children():
             child.destroy()
+        stock = next((st for st in self.app.cfg.stock if st.id == p.stock), None)
+        stock_text, stock_problem = check_stock(p, stock, snap) if snap and snap.reachable else (None, None)
         state, kind = snap.state if snap else ("Checking...", "wait")
+        if stock_problem and kind == "ok":
+            state, kind = "Check label stock", "warn"
         outer.configure(background=self.COLORS[kind])
 
+        # 1. What needs attention
         head = tk.Frame(body, background=self.CARD)
         head.pack(fill="x")
         tk.Label(head, text=p.name, font=("Segoe UI", 13, "bold"), background=self.CARD,
                  foreground=self.TEXT).pack(side="left")
         tk.Label(head, text=f" {state} ", font=("Segoe UI", 9, "bold"), background=self.COLORS[kind],
                  foreground="white").pack(side="right")
-        where = f"{p.host}" if p.host else f"Windows printer '{p.windows_name}'"
-        stock = next((s.name for s in self.app.cfg.stock if s.id == p.stock), None)
-        subtitle = " · ".join(x for x in (p.model, where, f"{p.dpi} dpi",
-                                          stock or f'{p.width_in:g} x {p.height_in:g} in') if x)
-        tk.Label(body, text=subtitle, background=self.CARD, foreground=self.MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w")
+        if snap is not None:
+            for text, color, weight in ([(t, "bad", "bold") for t in snap.problems] +
+                                        [(t, "warn", "normal") for t in (snap.diffs or [])] +
+                                        ([(stock_problem, "warn", "normal")] if stock_problem else [])):
+                tk.Label(body, text=f"● {text}", background=self.CARD, foreground=self.COLORS[color],
+                         font=("Segoe UI", 10, weight), wraplength=500, justify="left").pack(anchor="w", pady=(3, 0))
+            if not snap.reachable:
+                tk.Label(body, text=snap.error or "No answer.", background=self.CARD, foreground=self.MUTED,
+                         wraplength=500, justify="left").pack(anchor="w", pady=(4, 0))
+            facts = []
+            if snap.reachable:
+                facts.append(("Now", snap.activity))
+            if snap.queue_jobs:
+                facts.append(("Windows queue", f"{snap.queue_jobs} job{'s' if snap.queue_jobs != 1 else ''} waiting"))
+            facts.append(("Label stock", stock_text or (stock.name if stock else f"{p.width_in:g} x {p.height_in:g} in")))
+            grid = tk.Frame(body, background=self.CARD)
+            grid.pack(fill="x", pady=(6, 0))
+            for r, (name, value) in enumerate(facts):
+                tk.Label(grid, text=name, background=self.CARD, foreground=self.MUTED,
+                         font=("Segoe UI", 10)).grid(row=r, column=0, sticky="nw", padx=(0, 10))
+                tk.Label(grid, text=value, background=self.CARD, foreground=self.TEXT, font=("Segoe UI", 10, "bold"),
+                         wraplength=430, justify="left").grid(row=r, column=1, sticky="w")
+
+        # 2. Which printer it is
+        serial = snap.info.get("device.unique_id") if snap else None
+        where = p.host or f"Windows printer '{p.windows_name}'"
+        ident = " · ".join(x for x in (p.model, where, f"SN {serial}" if serial else None) if x)
+        tk.Label(body, text=ident, background=self.CARD, foreground=self.MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
         if snap is None:
             return
 
-        for problem in snap.problems:
-            tk.Label(body, text=f"● {problem}", background=self.CARD, foreground=self.COLORS["bad"],
-                     font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
-        for diff in snap.diffs or []:
-            tk.Label(body, text=f"● {diff}", background=self.CARD,
-                     foreground=self.COLORS["warn"]).pack(anchor="w")
-        if not snap.reachable:
-            tk.Label(body, text=snap.error or "No answer.", background=self.CARD, foreground=self.MUTED,
-                     wraplength=480, justify="left").pack(anchor="w", pady=(6, 0))
-
+        # 3. Everything else, on request
+        expanded = p.name in self.expanded
+        toggle = tk.Label(body, text=("▾ Less info" if expanded else "▸ More info"), background=self.CARD,
+                          foreground=self.COLORS["busy"], cursor="hand2", font=("Segoe UI", 9, "underline"))
+        toggle.pack(anchor="w", pady=(6, 0))
+        toggle.bind("<Button-1>", lambda e: self._toggle(p))
+        if not expanded:
+            return
         rows = self._details(p, snap)
         if rows:
             grid = tk.Frame(body, background=self.CARD)
-            grid.pack(fill="x", pady=(8, 0))
+            grid.pack(fill="x", pady=(4, 0))
             for i, (name, value) in enumerate(rows):
                 r, c = i // 2, (i % 2) * 2
                 tk.Label(grid, text=name, background=self.CARD, foreground=self.MUTED,
                          font=("Segoe UI", 9)).grid(row=r, column=c, sticky="w", padx=(0, 8))
                 tk.Label(grid, text=value, background=self.CARD, foreground=self.TEXT,
                          font=("Segoe UI", 9, "bold")).grid(row=r, column=c + 1, sticky="w", padx=(0, 18))
-
         foot = tk.Frame(body, background=self.CARD)
         foot.pack(fill="x", pady=(8, 0))
         checked = snap.checked_at.strftime("%I:%M:%S %p").lstrip("0")
@@ -2205,15 +2268,23 @@ class PrinterMonitor(tk.Toplevel):
         if snap.reachable and (snap.report or snap.info):
             ttk.Button(foot, text="Full report...", command=lambda: self._full_report(p, snap)).pack(side="right")
 
+    def _toggle(self, p):
+        self.expanded ^= {p.name}
+        self._render(p, self.snapshots.get(p.name))
+
+    def _toggle_all(self):
+        names = {p.name for p in self.printers()}
+        self.expanded = set() if self.expanded >= names else names
+        self.all_button.configure(text="Less info for all" if self.expanded else "More info for all")
+        for p in self.printers():
+            if p.name in self.cards:
+                self._render(p, self.snapshots.get(p.name))
+
     def _details(self, p, snap):
         """(name, value) pairs worth showing, only for what the printer actually told us."""
         st, report, info = snap.status, dict(snap.report), snap.info
         dots_per_inch = p.dpmm * 25.4
         rows = []
-        if snap.reachable:
-            rows.append(("Activity", snap.activity))
-        if snap.queue_jobs is not None:
-            rows.append(("Windows queue", f"{snap.queue_jobs} job{'s' if snap.queue_jobs != 1 else ''}"))
         if info.get("odometer.total_label_count"):
             rows.append(("Labels printed", self._number(info["odometer.total_label_count"])))
         if info.get("odometer.total_print_length"):
@@ -2239,8 +2310,9 @@ class PrinterMonitor(tk.Toplevel):
         length = st.get("label_length_dots")
         if length:
             rows.append(("Label length", f"{length} dots ({length / dots_per_inch:.2f} in)"))
-        for key, label in (("device.unique_id", "Serial number"), ("appl.name", "Firmware"),
-                           ("device.uptime", "Up for"), ("interface.network.active.mac_addr", "MAC address")):
+        for key, label in (("appl.name", "Firmware"), ("device.uptime", "Up for"),
+                           ("interface.network.active.mac_addr", "MAC address"),
+                           ("device.friendly_name", "Name on printer")):
             if info.get(key):
                 rows.append((label, info[key]))
         if "appl.name" not in info and report.get("FIRMWARE"):

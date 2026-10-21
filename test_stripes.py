@@ -381,6 +381,22 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(snap.info["odometer.total_label_count"], "19259")
         self.assertIn(("PRINT WIDTH", "406"), snap.report)
 
+    def test_stock_check(self):
+        p = zl.Printer(name="Alaine", host="x", model="ZD420", dpi=203)
+        stock = zl.Stock("2x1-gap", "2 x 1 in", 2, 1, "gap")
+        snap = zl.PrinterSnapshot(p, None, reachable=True, status={"label_length_dots": 217},
+                                  settings={"print_width": 406, "media": "gap"})
+        self.assertEqual(zl.check_stock(p, stock, snap),
+                         ("2 x 1 in · printer measures 2.00 x 1.07 in, gap labels", None))  # within tolerance
+        snap.status["label_length_dots"] = 320  # a longer label loaded
+        snap.settings["media"] = "mark"
+        text, problem = zl.check_stock(p, stock, snap)
+        self.assertEqual(problem, "Doesn't look like 2 x 1 in: printer measures labels 1.57 in long; "
+                                  "printer is set for black mark labels")
+        p.expected = {"media": "gap"}  # the spec check already reports media; don't say it twice
+        self.assertNotIn("black mark", zl.check_stock(p, stock, snap)[1])
+        self.assertIsNone(zl.check_stock(p, None, snap)[1])  # no stock set: nothing to compare
+
     def test_unreachable_and_non_link_os(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
