@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import queue
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict, field, fields, replace
 from datetime import datetime
@@ -124,6 +125,7 @@ class CompanyConfig:
     source: str = None     # where it was read from
     problems: list = field(default_factory=list)
     cached_at: str = None  # set when the server was unreachable and the saved copy is in use
+    beta: list = None      # computers and users who get beta versions; None when unknown
 
 
 def settings_path():
@@ -202,11 +204,27 @@ def _entries(data, key):
     return data.get(key, []) if isinstance(data, dict) else []
 
 
-def parse_config(folder):
-    """Read printers.json and (optional) stock.json from a folder.
+def parse_beta(folder, problems):
+    """The computer and user names in beta.json (optional): {"beta": ["ARROW01", "jsmith"]}."""
+    try:
+        data = _read_json(os.path.join(folder, "beta.json"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        problems.append(f"Could not read beta.json: {e}")
+        return []
+    names = data.get("beta") if isinstance(data, dict) else None
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        problems.append('beta.json should look like {"beta": ["COMPUTER", "username"]}')
+        return []
+    return [n.strip() for n in names if n.strip()]
 
-    Raises OSError/ValueError if printers.json itself can't be read; bad entries
-    are skipped and listed in the returned problems.
+
+def parse_config(folder):
+    """Read printers.json and the optional stock.json and beta.json from a folder.
+
+    Returns (printers, stock, beta, problems). Raises OSError/ValueError if
+    printers.json itself can't be read; bad entries are skipped and listed in problems.
     """
     problems = []
     try:
@@ -255,14 +273,14 @@ def parse_config(folder):
                 p.stock = ""
         names.add(p.name)
         printers.append(p)
-    return printers, stock, problems
+    return printers, stock, parse_beta(folder, problems), problems
 
 
 def save_cache(folder):
     """Keep a copy of the server's config so the app works when the server is down."""
     cache = cache_folder()
     os.makedirs(cache, exist_ok=True)
-    for name in ("printers.json", "stock.json"):
+    for name in ("printers.json", "stock.json", "beta.json"):
         src, dst = os.path.join(folder, name), os.path.join(cache, name)
         if os.path.exists(src):
             shutil.copyfile(src, dst + ".tmp")
@@ -275,12 +293,12 @@ def load_cached_config(folder):
     """The saved copy of the server's config, or None if there isn't one."""
     cache = cache_folder()
     try:
-        printers, stock, problems = parse_config(cache)
+        printers, stock, beta, problems = parse_config(cache)
         stamp = os.path.getmtime(os.path.join(cache, "printers.json"))
     except (OSError, ValueError):
         return None
     return CompanyConfig(printers, stock, folder, problems,
-                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"))
+                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"), beta=beta)
 
 
 def load_company_config():
@@ -291,7 +309,7 @@ def load_company_config():
     folder = configured_folder()
     if folder:
         try:
-            printers, stock, problems = parse_config(folder)
+            printers, stock, beta, problems = parse_config(folder)
         except (OSError, ValueError) as e:
             cached = load_cached_config(folder)
             if cached:
@@ -303,16 +321,16 @@ def load_company_config():
             save_cache(folder)
         except OSError:
             pass  # the app still works, just without an offline copy
-        return CompanyConfig(printers, stock, folder, problems)
+        return CompanyConfig(printers, stock, folder, problems, beta=beta)
     for local in local_folders():
         if os.path.exists(os.path.join(local, "printers.json")):
             try:
-                printers, stock, problems = parse_config(local)
+                printers, stock, beta, problems = parse_config(local)
             except (OSError, ValueError) as e:
                 path = os.path.join(local, "printers.json")
                 return CompanyConfig(source=local, problems=[f"Could not read {path}: {e}"])
-            return CompanyConfig(printers, stock, local, problems)
-    return CompanyConfig()
+            return CompanyConfig(printers, stock, local, problems, beta=beta)
+    return CompanyConfig(beta=[])  # no company settings at all: nobody is on beta
 
 
 def merge_printers(company, personal):
@@ -863,9 +881,32 @@ def remove_download_mark(path):
 # --------------------------------------------------------------------------
 
 def parse_version(text):
-    """'v1.2.3' -> (1, 2, 3); None for anything else (e.g. development builds)."""
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
-    return tuple(int(n) for n in m.groups()) if m else None
+    """'v1.2.3' -> (1, 2, 3, 1, 0) and 'v1.2.3-beta.4' -> (1, 2, 3, 0, 4), so betas sort
+    before their release; None for anything else (e.g. development builds)."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?", (text or "").strip())
+    if not m:
+        return None
+    major, minor, patch, beta = m.groups()
+    return int(major), int(minor), int(patch), 0 if beta else 1, int(beta or 0)
+
+
+def is_beta_version(text):
+    v = parse_version(text)
+    return bool(v) and v[3] == 0
+
+
+def display_version(text):
+    """'v1.4.0-beta.2' -> 'v1.4.0 Beta 2'."""
+    return re.sub(r"-beta\.(\d+)$", r" Beta \1", text or "")
+
+
+def on_beta(beta, computer=None, user=None):
+    """Whether this PC or user is listed for beta versions. None when the list is unknown."""
+    if beta is None:
+        return None
+    computer = (computer or os.environ.get("COMPUTERNAME") or socket.gethostname()).lower()
+    user = (user or os.environ.get("USERNAME") or getpass.getuser()).lower()
+    return any(name.lower().split("\\")[-1] in (computer, user) for name in beta)
 
 
 def _fetch(url, timeout=60):
@@ -873,14 +914,37 @@ def _fetch(url, timeout=60):
         return r.read()
 
 
-def check_for_update(current=None, fetch=_fetch):
-    """The newest release's version if it's newer than this one, else None."""
+def _release_version(url, fetch):
+    return fetch(url).decode("ascii", "replace").strip()
+
+
+def check_for_update(current=None, fetch=_fetch, beta=False):
+    """The version this copy should change to, or None to stay put.
+
+    Everyone gets the latest release when it's newer. Beta PCs (beta=True) follow the
+    newest of the latest release and the current beta, even if that means going back
+    (a beta was withdrawn). A beta copy on a PC that's no longer listed (beta=False)
+    goes back to the latest release; beta=None (list unknown) only ever moves forward.
+    """
     mine = parse_version(VERSION if current is None else current)
     if mine is None:
+        return None  # development build
+    latest = _release_version(f"{UPDATE_URL}/latest/download/version.txt", fetch)
+    target = latest if parse_version(latest) else None
+    if beta:
+        try:
+            candidate = _release_version(f"{UPDATE_URL}/download/beta/version.txt", fetch)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            candidate = None  # no beta published yet
+        if parse_version(candidate) and (not target or parse_version(candidate) > parse_version(target)):
+            target = candidate
+    if not target or parse_version(target) == mine:
         return None
-    latest = fetch(f"{UPDATE_URL}/latest/download/version.txt").decode("ascii", "replace").strip()
-    theirs = parse_version(latest)
-    return latest if theirs and theirs > mine else None
+    if parse_version(target) > mine or beta or (beta is False and mine[3] == 0):
+        return target
+    return None
 
 
 def folder_is_writable(folder):
@@ -972,7 +1036,7 @@ def pick_font_family(root):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} {VERSION}")
+        self.title(f"{APP_NAME} {display_version(VERSION)}")
         self.minsize(900, 640)
         try:
             self.iconbitmap(default=resource_path(os.path.join("assets", "icon.ico")))
@@ -1018,10 +1082,13 @@ class App(tk.Tk):
         else:
             self._show_config_problems()
             self._maybe_first_run()
-        if getattr(sys, "frozen", False):  # only the built .exe updates itself
+        self._updates_started = not getattr(sys, "frozen", False)  # only the built .exe updates itself
+        if not self._updates_started:
             remove_download_mark(sys.executable)
             remove_old_versions(sys.executable)
-            self.after(3000, self._check_for_update)
+            if not self.config_folder:
+                self.after(3000, self._start_updates)
+            # otherwise once the server's settings arrive, since they say who's on beta
         folder = status_folder()
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
@@ -1056,11 +1123,17 @@ class App(tk.Tk):
 
     # ----- self-update -----
 
+    def _start_updates(self):
+        if not self._updates_started:
+            self._updates_started = True
+            self._check_for_update()
+
     def _check_for_update(self):
         exe = sys.executable
+        beta = on_beta(self.cfg.beta)
 
         def work():
-            latest = check_for_update()
+            latest = check_for_update(beta=beta)
             if not latest:
                 return None
             if not folder_is_writable(os.path.dirname(exe)):
@@ -1079,10 +1152,11 @@ class App(tk.Tk):
             if kind == "installed":
                 self._log(lambda log: log.write(f"Downloaded {version}; finishes when Stripes restarts",
                                                 pending_update=version, last_update_error=None))
-                self.update_label.configure(text=f"Stripes {version} is ready.", style="Ok.TLabel")
+                self.update_label.configure(text=f"Stripes {display_version(version)} is ready.", style="Ok.TLabel")
                 self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
             else:
-                self.update_label.configure(text=f"Stripes {version} is available; this copy can't update itself.",
+                self.update_label.configure(text=f"Stripes {display_version(version)} is available; "
+                                                 "this copy can't update itself.",
                                             style="Warn.TLabel")
 
         self.bg.run(work, done)
@@ -1110,9 +1184,11 @@ class App(tk.Tk):
             self.cfg = cfg
             self._load_printer_list(select=self.printer_var.get() or self.settings.get("last_printer"))
             source = "saved copy (server unreachable)" if cfg.cached_at else "server" if cfg.source else "none"
-            self._log(lambda log: log.write(config=source, printers=len(cfg.printers)))
+            beta = bool(on_beta(cfg.beta))
+            self._log(lambda log: log.write(config=source, printers=len(cfg.printers), beta=beta))
         self._show_config_problems()
         self._maybe_first_run()
+        self._start_updates()
 
     def _show_config_problems(self):
         if self.cfg.problems:
@@ -1142,7 +1218,8 @@ class App(tk.Tk):
         titles.pack(side="left")
         ttk.Label(titles, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(titles, text="Zebra label printing", style="Muted.TLabel").pack(anchor="w")
-        self.update_label = ttk.Label(header, text=f"Version {VERSION}", style="Muted.TLabel")
+        self.update_label = ttk.Label(header, text=f"Version {display_version(VERSION)}",
+                                      style="Warn.TLabel" if is_beta_version(VERSION) else "Muted.TLabel")
         self.update_label.pack(side="right")
         self.update_button = ttk.Button(header, text="Restart to update", command=self._restart_to_update)
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
@@ -2297,7 +2374,8 @@ class PrinterMonitor(tk.Toplevel):
 class DeploymentWindow(tk.Toplevel):
     """Every PC/user running Stripes, from the shared status folder."""
 
-    COLUMNS = (("computer", "Computer", 110), ("user", "User", 100), ("version", "Version", 70),
+    COLUMNS = (("computer", "Computer", 110), ("user", "User", 100), ("version", "Version", 110),
+               ("channel", "Channel", 60),
                ("status", "Status", 85), ("last_seen", "Last seen", 125), ("last_update", "Last update", 230),
                ("first_seen", "Installed", 125), ("notes", "Notes", 280))
 
@@ -2344,16 +2422,22 @@ class DeploymentWindow(tk.Toplevel):
             self.summary.configure(text=f"Couldn't read {self.folder}: {describe_error(error)}")
             return
         self.records = records
-        versions = [parse_version(r.get("version")) for r in records]
-        latest = max([v for v in versions if v] + [parse_version(VERSION) or (0, 0, 0)])
-        latest_text = "v" + ".".join(map(str, latest))
+        # "Behind" compares with the newest release; beta PCs are ahead on purpose
+        releases = [r.get("version") for r in records if parse_version(r.get("version"))
+                    and not is_beta_version(r.get("version"))]
+        if parse_version(VERSION) and not is_beta_version(VERSION):
+            releases.append(VERSION)
+        latest = max(releases, key=parse_version, default=None)
         self.tree.delete(*self.tree.get_children())
-        behind = open_now = 0
-        for i, (r, v) in enumerate(zip(records, versions)):
+        behind = open_now = on_beta_now = 0
+        for i, r in enumerate(records):
+            v = parse_version(r.get("version"))
             is_open = is_open_now(r)
             open_now += is_open
+            beta = bool(r.get("beta")) or is_beta_version(r.get("version"))
+            on_beta_now += beta
             notes, tag = [], ()
-            if v and v < latest:
+            if v and latest and v < parse_version(latest) and not beta:
                 behind += 1
                 tag = ("behind",)
             if r.get("pending_update"):
@@ -2368,11 +2452,14 @@ class DeploymentWindow(tk.Toplevel):
             last_update = (f"{update.get('from')} → {update.get('to')}  ({_short_time(update.get('at'))})"
                            if update else "")
             self.tree.insert("", "end", iid=str(i), tags=tag, values=(
-                r.get("computer", ""), r.get("user", ""), r.get("version", ""),
-                "Open now" if is_open else "Closed", _short_time(r.get("last_seen")), last_update,
+                r.get("computer", ""), r.get("user", ""), display_version(r.get("version", "")),
+                "Beta" if beta else "Release", "Open now" if is_open else "Closed", _short_time(r.get("last_seen")), last_update,
                 _short_time(r.get("first_seen")), "; ".join(notes)))
-        self.summary.configure(text=f"{len(records)} installs  ·  {open_now} open now  ·  "
-                                    f"{len(records) - behind} on {latest_text}  ·  {behind} behind")
+        parts = [f"{len(records)} installs", f"{open_now} open now"]
+        if latest:
+            parts.append(f"{len(records) - behind - on_beta_now} on {latest}")
+        parts += [f"{behind} behind"] + ([f"{on_beta_now} on beta"] if on_beta_now else [])
+        self.summary.configure(text="  ·  ".join(parts))
 
     def _show_history(self):
         sel = self.tree.selection()

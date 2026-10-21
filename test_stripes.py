@@ -8,6 +8,7 @@ import socket
 import threading
 import types
 import unittest
+import urllib.error
 from unittest import mock
 
 import label_design as ld
@@ -246,9 +247,9 @@ class CompanyConfigTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def folder(self, printers=None, stock=None, encoding="utf-8"):
+    def folder(self, printers=None, stock=None, encoding="utf-8", beta=None):
         d = tempfile.mkdtemp(dir=self.tmp)
-        for name, content in (("printers.json", printers), ("stock.json", stock)):
+        for name, content in (("printers.json", printers), ("stock.json", stock), ("beta.json", beta)):
             if content is not None:
                 with open(os.path.join(d, name), "w", encoding=encoding) as f:
                     f.write(content)
@@ -285,6 +286,14 @@ class CompanyConfigTests(unittest.TestCase):
         self.assertEqual(cfg.printers[1].stock, "")  # unknown stock dropped, printer kept
         self.assertEqual([s.id for s in cfg.stock], ["s1"])
         self.assertEqual(len(cfg.problems), 8)
+
+    def test_beta_list(self):
+        d = self.folder(printers='{"printers": []}', beta='{"beta": ["ARROW01", " jdoe "]}')
+        self.assertEqual(self.load(d).beta, ["ARROW01", "jdoe"])
+        self.assertEqual(self.load(self.folder(printers='{"printers": []}')).beta, [])  # no file: nobody
+        cfg = self.load(self.folder(printers='{"printers": []}', beta='{"beta": "ARROW01"}'))
+        self.assertEqual(cfg.beta, [])
+        self.assertIn("beta.json", cfg.problems[0])
 
     def test_stock_file_optional(self):
         cfg = self.load(self.folder(printers='{"printers": [{"name": "A", "host": "192.0.2.1"}]}'))
@@ -427,13 +436,58 @@ class SelfUpdateTests(unittest.TestCase):
         return fetch
 
     def test_versions(self):
-        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2))
+        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2, 1, 0))
         self.assertIsNone(zl.parse_version("dev-abc1234"))
+        # a beta sorts after the release before it and before its own release
+        self.assertLess(zl.parse_version("v1.3.0"), zl.parse_version("v1.4.0-beta.1"))
+        self.assertLess(zl.parse_version("v1.4.0-beta.2"), zl.parse_version("v1.4.0-beta.10"))
+        self.assertLess(zl.parse_version("v1.4.0-beta.10"), zl.parse_version("v1.4.0"))
+        self.assertEqual(zl.display_version("v1.4.0-beta.2"), "v1.4.0 Beta 2")
         fetch = self.fake_github({"/latest/download/version.txt": b"v1.10.0\n"})
         self.assertEqual(zl.check_for_update("v1.9.9", fetch), "v1.10.0")  # not a text comparison
         self.assertIsNone(zl.check_for_update("v1.10.0", fetch))
         self.assertIsNone(zl.check_for_update("v2.0.0", fetch))
         self.assertIsNone(zl.check_for_update("dev-abc1234", fetch))  # development builds never update
+
+    def beta_github(self, latest, beta=None):
+        files = {"/latest/download/version.txt": latest.encode()}
+        fetch = self.fake_github(files)
+        if beta is None:
+            def without_beta(url, timeout=60):
+                if url.endswith("/download/beta/version.txt"):
+                    raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+                return fetch(url, timeout)
+            return without_beta
+        files["/download/beta/version.txt"] = beta.encode()
+        return fetch
+
+    def test_beta_channel(self):
+        fetch = self.beta_github("v1.3.0", "v1.4.0-beta.2")
+        self.assertIsNone(zl.check_for_update("v1.3.0", fetch, beta=False))  # betas never reach others
+        self.assertEqual(zl.check_for_update("v1.3.0", fetch, beta=True), "v1.4.0-beta.2")
+        self.assertEqual(zl.check_for_update("v1.4.0-beta.1", fetch, beta=True), "v1.4.0-beta.2")
+        self.assertIsNone(zl.check_for_update("v1.4.0-beta.2", fetch, beta=True))
+        # the beta was withdrawn (pointed back at beta 1): beta PCs follow it back
+        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", self.beta_github("v1.3.0", "v1.4.0-beta.1"),
+                                             beta=True), "v1.4.0-beta.1")
+        # taken off the list: back to the release
+        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", fetch, beta=False), "v1.3.0")
+        # list unknown (server down, no saved copy): never go backwards
+        self.assertIsNone(zl.check_for_update("v1.4.0-beta.2", fetch, beta=None))
+        # the release caught up: beta PCs move to it
+        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", self.beta_github("v1.4.0", "v1.4.0-beta.2"),
+                                             beta=True), "v1.4.0")
+        # nothing published to beta yet: beta PCs just get releases
+        self.assertEqual(zl.check_for_update("v1.2.0", self.beta_github("v1.3.0"), beta=True), "v1.3.0")
+        # a newer release a release PC somehow has is left alone
+        self.assertIsNone(zl.check_for_update("v2.0.0", fetch, beta=False))
+
+    def test_on_beta(self):
+        self.assertTrue(zl.on_beta(["ARROW01"], "arrow01", "jdoe"))
+        self.assertTrue(zl.on_beta(["ARROWFARMS\\JDoe"], "ARROW07", "jdoe"))
+        self.assertFalse(zl.on_beta(["ARROW01"], "ARROW07", "jdoe"))
+        self.assertFalse(zl.on_beta([], "ARROW01", "jdoe"))
+        self.assertIsNone(zl.on_beta(None, "ARROW01", "jdoe"))
 
     def test_install_swaps_the_exe(self):
         import hashlib
