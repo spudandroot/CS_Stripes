@@ -370,8 +370,13 @@ def send_raw(host, port, data, timeout=5):
         s.shutdown(socket.SHUT_WR)
 
 
-def parse_host_status(reply):
-    """Turn a ~HS reply into a list of problems (empty list = ready)."""
+_PRINT_MODES = {"0": "Rewind", "1": "Peel-off", "2": "Tear-off", "3": "Cutter", "4": "Applicator",
+                "5": "Delayed cut", "6": "Linerless peel", "7": "Linerless rewind", "8": "Partial cutter",
+                "9": "RFID", "K": "Kiosk", "S": "Stream"}
+
+
+def parse_host_status_details(reply):
+    """Everything a ~HS (host status) reply tells us, by name."""
     parts = re.findall(rb"\x02(.*?)\x03", reply, re.S)
     if len(parts) < 2:
         raise ValueError("The printer sent an unexpected status reply.")
@@ -381,23 +386,39 @@ def parse_host_status(reply):
     def flag(fields_, i):
         return len(fields_) > i and fields_[i].strip() == "1"
 
-    problems = []
-    if flag(s1, 1):
-        problems.append("Out of labels")
-    if flag(s1, 2):
-        problems.append("Paused")
-    if flag(s2, 2):
-        problems.append("Print head open")
-    if flag(s2, 3):
-        problems.append("Ribbon out")
-    if flag(s1, 10):
-        problems.append("Print head too cold")
-    if flag(s1, 11):
-        problems.append("Print head too hot")
-    return problems
+    def number(fields_, i):
+        try:
+            return int(fields_[i].strip())
+        except (IndexError, ValueError):
+            return None
+
+    mode = s2[5].strip() if len(s2) > 5 else ""
+    return {
+        "paper_out": flag(s1, 1), "paused": flag(s1, 2), "label_length_dots": number(s1, 3),
+        "formats_waiting": number(s1, 4), "buffer_full": flag(s1, 5), "corrupt_ram": flag(s1, 9),
+        "under_temp": flag(s1, 10), "over_temp": flag(s1, 11),
+        "head_open": flag(s2, 2), "ribbon_out": flag(s2, 3), "thermal_transfer": flag(s2, 4),
+        "print_mode": _PRINT_MODES.get(mode, mode or None), "label_waiting": flag(s2, 7),
+        "labels_remaining": number(s2, 8), "graphics_stored": number(s2, 10),
+    }
 
 
-def query_status(host, port, timeout=3):
+_STATUS_PROBLEMS = [("paper_out", "Out of labels"), ("paused", "Paused"), ("head_open", "Print head open"),
+                    ("ribbon_out", "Ribbon out"), ("under_temp", "Print head too cold"),
+                    ("over_temp", "Print head too hot"), ("buffer_full", "Receive buffer full"),
+                    ("corrupt_ram", "Printer memory error")]
+
+
+def status_problems(details):
+    return [text for key, text in _STATUS_PROBLEMS if details.get(key)]
+
+
+def parse_host_status(reply):
+    """Turn a ~HS reply into a list of problems (empty list = ready)."""
+    return status_problems(parse_host_status_details(reply))
+
+
+def query_status_details(host, port, timeout=3):
     reply = b""
     with socket.create_connection((host, port), timeout=timeout) as s:
         s.sendall(b"~HS")
@@ -406,7 +427,11 @@ def query_status(host, port, timeout=3):
             if not chunk:
                 break
             reply += chunk
-    return parse_host_status(reply)
+    return parse_host_status_details(reply)
+
+
+def query_status(host, port, timeout=3):
+    return status_problems(query_status_details(host, port, timeout))
 
 
 # Lines of the printer's configuration report (^HH) that we compare with the spec.
@@ -445,8 +470,18 @@ def parse_config_report(text):
     return found
 
 
-def query_config(host, port, timeout=4):
-    """Ask the printer for its configuration report. Read-only."""
+def parse_config_lines(text):
+    """Every "value   NAME" line of a ^HH configuration report, in order, as (name, value)."""
+    found = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*(\S.*?)\s{2,}([A-Z][A-Z0-9 ./()#-]*?)\s*$", line)
+        if m:
+            found.append((m.group(2).strip(), m.group(1).strip()))
+    return found
+
+
+def query_config_report(host, port, timeout=4):
+    """The printer's configuration report (^HH) as text. Read-only."""
     reply = b""
     with socket.create_connection((host, port), timeout=timeout) as s:
         s.sendall(b"^XA^HH^XZ")
@@ -458,7 +493,51 @@ def query_config(host, port, timeout=4):
                 reply += chunk
         except socket.timeout:
             pass
-    return parse_config_report(reply.decode("ascii", "replace"))
+    return reply.decode("ascii", "replace")
+
+
+def query_config(host, port, timeout=4):
+    """The settings we compare with the spec, from the configuration report."""
+    return parse_config_report(query_config_report(host, port, timeout))
+
+
+# Device details that Link-OS printers (ZD, ZT, ...) report over Set-Get-Do. Read-only.
+SGD_INFO = {
+    "device.friendly_name": "Name on printer",
+    "device.unique_id": "Serial number",
+    "appl.name": "Firmware",
+    "odometer.total_label_count": "Labels printed (lifetime)",
+    "odometer.total_print_length": "Printed length (lifetime)",
+    "device.uptime": "Uptime",
+    "interface.network.active.mac_addr": "MAC address",
+    "head.resolution.in_dpi": "Resolution (dpi)",
+}
+
+
+def is_link_os(printer):
+    return (printer.model or "").upper().startswith(("ZD", "ZT", "ZQ", "ZE"))
+
+
+def query_sgd(host, port, names, timeout=4):
+    """Read Set-Get-Do values. Ones the printer doesn't know come back as None."""
+    names = list(names)
+    request = "".join(f'! U1 getvar "{name}"\r\n' for name in names).encode("ascii")
+    reply = b""
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.sendall(request)
+        try:
+            while reply.count(b'"') < 2 * len(names):
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+        except socket.timeout:
+            pass
+    values = re.findall(rb'"([^"]*)"', reply)
+    if len(values) != len(names):
+        return {}  # can't tell which answer is which
+    return {name: (None if value.strip() in (b"", b"?") else value.decode("utf-8", "replace").strip())
+            for name, value in zip(names, values)}
 
 
 _SPEC_LABELS = {"darkness": "Darkness", "speed": "Speed", "print_mode": "Print mode",
@@ -624,6 +703,92 @@ def printer_problems(printer):
     if printer.host:
         return query_status(printer.host, printer.port)
     return windows_printer_problems(printer.windows_name)
+
+
+@dataclass
+class PrinterSnapshot:
+    """Everything we could find out about a printer at one moment."""
+    printer: Printer
+    checked_at: datetime
+    reachable: bool = False
+    error: str = ""
+    status: dict = field(default_factory=dict)    # from ~HS
+    problems: list = field(default_factory=list)
+    report: list = field(default_factory=list)    # (name, value) lines of the configuration report
+    settings: dict = field(default_factory=dict)  # the ones compared with the spec
+    diffs: list = None                             # None when there's no spec to compare with
+    info: dict = field(default_factory=dict)      # Set-Get-Do device details
+    queue_jobs: int = None                         # jobs in the Windows print queue
+    response_ms: int = None
+
+    @property
+    def activity(self):
+        remaining, waiting = self.status.get("labels_remaining"), self.status.get("formats_waiting")
+        if remaining:
+            return f"Printing: {remaining} label{'s' if remaining != 1 else ''} left in this job"
+        if waiting:
+            return f"{waiting} job{'s' if waiting != 1 else ''} waiting"
+        if self.status.get("label_waiting"):
+            return "Label waiting to be taken"
+        return "Idle"
+
+    @property
+    def state(self):
+        """(text, kind) for the status badge: kind is ok, busy, warn, bad or off."""
+        if not self.reachable:
+            return "Not reachable", "off"
+        if self.problems:
+            return self.problems[0], "bad"
+        if self.status.get("labels_remaining") or self.status.get("formats_waiting"):
+            return "Printing", "busy"
+        if self.diffs:
+            return "Ready (differs from spec)", "warn"
+        return "Ready", "ok"
+
+
+def windows_queue_jobs(windows_name):
+    h = win32print.OpenPrinter(windows_name)
+    try:
+        return len(win32print.EnumJobs(h, 0, 9999, 1))
+    finally:
+        win32print.ClosePrinter(h)
+
+
+def inspect_printer(printer):
+    """Ask a printer everything it will tell us. Read-only; never changes anything."""
+    snap = PrinterSnapshot(printer, datetime.now())
+    if printer.windows_name and win32print is not None:
+        try:
+            snap.queue_jobs = windows_queue_jobs(printer.windows_name)
+            if not printer.host:
+                snap.problems = windows_printer_problems(printer.windows_name)
+                snap.reachable = True
+        except Exception as e:  # pywintypes.error
+            snap.error = describe_error(e)
+    if not printer.host:
+        return snap
+    started = time.monotonic()
+    try:
+        snap.status = query_status_details(printer.host, printer.port)
+    except (OSError, ValueError) as e:
+        snap.error = describe_error(e)
+        return snap
+    snap.response_ms = round((time.monotonic() - started) * 1000)
+    snap.reachable = True
+    snap.problems = status_problems(snap.status)
+    try:
+        text = query_config_report(printer.host, printer.port)
+        snap.report, snap.settings = parse_config_lines(text), parse_config_report(text)
+    except OSError:
+        pass
+    if printer.expected and snap.settings:
+        snap.diffs = spec_differences(printer.expected, snap.settings)
+    if is_link_os(printer):
+        try:
+            snap.info = query_sgd(printer.host, printer.port, SGD_INFO)
+        except OSError:
+            pass
+    return snap
 
 
 def labelary_png(zpl, printer):
@@ -990,6 +1155,7 @@ class App(tk.Tk):
         self.printer_box.bind("<<ComboboxSelected>>", lambda e: self._printer_changed())
         ttk.Button(top, text="Check printer", command=self.check_status).pack(side="left")
         ttk.Button(top, text="Manage printers...", command=self.manage_printers).pack(side="left", padx=6)
+        ttk.Button(top, text="Printer monitor", command=self.open_monitor).pack(side="left")
         self.printer_status = ttk.Label(top, text="", style="Muted.TLabel")
         self.printer_status.pack(side="left", padx=8)
 
@@ -1294,6 +1460,13 @@ class App(tk.Tk):
                                     parent=self)
 
         self.bg.run(lambda: check_printer(p), done)
+
+    def open_monitor(self):
+        if getattr(self, "monitor", None) and self.monitor.winfo_exists():
+            self.monitor.deiconify()
+            self.monitor.lift()
+            return
+        self.monitor = PrinterMonitor(self)
 
     def manage_printers(self):
         PrinterDialog(self)
@@ -1786,6 +1959,278 @@ class App(tk.Tk):
             self.check_status(quiet=True)
 
         self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
+
+
+class PrinterMonitor(tk.Toplevel):
+    """Live view of every printer: status, activity, settings and device details."""
+
+    REFRESH = {"Every 5 seconds": 5, "Every 10 seconds": 10, "Every 30 seconds": 30, "Every minute": 60, "Off": 0}
+    COLORS = {"ok": "#15803d", "busy": "#2563eb", "warn": "#b45309", "bad": "#b91c1c", "off": "#6b7280",
+              "wait": "#9ca3af"}
+    CARD, MUTED, TEXT = "#ffffff", "#6b7280", "#111827"
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Printer monitor")
+        self.geometry("1180x780")
+        self.minsize(760, 480)
+        self.configure(background="#f3f4f6")
+        self.snapshots, self.pending, self.cards = {}, set(), {}
+        self._timer = None
+
+        bar = ttk.Frame(self, padding=(14, 12, 14, 6))
+        bar.pack(fill="x")
+        titles = ttk.Frame(bar)
+        titles.pack(side="left")
+        ttk.Label(titles, text="Printer monitor", font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        self.summary = ttk.Label(titles, text="Checking printers...", style="Muted.TLabel")
+        self.summary.pack(anchor="w")
+        ttk.Button(bar, text="Refresh now", command=self.refresh).pack(side="right")
+        self.refresh_var = tk.StringVar(value="Every 10 seconds")
+        box = ttk.Combobox(bar, textvariable=self.refresh_var, values=list(self.REFRESH), state="readonly", width=16)
+        box.pack(side="right", padx=8)
+        box.bind("<<ComboboxSelected>>", lambda e: self._schedule())
+        ttk.Label(bar, text="Auto refresh:").pack(side="right")
+        self.updated = ttk.Label(bar, text="", style="Muted.TLabel")
+        self.updated.pack(side="right", padx=14)
+
+        # Scrollable grid of printer cards
+        holder = tk.Frame(self, background="#f3f4f6")
+        holder.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.canvas = tk.Canvas(holder, background="#f3f4f6", highlightthickness=0)
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.grid_frame = tk.Frame(self.canvas, background="#f3f4f6")
+        self._window = self.canvas.create_window(0, 0, window=self.grid_frame, anchor="nw")
+        self.grid_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._window, width=e.width))
+        self.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
+        self.grid_frame.columnconfigure((0, 1), weight=1, uniform="cards")
+
+        self._build_cards()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.refresh()
+        self._schedule()
+
+    # ----- refreshing -----
+
+    def printers(self):
+        return self.app.all_printers()
+
+    def _build_cards(self):
+        for child in self.grid_frame.winfo_children():
+            child.destroy()
+        self.cards = {}
+        printers = self.printers()
+        if not printers:
+            tk.Label(self.grid_frame, text="No printers set up yet.", background="#f3f4f6",
+                     foreground=self.MUTED).grid(row=0, column=0, pady=40)
+        for i, p in enumerate(printers):
+            outer = tk.Frame(self.grid_frame, background=self.COLORS["wait"])
+            outer.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6)
+            body = tk.Frame(outer, background=self.CARD, padx=12, pady=10)
+            body.pack(side="right", fill="both", expand=True, padx=(5, 0))
+            self.cards[p.name] = (outer, body)
+            self._render(p, None)
+
+    def refresh(self):
+        names = [p.name for p in self.printers()]
+        if names != list(self.cards):
+            self._build_cards()
+        for p in self.printers():
+            if p.name in self.pending:
+                continue
+            self.pending.add(p.name)
+            self.app.bg.run(lambda p=p: inspect_printer(p), lambda snap, error, p=p: self._arrived(p, snap, error))
+
+    def _arrived(self, printer, snap, error):
+        self.pending.discard(printer.name)
+        if not self.winfo_exists():
+            return
+        if error:
+            snap = PrinterSnapshot(printer, datetime.now(), error=describe_error(error))
+        self.snapshots[printer.name] = snap
+        if printer.name in self.cards:
+            self._render(printer, snap)
+        self._summarize()
+
+    def _schedule(self):
+        if self._timer:
+            self.after_cancel(self._timer)
+            self._timer = None
+        seconds = self.REFRESH.get(self.refresh_var.get(), 0)
+        if seconds:
+            self._timer = self.after(seconds * 1000, self._tick)
+
+    def _tick(self):
+        self._timer = None
+        if self.winfo_exists():
+            self.refresh()
+            self._schedule()
+
+    def _close(self):
+        if self._timer:
+            self.after_cancel(self._timer)
+        self.destroy()
+
+    def _summarize(self):
+        snaps = [self.snapshots[p.name] for p in self.printers() if p.name in self.snapshots]
+        counts = {}
+        for s in snaps:
+            kind = s.state[1]
+            counts[kind] = counts.get(kind, 0) + 1
+        parts = [f"{len(self.printers())} printers"]
+        for kind, word in (("ok", "ready"), ("busy", "printing"), ("warn", "differ from spec"),
+                           ("bad", "need attention"), ("off", "not reachable")):
+            if counts.get(kind):
+                parts.append(f"{counts[kind]} {word}")
+        self.summary.configure(text="  ·  ".join(parts))
+        self.updated.configure(text=f"Updated {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}")
+
+    # ----- one printer card -----
+
+    def _render(self, p, snap):
+        outer, body = self.cards[p.name]
+        for child in body.winfo_children():
+            child.destroy()
+        state, kind = snap.state if snap else ("Checking...", "wait")
+        outer.configure(background=self.COLORS[kind])
+
+        head = tk.Frame(body, background=self.CARD)
+        head.pack(fill="x")
+        tk.Label(head, text=p.name, font=("Segoe UI", 13, "bold"), background=self.CARD,
+                 foreground=self.TEXT).pack(side="left")
+        tk.Label(head, text=f" {state} ", font=("Segoe UI", 9, "bold"), background=self.COLORS[kind],
+                 foreground="white").pack(side="right")
+        where = f"{p.host}" if p.host else f"Windows printer '{p.windows_name}'"
+        stock = next((s.name for s in self.app.cfg.stock if s.id == p.stock), None)
+        subtitle = " · ".join(x for x in (p.model, where, f"{p.dpi} dpi",
+                                          stock or f'{p.width_in:g} x {p.height_in:g} in') if x)
+        tk.Label(body, text=subtitle, background=self.CARD, foreground=self.MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        if snap is None:
+            return
+
+        for problem in snap.problems:
+            tk.Label(body, text=f"● {problem}", background=self.CARD, foreground=self.COLORS["bad"],
+                     font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
+        for diff in snap.diffs or []:
+            tk.Label(body, text=f"● {diff}", background=self.CARD,
+                     foreground=self.COLORS["warn"]).pack(anchor="w")
+        if not snap.reachable:
+            tk.Label(body, text=snap.error or "No answer.", background=self.CARD, foreground=self.MUTED,
+                     wraplength=480, justify="left").pack(anchor="w", pady=(6, 0))
+
+        rows = self._details(p, snap)
+        if rows:
+            grid = tk.Frame(body, background=self.CARD)
+            grid.pack(fill="x", pady=(8, 0))
+            for i, (name, value) in enumerate(rows):
+                r, c = i // 2, (i % 2) * 2
+                tk.Label(grid, text=name, background=self.CARD, foreground=self.MUTED,
+                         font=("Segoe UI", 9)).grid(row=r, column=c, sticky="w", padx=(0, 8))
+                tk.Label(grid, text=value, background=self.CARD, foreground=self.TEXT,
+                         font=("Segoe UI", 9, "bold")).grid(row=r, column=c + 1, sticky="w", padx=(0, 18))
+
+        foot = tk.Frame(body, background=self.CARD)
+        foot.pack(fill="x", pady=(8, 0))
+        checked = snap.checked_at.strftime("%I:%M:%S %p").lstrip("0")
+        timing = f"Checked {checked}" + (f" · answered in {snap.response_ms} ms" if snap.response_ms is not None else "")
+        tk.Label(foot, text=timing, background=self.CARD, foreground=self.MUTED,
+                 font=("Segoe UI", 8)).pack(side="left")
+        if snap.reachable and (snap.report or snap.info):
+            ttk.Button(foot, text="Full report...", command=lambda: self._full_report(p, snap)).pack(side="right")
+
+    def _details(self, p, snap):
+        """(name, value) pairs worth showing, only for what the printer actually told us."""
+        st, report, info = snap.status, dict(snap.report), snap.info
+        dots_per_inch = p.dpmm * 25.4
+        rows = []
+        if snap.reachable:
+            rows.append(("Activity", snap.activity))
+        if snap.queue_jobs is not None:
+            rows.append(("Windows queue", f"{snap.queue_jobs} job{'s' if snap.queue_jobs != 1 else ''}"))
+        if info.get("odometer.total_label_count"):
+            rows.append(("Labels printed", self._number(info["odometer.total_label_count"])))
+        if info.get("odometer.total_print_length"):
+            rows.append(("Printed length", self._length(info["odometer.total_print_length"])))
+        if "DARKNESS" in report:
+            rows.append(("Darkness", report["DARKNESS"].lstrip("+")))
+        if "PRINT SPEED" in report:
+            rows.append(("Speed", report["PRINT SPEED"].lower()))
+        mode = st.get("print_mode") or report.get("PRINT MODE", "").title()
+        if mode:
+            rows.append(("Print mode", mode))
+        if "MEDIA TYPE" in report:
+            rows.append(("Media", report["MEDIA TYPE"].title()))
+        sensor = report.get("SENSOR SELECT") or report.get("SENSOR TYPE")
+        if sensor:
+            rows.append(("Sensor", sensor.title()))
+        if st:
+            rows.append(("Printing method", "Thermal transfer (ribbon)" if st.get("thermal_transfer")
+                         else "Direct thermal"))
+        width = snap.settings.get("print_width")
+        if width:
+            rows.append(("Print width", f"{width} dots ({width / dots_per_inch:.2f} in)"))
+        length = st.get("label_length_dots")
+        if length:
+            rows.append(("Label length", f"{length} dots ({length / dots_per_inch:.2f} in)"))
+        for key, label in (("device.unique_id", "Serial number"), ("appl.name", "Firmware"),
+                           ("device.uptime", "Up for"), ("interface.network.active.mac_addr", "MAC address")):
+            if info.get(key):
+                rows.append((label, info[key]))
+        if "appl.name" not in info and report.get("FIRMWARE"):
+            rows.append(("Firmware", report["FIRMWARE"].replace("<-", "").strip()))
+        if snap.diffs == []:
+            rows.append(("Spec", "Matches"))
+        return rows
+
+    @staticmethod
+    def _length(text):
+        """'11291 INCHES, 28679 CENTIMETERS' -> '11,291 in (287 m)'."""
+        m = re.match(r"\s*(\d+)\s*INCH", text, re.I)
+        if not m:
+            return text.split(",")[0].strip().lower()
+        inches = int(m.group(1))
+        return f"{inches:,} in ({inches * 0.0254:,.0f} m)"
+
+    @staticmethod
+    def _number(text):
+        try:
+            return f"{int(text):,}"
+        except ValueError:
+            return text
+
+    def _full_report(self, p, snap):
+        win = tk.Toplevel(self)
+        win.title(f"{p.name}: full report")
+        win.geometry("560x620")
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=("setting", "value"), show="headings")
+        tree.heading("setting", text="Setting", anchor="w")
+        tree.heading("value", text="Value", anchor="w")
+        tree.column("setting", width=230, anchor="w")
+        tree.column("value", width=290, anchor="w")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        tree.insert("", "end", values=("— Device —", ""))
+        for key, label in SGD_INFO.items():
+            if snap.info.get(key):
+                tree.insert("", "end", values=(label, snap.info[key]))
+        tree.insert("", "end", values=("— Status —", ""))
+        for key, value in snap.status.items():
+            shown = ("Yes" if value else "No") if isinstance(value, bool) else ("?" if value is None else value)
+            tree.insert("", "end", values=(key.replace("_", " ").capitalize(), shown))
+        tree.insert("", "end", values=("— Configuration report —", ""))
+        for name, value in snap.report:
+            tree.insert("", "end", values=(name.title(), value))
+        win.transient(self)
 
 
 class DeploymentWindow(tk.Toplevel):

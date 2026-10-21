@@ -54,9 +54,10 @@ class PrinterLabelTests(unittest.TestCase):
 class FakePrinter:
     """Listens like a Zebra on port 9100: records data, answers ~HS."""
 
-    def __init__(self, hs_reply=HS_READY, config_report=b"\x02\x03"):
+    def __init__(self, hs_reply=HS_READY, config_report=b"\x02\x03", sgd=None):
         self.hs_reply = hs_reply
         self.config_report = config_report
+        self.sgd = sgd or {}
         self.received = []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
@@ -82,6 +83,10 @@ class FakePrinter:
                         break
                     if data == b"^XA^HH^XZ":
                         conn.sendall(self.config_report)
+                        break
+                    if data.startswith(b"! U1 getvar") and data.endswith(b"\r\n"):
+                        names = re.findall(rb'getvar "([^"]+)"', data)
+                        conn.sendall(b"".join(b'"' + self.sgd.get(n.decode(), "?").encode() + b'"' for n in names))
                         break
                 self.received.append(data)
 
@@ -343,6 +348,56 @@ ZTC ZD420-203dpi ZPL
   39.0IN   988MM      MAXIMUM LENGTH
 FIRMWARE IN THIS PRINTER IS COPYRIGHTED
 \x03"""
+
+
+HS_BUSY = (b"\x02030,0,0,0217,002,0,0,0,000,0,0,0\x03\r\n"
+           b"\x02000,0,0,0,1,1,6,1,00000024,1,003\x03\r\n\x021234,0\x03\r\n")
+
+
+class MonitorTests(unittest.TestCase):
+    def test_status_details(self):
+        d = zl.parse_host_status_details(HS_BUSY)
+        self.assertEqual((d["label_length_dots"], d["formats_waiting"], d["labels_remaining"]), (217, 2, 24))
+        self.assertEqual((d["thermal_transfer"], d["print_mode"], d["label_waiting"]), (True, "Peel-off", True))
+        self.assertEqual(zl.status_problems(d), [])
+        self.assertEqual(zl.parse_host_status(HS_PROBLEMS), ["Out of labels", "Paused", "Print head open"])
+
+    def test_config_lines(self):
+        lines = dict(zl.parse_config_lines(ZD_REPORT))
+        self.assertEqual(lines["DARKNESS"], "+10.0")
+        self.assertEqual(lines["LABEL LENGTH"], "0217")
+        self.assertEqual(lines["MAXIMUM LENGTH"], "39.0IN   988MM")
+        self.assertNotIn("PRINTER CONFIGURATION", lines)
+
+    def test_sgd(self):
+        fake = FakePrinter(sgd={"device.unique_id": "D2J193208123", "odometer.total_label_count": "10563"})
+        self.addCleanup(fake.close)
+        info = zl.query_sgd("127.0.0.1", fake.port, ["device.unique_id", "odometer.total_label_count", "nope"])
+        self.assertEqual(info, {"device.unique_id": "D2J193208123", "odometer.total_label_count": "10563",
+                                "nope": None})
+
+    def test_inspect_printer(self):
+        fake = FakePrinter(hs_reply=HS_BUSY, config_report=ZD_REPORT.encode(),
+                           sgd={"odometer.total_label_count": "19259"})
+        self.addCleanup(fake.close)
+        p = zl.Printer(name="Gary", host="127.0.0.1", port=fake.port, model="ZD420", expected={"darkness": 10})
+        snap = zl.inspect_printer(p)
+        self.assertTrue(snap.reachable)
+        self.assertEqual(snap.state, ("Printing", "busy"))
+        self.assertEqual(snap.activity, "Printing: 24 labels left in this job")
+        self.assertEqual(snap.diffs, [])
+        self.assertEqual(snap.info["odometer.total_label_count"], "19259")
+        self.assertIn(("PRINT WIDTH", "406"), snap.report)
+
+    def test_unreachable_and_non_link_os(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        snap = zl.inspect_printer(zl.Printer(name="Off", host="127.0.0.1", port=port))
+        self.assertEqual(snap.state, ("Not reachable", "off"))
+        self.assertIn("refused", snap.error)
+        self.assertFalse(zl.is_link_os(zl.Printer(name="x", model="Other")))  # never sent SGD
 
 
 class SpecCheckTests(unittest.TestCase):
