@@ -155,6 +155,7 @@ def load_settings():
         "printers": printers,
         "last_printer": data.get("last_printer"),
         "recent": data.get("recent", []),
+        "alerts": data.get("alerts") is True,
     }
 
 
@@ -1194,6 +1195,9 @@ class App(tk.Tk):
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
+        self.alerts = PrinterAlerts(self)
+        if self.settings["alerts"]:
+            self.after(5000, self.alerts.start)  # once the server's printer list is in
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ----- deployment log -----
@@ -1703,6 +1707,14 @@ class App(tk.Tk):
 
         stock = self.selected_stock()
         self.bg.run(lambda: check_printer(p, stock), done)
+
+    def set_alerts(self, on):
+        self.settings["alerts"] = on
+        self.save()
+        if on:
+            self.alerts.start()
+        else:
+            self.alerts.stop()
 
     def open_monitor(self):
         if getattr(self, "monitor", None) and self.monitor.winfo_exists():
@@ -2404,6 +2416,97 @@ class HistoryWindow(tk.Toplevel):
         self.app.bg.run(lambda: send_label(printer, zpl.encode("utf-8")), done)
 
 
+class PrinterAlerts:
+    """While Stripes is open, check every printer now and then and pop up a notice when
+    one runs into a problem (out of labels, head open...). Off unless the user turns it on."""
+
+    SECONDS = 30
+    MISSES = 2  # don't cry wolf over one dropped check
+
+    def __init__(self, app):
+        self.app = app
+        self.known, self.misses, self.pending, self.toasts = {}, {}, set(), []
+        self._timer = None
+
+    def start(self):
+        if self._timer is None:
+            self._tick()
+
+    def stop(self):
+        if self._timer is not None:
+            self.app.after_cancel(self._timer)
+            self._timer = None
+        self.known.clear()
+        self.misses.clear()
+
+    def _tick(self):
+        self._timer = self.app.after(self.SECONDS * 1000, self._tick)
+        for p in self.app.all_printers():
+            if p.name not in self.pending:
+                self.pending.add(p.name)
+                self.app.bg.run(lambda p=p: printer_problems(p),
+                                lambda problems, error, p=p: self._arrived(p, problems, error))
+
+    def _arrived(self, p, problems, error):
+        self.pending.discard(p.name)
+        if self._timer is None:
+            return  # turned off meanwhile
+        before = self.known.get(p.name, set())
+        if error:
+            self.misses[p.name] = self.misses.get(p.name, 0) + 1
+            problems = ["Not reachable"] if self.misses[p.name] >= self.MISSES else list(before)
+        else:
+            self.misses[p.name] = 0
+        new = [x for x in problems if x not in before]
+        self.known[p.name] = set(problems)
+        if new:
+            self.notify(p.name, new)
+
+    def notify(self, name, problems):
+        self.app.bell()
+        self.toasts = [t for t in self.toasts if t.winfo_exists()]
+        # stack upwards from the bottom right corner, starting again if they'd reach the top
+        bottom = min([t.winfo_y() - 10 for t in self.toasts] + [self.app.winfo_screenheight() - 60])
+        if bottom < 250:
+            bottom = self.app.winfo_screenheight() - 60
+        self.toasts.append(AlertToast(self.app, name, problems, bottom))
+
+
+class AlertToast(tk.Toplevel):
+    """A small notice in the corner of the screen that stays on top until dismissed."""
+
+    def __init__(self, app, name, problems, bottom):
+        super().__init__(app)
+        self.app = app
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(background="#b91c1c")
+        body = tk.Frame(self, background="white", padx=12, pady=10)
+        body.pack(fill="both", expand=True, padx=(6, 1), pady=1)
+        tk.Label(body, text=f"{name} needs attention", font=("Segoe UI", 11, "bold"), background="white",
+                 foreground="#111827").pack(anchor="w")
+        for problem in problems:
+            tk.Label(body, text=f"● {problem}", font=("Segoe UI", 10, "bold"), background="white",
+                     foreground="#b91c1c").pack(anchor="w", pady=(4, 0))
+            fix = PrinterMonitor.FIXES.get(problem)
+            if fix:
+                tk.Label(body, text=fix, font=("Segoe UI", 9), background="white", foreground="#111827",
+                         wraplength=300, justify="left").pack(anchor="w", padx=(14, 0))
+        buttons = tk.Frame(body, background="white")
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Dismiss", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Printer monitor", command=self._open_monitor).pack(side="right", padx=(0, 6))
+        self.update_idletasks()
+        w, h = max(self.winfo_reqwidth(), 340), self.winfo_reqheight()
+        x = self.winfo_screenwidth() - w - 16
+        self.geometry(f"{w}x{h}+{x}+{bottom - h}")
+        self.update_idletasks()
+
+    def _open_monitor(self):
+        self.app.open_monitor()
+        self.destroy()
+
+
 class PrinterMonitor(tk.Toplevel):
     """Live view of every printer: status, activity, settings and device details."""
 
@@ -2450,6 +2553,10 @@ class PrinterMonitor(tk.Toplevel):
         ttk.Label(titles, text="Printer monitor", font=("Segoe UI", 15, "bold")).pack(anchor="w")
         self.summary = ttk.Label(titles, text="Checking printers...", style="Muted.TLabel")
         self.summary.pack(anchor="w")
+        self.alerts_var = tk.BooleanVar(value=app.settings["alerts"])
+        ttk.Checkbutton(titles, text="Alert me when a printer has a problem (while Stripes is open)",
+                        variable=self.alerts_var, command=lambda: app.set_alerts(self.alerts_var.get())
+                        ).pack(anchor="w", pady=(4, 0))
 
         # Scrollable grid of printer cards
         holder = tk.Frame(self, background="#f3f4f6")

@@ -453,6 +453,25 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(zl.read_history(os.path.join(d, "none.jsonl")), [])
 
 
+class AlertTests(unittest.TestCase):
+    def test_only_new_problems_alert(self):
+        alerts = zl.PrinterAlerts(app=None)
+        alerts._timer = "running"
+        told = []
+        alerts.notify = lambda name, problems: told.append((name, problems))
+        p = zl.Printer(name="ZDDown", host="x")
+        alerts._arrived(p, [], None)
+        alerts._arrived(p, ["Out of labels", "Paused"], None)
+        alerts._arrived(p, ["Out of labels", "Paused"], None)  # still the same: no repeat
+        alerts._arrived(p, ["Out of labels", "Paused", "Print head open"], None)
+        alerts._arrived(p, [], None)
+        alerts._arrived(p, ["Paused"], None)  # came back after clearing: alert again
+        alerts._arrived(p, None, OSError("timed out"))  # one missed check is ignored
+        alerts._arrived(p, None, OSError("timed out"))
+        self.assertEqual(told, [("ZDDown", ["Out of labels", "Paused"]), ("ZDDown", ["Print head open"]),
+                                ("ZDDown", ["Paused"]), ("ZDDown", ["Not reachable"])])
+
+
 class SelfUpdateTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
