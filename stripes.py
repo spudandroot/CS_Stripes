@@ -882,7 +882,8 @@ def remove_old_versions(exe_path):
 # --------------------------------------------------------------------------
 
 class Background:
-    """Run slow work (network) off the UI thread and report back on it."""
+    """Run slow work (network, printers, the share) on a worker thread, then hand the
+    result back to the UI thread, so the window never freezes while it waits."""
 
     def __init__(self, root):
         self.root = root
