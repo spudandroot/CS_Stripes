@@ -9,7 +9,6 @@ import copy
 import gc
 import getpass
 import glob
-import hashlib
 import json
 import os
 import platform
@@ -18,11 +17,9 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import queue
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, asdict, field, fields, replace
 from datetime import datetime
@@ -52,8 +49,6 @@ MODELS = {
 MAX_RECENT = 20
 MAX_COPIES = 9999
 CONFIRM_COPIES_OVER = 50
-UPDATE_URL = "https://github.com/spudandroot/CS_Stripes/releases"
-UPDATE_CHECK_HOURS = 6
 HEARTBEAT_MINUTES = 15
 
 
@@ -728,10 +723,6 @@ class DeploymentLog:
             event = None
         return self.write(event, **fields)
 
-    def update_failed(self, message):
-        last = self.read().get("last_update_error") or {}
-        event = None if last.get("message") == message else f"Update check failed: {message}"
-        return self.write(event, last_update_error={"at": _now(), "message": message})
 
 
 def read_deployment(folder):
@@ -771,7 +762,7 @@ def remove_download_mark(path):
 
 
 # --------------------------------------------------------------------------
-# Self-update
+# Versions
 # --------------------------------------------------------------------------
 
 def parse_version(text):
@@ -792,81 +783,6 @@ def is_beta_version(text):
 def display_version(text):
     """'v1.4.0-beta.2' -> 'v1.4.0 Beta 2'."""
     return re.sub(r"-beta\.(\d+)$", r" Beta \1", text or "")
-
-
-def on_beta(beta, computer=None, user=None):
-    """Whether this PC or user is listed for beta versions. None when the list is unknown."""
-    if beta is None:
-        return None
-    computer = (computer or os.environ.get("COMPUTERNAME") or socket.gethostname()).lower()
-    user = (user or os.environ.get("USERNAME") or getpass.getuser()).lower()
-    return any(name.lower().split("\\")[-1] in (computer, user) for name in beta)
-
-
-def _fetch(url, timeout=60):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
-
-
-def _release_version(url, fetch):
-    return fetch(url).decode("ascii", "replace").strip()
-
-
-def check_for_update(current=None, fetch=_fetch, beta=False):
-    """The version this copy should change to, or None to stay put.
-
-    Everyone gets the latest release when it's newer. Beta PCs (beta=True) follow the
-    newest of the latest release and the current beta, even if that means going back
-    (a beta was withdrawn). A beta copy on a PC that's no longer listed (beta=False)
-    goes back to the latest release; beta=None (list unknown) only ever moves forward.
-    """
-    mine = parse_version(VERSION if current is None else current)
-    if mine is None:
-        return None  # development build
-    latest = _release_version(f"{UPDATE_URL}/latest/download/version.txt", fetch)
-    target = latest if parse_version(latest) else None
-    if beta:
-        try:
-            candidate = _release_version(f"{UPDATE_URL}/download/beta/version.txt", fetch)
-        except urllib.error.HTTPError as e:
-            if e.code != 404:
-                raise
-            candidate = None  # no beta published yet
-        if parse_version(candidate) and (not target or parse_version(candidate) > parse_version(target)):
-            target = candidate
-    if not target or parse_version(target) == mine:
-        return None
-    if parse_version(target) > mine or beta or (beta is False and mine[3] == 0):
-        return target
-    return None
-
-
-def folder_is_writable(folder):
-    try:
-        with tempfile.TemporaryFile(dir=folder):
-            return True
-    except OSError:
-        return False
-
-
-def install_update(version, exe_path, fetch=_fetch):
-    """Download a release and put it in place of exe_path, for the next start.
-
-    Windows lets a running program be renamed but not overwritten, so the
-    running exe is moved aside (Stripes.exe.old-...) and the new one takes its
-    name. Old copies are cleaned up on a later start.
-    """
-    base = f"{UPDATE_URL}/download/{version}"
-    data = fetch(f"{base}/Stripes.exe", timeout=600)
-    expected = fetch(f"{base}/Stripes.exe.sha256").decode("ascii", "replace").strip().upper()
-    if hashlib.sha256(data).hexdigest().upper() != expected:
-        raise ValueError("the download was damaged (checksum mismatch)")
-    new = exe_path + ".new"
-    with open(new, "wb") as f:
-        f.write(data)
-    if os.path.exists(exe_path):
-        os.replace(exe_path, f"{exe_path}.old-{int(time.time() * 1000)}")
-    os.replace(new, exe_path)
 
 
 def remove_old_versions(exe_path):
@@ -977,13 +893,11 @@ class App(tk.Tk):
         else:
             self._show_config_problems()
             self._maybe_first_run()
-        self._updates_started = not getattr(sys, "frozen", False)  # only the built .exe updates itself
-        if not self._updates_started:
+        # Updates are installed by IT (Group Policy copies the new exe from the share);
+        # Stripes doesn't update itself.
+        if getattr(sys, "frozen", False):
             remove_download_mark(sys.executable)
-            remove_old_versions(sys.executable)
-            if not self.config_folder:
-                self.after(3000, self._start_updates)
-            # otherwise once the server's settings arrive, since they say who's on beta
+            remove_old_versions(sys.executable)  # leftovers from when it did
         folder = status_folder()
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
@@ -1016,56 +930,6 @@ class App(tk.Tk):
         except OSError:
             pass
 
-    # ----- self-update -----
-
-    def _start_updates(self):
-        if not self._updates_started:
-            self._updates_started = True
-            self._check_for_update()
-
-    def _check_for_update(self):
-        exe = sys.executable
-        beta = on_beta(self.cfg.beta)
-
-        def work():
-            latest = check_for_update(beta=beta)
-            if not latest:
-                return None
-            if not folder_is_writable(os.path.dirname(exe)):
-                return "available", latest
-            install_update(latest, exe)
-            return "installed", latest
-
-        def done(result, error):
-            if error:
-                self._log(lambda log: log.update_failed(describe_error(error)))
-            if error or not result:
-                # offline or nothing new: look again later
-                self.after(UPDATE_CHECK_HOURS * 3600 * 1000, self._check_for_update)
-                return
-            kind, version = result
-            if kind == "installed":
-                self._log(lambda log: log.write(f"Downloaded {version}; finishes when Stripes restarts",
-                                                pending_update=version, last_update_error=None))
-                self.update_label.configure(text=f"Stripes {display_version(version)} is ready.", style="Ok.TLabel")
-                self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
-            else:
-                self.update_label.configure(text=f"Stripes {display_version(version)} is available; "
-                                                 "this copy can't update itself.",
-                                            style="Warn.TLabel")
-
-        self.bg.run(work, done)
-
-    def _restart_to_update(self):
-        if not self.active_design().is_empty() and not messagebox.askyesno(
-                APP_NAME, "Restart Stripes now? The label you're working on will be cleared.", parent=self):
-            return
-        # PYINSTALLER_RESET_ENVIRONMENT makes the new copy start fresh rather
-        # than reuse this one's unpacked files.
-        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
-        subprocess.Popen([sys.executable], env=env, close_fds=True)
-        self._on_close()
-
     @property
     def company(self):
         return self.cfg.printers
@@ -1079,11 +943,9 @@ class App(tk.Tk):
             self.cfg = cfg
             self._load_printer_list(select=self.printer_var.get() or self.settings.get("last_printer"))
             source = "saved copy (server unreachable)" if cfg.cached_at else "server" if cfg.source else "none"
-            beta = bool(on_beta(cfg.beta))
-            self._log(lambda log: log.write(config=source, printers=len(cfg.printers), beta=beta))
+            self._log(lambda log: log.write(config=source, printers=len(cfg.printers)))
         self._show_config_problems()
         self._maybe_first_run()
-        self._start_updates()
 
     def _show_config_problems(self):
         if self.cfg.problems:
@@ -1116,7 +978,6 @@ class App(tk.Tk):
         self.update_label = ttk.Label(header, text=f"Version {display_version(VERSION)}",
                                       style="Warn.TLabel" if is_beta_version(VERSION) else "Muted.TLabel")
         self.update_label.pack(side="right")
-        self.update_button = ttk.Button(header, text="Restart to update", command=self._restart_to_update)
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
         # Printer row

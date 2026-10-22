@@ -8,7 +8,6 @@ import socket
 import threading
 import types
 import unittest
-import urllib.error
 from unittest import mock
 
 import label_design as ld
@@ -372,22 +371,7 @@ class SpecCheckTests(unittest.TestCase):
         self.assertEqual(zl.check_printer(p), ([], None))  # no spec, no check
 
 
-class SelfUpdateTests(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        self.exe = os.path.join(self.dir, "Stripes.exe")
-        with open(self.exe, "wb") as f:
-            f.write(b"old version")
-
-    def fake_github(self, files):
-        def fetch(url, timeout=60):
-            for suffix, data in files.items():
-                if url.endswith(suffix):
-                    return data
-            raise OSError(f"404 {url}")
-        return fetch
-
+class VersionTests(unittest.TestCase):
     def test_versions(self):
         self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2, 1, 0))
         self.assertIsNone(zl.parse_version("dev-abc1234"))
@@ -395,78 +379,17 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertLess(zl.parse_version("v1.3.0"), zl.parse_version("v1.4.0-beta.1"))
         self.assertLess(zl.parse_version("v1.4.0-beta.2"), zl.parse_version("v1.4.0-beta.10"))
         self.assertLess(zl.parse_version("v1.4.0-beta.10"), zl.parse_version("v1.4.0"))
+        self.assertLess(zl.parse_version("v1.9.9"), zl.parse_version("v1.10.0"))  # not a text comparison
         self.assertEqual(zl.display_version("v1.4.0-beta.2"), "v1.4.0 Beta 2")
-        fetch = self.fake_github({"/latest/download/version.txt": b"v1.10.0\n"})
-        self.assertEqual(zl.check_for_update("v1.9.9", fetch), "v1.10.0")  # not a text comparison
-        self.assertIsNone(zl.check_for_update("v1.10.0", fetch))
-        self.assertIsNone(zl.check_for_update("v2.0.0", fetch))
-        self.assertIsNone(zl.check_for_update("dev-abc1234", fetch))  # development builds never update
 
-    def beta_github(self, latest, beta=None):
-        files = {"/latest/download/version.txt": latest.encode()}
-        fetch = self.fake_github(files)
-        if beta is None:
-            def without_beta(url, timeout=60):
-                if url.endswith("/download/beta/version.txt"):
-                    raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
-                return fetch(url, timeout)
-            return without_beta
-        files["/download/beta/version.txt"] = beta.encode()
-        return fetch
-
-    def test_beta_channel(self):
-        fetch = self.beta_github("v1.3.0", "v1.4.0-beta.2")
-        self.assertIsNone(zl.check_for_update("v1.3.0", fetch, beta=False))  # betas never reach others
-        self.assertEqual(zl.check_for_update("v1.3.0", fetch, beta=True), "v1.4.0-beta.2")
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.1", fetch, beta=True), "v1.4.0-beta.2")
-        self.assertIsNone(zl.check_for_update("v1.4.0-beta.2", fetch, beta=True))
-        # the beta was withdrawn (pointed back at beta 1): beta PCs follow it back
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", self.beta_github("v1.3.0", "v1.4.0-beta.1"),
-                                             beta=True), "v1.4.0-beta.1")
-        # taken off the list: back to the release
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", fetch, beta=False), "v1.3.0")
-        # list unknown (server down, no saved copy): never go backwards
-        self.assertIsNone(zl.check_for_update("v1.4.0-beta.2", fetch, beta=None))
-        # the release caught up: beta PCs move to it
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", self.beta_github("v1.4.0", "v1.4.0-beta.2"),
-                                             beta=True), "v1.4.0")
-        # nothing published to beta yet: beta PCs just get releases
-        self.assertEqual(zl.check_for_update("v1.2.0", self.beta_github("v1.3.0"), beta=True), "v1.3.0")
-        # a newer release a release PC somehow has is left alone
-        self.assertIsNone(zl.check_for_update("v2.0.0", fetch, beta=False))
-
-    def test_on_beta(self):
-        self.assertTrue(zl.on_beta(["ARROW01"], "arrow01", "jdoe"))
-        self.assertTrue(zl.on_beta(["ARROWFARMS\\JDoe"], "ARROW07", "jdoe"))
-        self.assertFalse(zl.on_beta(["ARROW01"], "ARROW07", "jdoe"))
-        self.assertFalse(zl.on_beta([], "ARROW01", "jdoe"))
-        self.assertIsNone(zl.on_beta(None, "ARROW01", "jdoe"))
-
-    def test_install_swaps_the_exe(self):
-        import hashlib
-        new = b"new version"
-        fetch = self.fake_github({"/download/v1.1.0/Stripes.exe": new,
-                                  "/download/v1.1.0/Stripes.exe.sha256": hashlib.sha256(new).hexdigest().encode()})
-        zl.install_update("v1.1.0", self.exe, fetch)
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), new)
-        olds = [n for n in os.listdir(self.dir) if n.startswith("Stripes.exe.old-")]
-        self.assertEqual(len(olds), 1)  # the running copy, moved aside
-        zl.remove_old_versions(self.exe)
-        self.assertEqual(os.listdir(self.dir), ["Stripes.exe"])
-
-    def test_damaged_download_leaves_current_copy(self):
-        fetch = self.fake_github({"/download/v1.1.0/Stripes.exe": b"truncated",
-                                  "/download/v1.1.0/Stripes.exe.sha256": b"0" * 64})
-        with self.assertRaises(ValueError):
-            zl.install_update("v1.1.0", self.exe, fetch)
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), b"old version")
-        self.assertEqual(os.listdir(self.dir), ["Stripes.exe"])
-
-    def test_writable_folder(self):
-        self.assertTrue(zl.folder_is_writable(self.dir))
-        self.assertFalse(zl.folder_is_writable(os.path.join(self.dir, "missing")))
+    def test_old_copies_cleaned_up(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = os.path.join(d, "Stripes.exe")
+        for name in ("Stripes.exe", "Stripes.exe.old-123", "Stripes.exe.new"):
+            open(os.path.join(d, name), "w").close()
+        zl.remove_old_versions(exe)
+        self.assertEqual(os.listdir(d), ["Stripes.exe"])
 
 
 class DeploymentLogTests(unittest.TestCase):
@@ -502,13 +425,6 @@ class DeploymentLogTests(unittest.TestCase):
         from datetime import datetime, timedelta
         old = (datetime.now() - timedelta(hours=2)).isoformat(sep=" ", timespec="seconds")
         self.assertFalse(zl.is_open_now({"running": True, "last_seen": old}))
-
-    def test_repeated_update_errors_logged_once(self):
-        log = self.log()
-        log.update_failed("No answer")
-        log.update_failed("No answer")
-        log.update_failed("Something else")
-        self.assertEqual(len(log.read()["events"]), 2)
 
     def test_events_are_capped(self):
         log = self.log()
