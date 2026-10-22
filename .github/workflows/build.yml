@@ -27,6 +27,10 @@ on:
         description: "Sign only (test signing without publishing)"
         type: boolean
         default: false
+      latest:
+        description: "Make it the latest release, so every PC updates to it (untick to publish without rolling out)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -129,7 +133,7 @@ jobs:
         if: (github.ref_type == 'tag' || inputs.release != '') && !contains(env.STRIPES_VERSION, '-beta.')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes --latest
+        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes --latest=${{ inputs.latest != false }}
 
       - name: Publish beta
         if: (github.ref_type == 'tag' || inputs.release != '') && contains(env.STRIPES_VERSION, '-beta.')
