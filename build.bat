@@ -16,7 +16,7 @@ call .venv\Scripts\activate.bat || goto :fail
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt pyinstaller || goto :fail
 python -m unittest || goto :fail
-pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" stripes.py || goto :fail
+pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --hidden-import pystray._win32 stripes.py || goto :fail
 
 echo.
 echo Done: %cd%\dist\Stripes.exe

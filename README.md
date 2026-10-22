@@ -82,6 +82,10 @@ One GPO, linked to an OU that contains both the users and their PCs:
    `\\SERVER\Share\Stripes\Stripes.exe`, destination `%LocalAppData%\Programs\Stripes\Stripes.exe`
 4. **Shortcuts**: *User Configuration > Preferences > Windows Settings > Shortcuts*, location
    **Desktop** and **Start Menu**, target `%LocalAppData%\Programs\Stripes\Stripes.exe`
+5. **Start in the tray at logon**: another Shortcut item, location **Startup**, same target,
+   arguments `--tray`. Stripes then waits in the notification area and opens instantly. Closing
+   its window keeps it there; right-click the tray icon > **Quit Stripes** to exit. Opening the
+   shortcut again brings the running copy forward instead of starting a second one.
 
 ### Deployment log
 
