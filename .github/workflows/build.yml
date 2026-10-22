@@ -7,6 +7,11 @@ name: Build
 # A version like v1.4.0-beta.1 is a beta: it's published as a pre-release, and the
 # "beta" release (which only holds version.txt) is pointed at it. Only PCs and users
 # listed in beta.json follow it. Betas can be run from any branch.
+#
+# Releases are code-signed with Azure Artifact Signing (account ArrowfarmsSigning,
+# profile Stripes-Signing). Only the sign job can sign: it runs in the "release"
+# environment, whose secrets hold the Azure IDs, and Azure only accepts that environment.
+# "Sign only" signs a build without publishing it, to test signing.
 on:
   push:
     branches: [main]
@@ -18,6 +23,10 @@ on:
         description: "Version to release, e.g. v1.2.0, or v1.3.0-beta.1 for beta PCs only (empty: just build)"
         required: false
         default: ""
+      sign:
+        description: "Sign only (test signing without publishing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -25,6 +34,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.stamp.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +50,7 @@ jobs:
         run: python -m unittest -v
 
       - name: Stamp version
+        id: stamp
         shell: pwsh
         env:
           RELEASE: ${{ inputs.release }}
@@ -50,10 +62,57 @@ jobs:
             throw "Version must look like v1.2.0 or v1.2.0-beta.1"
           }
           "VERSION = `"$v`"" | Out-File -Encoding utf8 stripes_version.py
-          "STRIPES_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
       - name: Build Stripes.exe
         run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" stripes.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stripes-unsigned
+          path: dist/Stripes.exe
+
+  sign:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.release != '' || inputs.sign
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      STRIPES_VERSION: ${{ needs.build.outputs.version }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Stripes-unsigned
+          path: dist
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Stripes.exe
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: ArrowfarmsSigning
+          certificate-profile-name: Stripes-Signing
+          files: ${{ github.workspace }}\dist\Stripes.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist\Stripes.exe
+          Write-Output "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { throw "Stripes.exe is not validly signed: $($sig.StatusMessage)" }
 
       - name: Checksum and version files
         shell: pwsh
@@ -63,7 +122,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Stripes
+          name: Stripes-signed
           path: dist/*
 
       - name: Publish release
