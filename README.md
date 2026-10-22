@@ -24,7 +24,6 @@ IT keeps two files in a folder on a server share:
 |---|---|
 | `printers.json` | Each printer: name, IP, model, dpi, default stock, and the settings it should have |
 | `stock.json` | Each kind of label roll: size and media type |
-| `beta.json` | Optional: computers and users who get beta versions (see [Beta versions](#beta-versions)) |
 
 Stripes finds the folder through a registry value set by Group Policy (so the server's name never
 appears in this repo):
@@ -66,21 +65,19 @@ Keep your real files on the internal share, **not in this repo**.
 
 ## Deploying to domain PCs (Group Policy)
 
-Each user runs their own copy from `%LocalAppData%\Programs\Stripes`, and **Stripes keeps itself up
-to date**: at start (and every few hours while open) it checks the latest GitHub release, downloads
-it, verifies its SHA-256 checksum and offers **Restart to update**. Users own that folder, so no admin
-rights or install scripts are needed. (A copy in a folder it can't write to, like Program Files, just
-says a new version is available.)
+Each user runs their own copy from `%LocalAppData%\Programs\Stripes`. **Group Policy keeps it up
+to date**: IT puts a new `Stripes.exe` on the share and every PC gets it at the next logon. Stripes
+doesn't update itself (antivirus treats a program replacing itself as suspicious).
 
 One GPO, linked to an OU that contains both the users and their PCs:
 
-1. Put `Stripes.exe` from [Releases](../../releases/latest) on a share Domain Users can read
-   (Properties > **Unblock** it first). It's only the starting copy; it never needs updating.
+1. Put `Stripes.exe` from [Releases](../../releases) on a share Domain Users can read
+   (Properties > **Unblock** it first). This is the copy every PC gets.
 2. **Settings location**: *Computer Configuration > Preferences > Windows Settings > Registry*,
    action **Update**: hive `HKEY_LOCAL_MACHINE`, key `SOFTWARE\Policies\Stripes`, value `ConfigPath`
    (REG_SZ) = `\\SERVER\Share\Stripes\config`
 3. **Each user's copy**: *User Configuration > Preferences > Windows Settings > Files*, action
-   **Create** (copies only if missing, so it never undoes a self-update): source
+   **Replace** (copies it again at each logon, so a new version on the share reaches everyone): source
    `\\SERVER\Share\Stripes\Stripes.exe`, destination `%LocalAppData%\Programs\Stripes\Stripes.exe`
 4. **Shortcuts**: *User Configuration > Preferences > Windows Settings > Shortcuts*, location
    **Desktop** and **Start Menu**, target `%LocalAppData%\Programs\Stripes\Stripes.exe`
@@ -89,40 +86,17 @@ One GPO, linked to an OU that contains both the users and their PCs:
 
 Create a `status` folder next to `config` (e.g. `\\SERVER\Share\Stripes\status`) and give Domain
 Users **Modify** on it. Each copy of Stripes then keeps one small file there (`COMPUTER_user.json`)
-with its version, when it was installed, its last update, a heartbeat every 15 minutes while open,
-pending updates and update errors. **Manage printers > Deployment status...** shows them all in one
+with its version, when it was installed, its last update and a heartbeat every 15 minutes while open. **Manage printers > Deployment status...** shows them all in one
 table. Without the folder, nothing is written.
 
 ## Releasing a new version
 
-Every push to `main` is tested and built by GitHub Actions on Windows (download the build from
-the run's artifacts). To ship to all PCs, publish a release: on GitHub go to
-**Actions > Build > Run workflow**, type the version (e.g. `v1.1.0`) and click **Run workflow**.
-Pushing a tag (`git tag v1.1.0 && git push origin v1.1.0`) does the same.
+Every push to `main` is tested and built by GitHub Actions on Windows. To make a release: on GitHub
+go to **Actions > Build > Run workflow**, type the version (e.g. `v1.4.0`) and click **Run workflow**.
+Releases are code-signed (Azure Artifact Signing, "Arrow Farms, Inc.").
 
-That publishes a Release; each copy of Stripes picks it up the next time it starts (or within a few hours).
-
-### Beta versions
-
-To try a version on a few PCs first, list them in `beta.json` next to `printers.json`:
-
-```json
-{"beta": ["ARROW01", "jsmith"]}
-```
-
-Each entry is a computer name (anyone on that PC) or a Windows username (that person on any PC).
-Then run the workflow with a beta version, e.g. `v1.4.0-beta.1`. It can be run from any branch.
-It's published as a pre-release, which ordinary copies of Stripes ignore. Copies on listed PCs move
-to it the next time they start (or within a few hours), and show "Beta" next to the version.
-
-- Release the same code to everyone with `v1.4.0`; beta PCs move to it too.
-- Beta PCs always run the newest of the latest release and the current beta, even if that's
-  older than what they have, so publishing a fixed beta (or re-pointing `beta`) rolls them back.
-- Take a PC off the list and it goes back to the latest release.
-- **Deployment status** shows who is on beta.
-
-A copy older than v1.4.0 doesn't know about betas: to start one on beta, download the beta's
-`Stripes.exe` from Releases into `%LocalAppData%\Programs\Stripes` once (with Stripes closed).
+Then download its `Stripes.exe`, **Unblock** it, and put it on the share in place of the old one.
+PCs get it at their next logon, or the next Group Policy refresh while Stripes is closed.
 
 ## Development
 
