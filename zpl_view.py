@@ -16,22 +16,23 @@ from dataclasses import dataclass, field
 from PIL import Image
 
 import label_design as ld
+from i18n import tr, N_
 
 # Commands that change how the printer is set up. They stay in effect after the label
 # and affect what other software prints (some even save to the printer's memory).
-SETTINGS_COMMANDS = {
-    "PW": "print width", "LL": "label length", "LS": "label shift", "LT": "label top",
-    "MD": "darkness", "PR": "print speed", "MN": "media type", "MT": "thermal type",
-    "MM": "print mode", "MU": "units", "PO": "print orientation", "PM": "mirror image",
-    "ML": "maximum label length", "MF": "media feed", "JU": "saving or resetting the configuration",
-    "JZ": "reprint after error", "KD": "display", "KN": "printer name", "KP": "front panel password",
-    "NC": "network", "ND": "network address", "NI": "network ID", "NS": "network settings",
-    "SC": "serial port", "ST": "printer clock", "WI": "wireless", "ID": "deleting stored objects",
-    "DF": "storing a format", "IS": "storing a format", "DG": "storing a graphic",
-    "SD": "darkness", "TA": "tear-off position", "JS": "backfeed", "JR": "printer reset",
-    "JC": "media calibration", "JL": "length calibration", "SE": "encoding table", "CC": "command prefix",
-    "CT": "command prefix", "CD": "delimiter", "JD": "diagnostics", "JM": "dots per mm",
-    "WC": "printing the configuration label",
+SETTINGS_COMMANDS = {  # descriptions are shown with tr()
+    "PW": N_("print width"), "LL": N_("label length"), "LS": N_("label shift"), "LT": N_("label top"),
+    "MD": N_("darkness"), "PR": N_("print speed"), "MN": N_("media type"), "MT": N_("thermal type"),
+    "MM": N_("print mode"), "MU": N_("units"), "PO": N_("print orientation"), "PM": N_("mirror image"),
+    "ML": N_("maximum label length"), "MF": N_("media feed"), "JU": N_("saving or resetting the configuration"),
+    "JZ": N_("reprint after error"), "KD": N_("display"), "KN": N_("printer name"),
+    "KP": N_("front panel password"), "NC": N_("network"), "ND": N_("network address"), "NI": N_("network ID"),
+    "NS": N_("network settings"), "SC": N_("serial port"), "ST": N_("printer clock"), "WI": N_("wireless"),
+    "ID": N_("deleting stored objects"), "DF": N_("storing a format"), "IS": N_("storing a format"),
+    "DG": N_("storing a graphic"), "SD": N_("darkness"), "TA": N_("tear-off position"), "JS": N_("backfeed"),
+    "JR": N_("printer reset"), "JC": N_("media calibration"), "JL": N_("length calibration"),
+    "SE": N_("encoding table"), "CC": N_("command prefix"), "CT": N_("command prefix"), "CD": N_("delimiter"),
+    "JD": N_("diagnostics"), "JM": N_("dots per mm"), "WC": N_("printing the configuration label"),
 }
 # Recognised and safe to ignore in the preview.
 _IGNORED = {"XA", "CI", "PQ", "FR", "FS", "FW", "PF", "HH", "HS", "XB", "FN", "SN", "SF", "FV", "MC", "PH", "XG"}
@@ -109,7 +110,7 @@ def decode_gf_hex(data, row_bytes):
         elif c == ":":  # same as the previous row
             row = rows[-1] if rows else "0" * width
         else:
-            raise ValueError(f"^GF data has an unexpected character {c!r}")
+            raise ValueError(tr("^GF data has an unexpected character {char}", char=repr(c)))
         i += 1
         while len(row) >= width:
             rows.append(row[:width])
@@ -122,10 +123,10 @@ def decode_gf_hex(data, row_bytes):
 def _graphic(params):
     """^GFA,total,total,row_bytes,data -> 1-bit image (black = 0), or raise ValueError."""
     if len(params) < 5 or params[0].upper() != "A":
-        raise ValueError("only ^GFA (ASCII hex) graphics can be previewed")
+        raise ValueError(tr("only ^GFA (ASCII hex) graphics can be previewed"))
     row_bytes = _int(params, 3, 0)
     if row_bytes <= 0:
-        raise ValueError("^GF needs the bytes per row")
+        raise ValueError(tr("^GF needs the bytes per row"))
     data = ",".join(params[4:])  # commas inside the data are run-length codes
     rows = decode_gf_hex(data, row_bytes)
     img = Image.frombytes("1", (row_bytes * 8, len(rows)), b"".join(rows))
@@ -188,7 +189,7 @@ def parse(text, label):
             if view.labels >= 1:
                 rest = text[m.end():]
                 if "^XA" in rest.upper():
-                    view.warnings.append("Only the first label (^XA ... ^XZ) is shown in the preview.")
+                    view.warnings.append(tr("Only the first label (^XA ... ^XZ) is shown in the preview."))
                     # still note settings commands further on
                     for later in _TOKEN.finditer(rest):
                         c = later.group(1).upper()
@@ -247,13 +248,13 @@ def parse(text, label):
             if f"^{code}" not in unknown:
                 unknown.append(f"^{code}")
     if in_label and view.labels:
-        view.warnings.append("The label isn't closed with ^XZ.")
+        view.warnings.append(tr("The label isn't closed with ^XZ."))
     if not view.labels and text.strip():
-        view.errors.append("ZPL labels start with ^XA and end with ^XZ.")
+        view.errors.append(tr("ZPL labels start with ^XA and end with ^XZ."))
     if rotated:
-        view.warnings.append("Rotated fields are shown unrotated in the preview.")
+        view.warnings.append(tr("Rotated fields are shown unrotated in the preview."))
     if unknown:
-        view.warnings.append("Not shown in the preview: " + " ".join(unknown[:12]) +
+        view.warnings.append(tr("Not shown in the preview:") + " " + " ".join(unknown[:12]) +
                              (" ..." if len(unknown) > 12 else ""))
     return view
 
@@ -281,7 +282,7 @@ def _emit(view, st, label, field_end):
             bitmap = _graphic(st.graphic[1])
             marks.append(ld.Mark("image", x, y, bitmap.width, bitmap.height, bitmap=bitmap))
         except ValueError as e:
-            view.warnings.append(f"Graphic not shown: {e}.")
+            view.warnings.append(tr("Graphic not shown: {error}.", error=e))
     elif st.barcode:
         code, p = st.barcode
         if code == "BQ":
@@ -340,7 +341,7 @@ def _emit(view, st, label, field_end):
                              origin=(ox, oy) if st.origin else None, origin_span=st.origin_span,
                              source_span=(st.field_start or 0, field_end)))
     if x2 > label.width or y2 > label.height or x1 < 0 or y1 < 0:
-        msg = "Something goes past the edge of the label."
+        msg = tr("Something goes past the edge of the label.")
         if msg not in view.warnings:
             view.warnings.append(msg)
 

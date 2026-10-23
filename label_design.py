@@ -14,6 +14,8 @@ import io
 from dataclasses import dataclass, field, asdict, fields
 from math import inf
 
+from i18n import tr
+
 MARGIN_IN = 0.06      # blank border around the label
 ITEM_GAP_IN = 0.03    # space between stacked items
 WIDTH_SAFETY = 1.08   # fudge factor on the character width estimate
@@ -64,12 +66,12 @@ class Element:
     def title(self):
         """Short description for lists."""
         if self.kind == "text":
-            return self.value or "(blank line)"
+            return self.value or tr("(blank line)")
         if self.kind == "barcode":
             return f"{SYMBOLOGIES[self.symbology]}: {self.value}"
         if self.kind == "qr":
             return f"QR: {self.value}"
-        return "Picture"
+        return tr("Picture")
 
 
 @dataclass
@@ -261,21 +263,21 @@ def _code128_values(data):
 def barcode_problem(symbology, data):
     """Why the data can't be printed as this barcode, or None if it's fine."""
     if not data:
-        return "Barcode is empty."
+        return tr("Barcode is empty.")
     if symbology == "code128":
         if any(not 32 <= ord(c) <= 126 for c in data):
-            return "Code 128 supports letters, digits and common symbols only."
+            return tr("Code 128 supports letters, digits and common symbols only.")
     elif symbology == "code39":
         if any(c not in _C39 or c == "*" for c in data.upper()):
-            return "Code 39 supports A-Z, 0-9, space and - . $ / + % only."
+            return tr("Code 39 supports A-Z, 0-9, space and - . $ / + % only.")
     elif symbology in ("ean13", "upca"):
         n = 12 if symbology == "ean13" else 11
         name = SYMBOLOGIES[symbology]
         if not data.isdigit() or len(data) not in (n, n + 1):
-            return f"{name} needs {n} digits (or {n + 1} with the check digit)."
+            return tr("{name} needs {n} digits (or {m} with the check digit).", name=name, n=n, m=n + 1)
         full = data if symbology == "ean13" else "0" + data
         if len(data) == n + 1 and ean_check_digit(full[:12]) != full[12]:
-            return f"{name} check digit is wrong; it should be {ean_check_digit(full[:12])}."
+            return tr("{name} check digit is wrong; it should be {digit}.", name=name, digit=ean_check_digit(full[:12]))
     return None
 
 
@@ -465,7 +467,7 @@ def render(design, label):
         if e.w <= 0 or e.h <= 0:
             continue
         if e.x < 0 or e.y < 0 or e.x + e.w > label.width or e.y + e.h > label.height:
-            warnings.append(f"Item {n} goes past the edge of the label.")
+            warnings.append(tr("Item {n} goes past the edge of the label.", n=n))
 
         if e.kind == "text":
             if not e.value.strip():
@@ -474,25 +476,25 @@ def render(design, label):
             if e.size_pt:
                 h = int(pt_to_dots(e.size_pt, label))
                 if h > fit + 0.5:
-                    warnings.append(f"Line {n} is probably too wide for its space.")
+                    warnings.append(tr("Line {n} is probably too wide for its space.", n=n))
                 if h > e.h + 0.5:
-                    warnings.append(f"Line {n} is taller than its space.")
+                    warnings.append(tr("Line {n} is taller than its space.", n=n))
             else:
                 h = int(min(e.h, fit))
             if h < label.dots(0.06):
-                warnings.append(f"Line {n} is very small and may be hard to read.")
+                warnings.append(tr("Line {n} is very small and may be hard to read.", n=n))
             h = max(1, h)
             marks.append(Mark("text", e.x, e.y + (e.h - h) // 2, e.w, h, e, e.value, h, e.align))
 
         elif e.kind == "barcode":
             problem = barcode_problem(e.symbology, e.value)
             if problem:
-                errors.append(f"Item {n}: {problem}")
+                errors.append(tr("Item {n}: {problem}", n=n, problem=problem))
                 continue
             modules = barcode_modules(e.symbology, e.value)
             module = min(10, e.w // len(modules))
             if module < 1:
-                errors.append(f"Item {n}: the barcode is too long to fit; shorten it or make its space wider.")
+                errors.append(tr("Item {n}: the barcode is too long to fit; shorten it or make its space wider.", n=n))
                 continue
             width = module * len(modules)
             human = barcode_human_text(e.symbology, e.value)
@@ -500,7 +502,7 @@ def render(design, label):
                 if e.show_text else 0
             bar_h = e.h - (text_h + 2 if text_h else 0)
             if bar_h < label.dots(0.15):
-                warnings.append(f"Item {n}: the barcode is very short and may not scan.")
+                warnings.append(tr("Item {n}: the barcode is very short and may not scan.", n=n))
             x = _place(e.x, e.w, width, e.align)
             marks.append(Mark("bars", x, e.y, width, max(1, bar_h), e, module=module, pattern=modules))
             if text_h:
@@ -508,12 +510,13 @@ def render(design, label):
 
         elif e.kind == "qr":
             if not e.value:
-                errors.append(f"Item {n}: QR code is empty.")
+                errors.append(tr("Item {n}: QR code is empty.", n=n))
                 continue
             matrix = qr_matrix(e.value)
             module = min(10, min(e.w, e.h) // len(matrix))
             if module < 1:
-                errors.append(f"Item {n}: the QR code holds too much to fit; shorten it or make its space bigger.")
+                errors.append(tr("Item {n}: the QR code holds too much to fit; shorten it or make its space bigger.",
+                                 n=n))
                 continue
             side = module * len(matrix)
             marks.append(Mark("qr", _place(e.x, e.w, side, e.align), e.y + (e.h - side) // 2,
