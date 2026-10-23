@@ -29,6 +29,7 @@ import tkinter.font
 from tkinter import ttk, messagebox, filedialog
 
 import label_design as ld
+import zpl_view as zv
 
 APP_NAME = "Stripes"
 try:
@@ -1115,16 +1116,19 @@ class App(tk.Tk):
         body.columnconfigure(1, weight=3, uniform="cols")
         body.rowconfigure(0, weight=1)
 
-        # Left: Simple tab (just type) and Advanced tab (items, barcodes, pictures...)
+        # Left: Simple tab (just type), Advanced tab (items, barcodes, pictures...) and ZPL tab
         left = ttk.Frame(body)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.tabs = ttk.Notebook(left)
         self.tabs.pack(fill="both", expand=True)
         simple, advanced = ttk.Frame(self.tabs, padding=8), ttk.Frame(self.tabs, padding=8)
+        zpl = ttk.Frame(self.tabs, padding=8)
         self.tabs.add(simple, text="  Simple  ")
         self.tabs.add(advanced, text="  Advanced  ")
+        self.tabs.add(zpl, text="  ZPL  ")
         self._build_simple(simple)
         self._build_items(advanced)
+        self._build_zpl(zpl)
         self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
         recent_row = ttk.Frame(left)
         recent_row.pack(fill="x", pady=(8, 0))
@@ -1171,6 +1175,58 @@ class App(tk.Tk):
         ttk.Label(parent, text="Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
                                "size per line, use the Advanced tab.",
                   style="Muted.TLabel", wraplength=330, justify="left").pack(anchor="w", pady=(6, 0))
+
+    def _build_zpl(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        ttk.Label(top, text="ZPL, printed exactly as typed:").pack(side="left")
+        ttk.Button(top, text="From my label", command=self._zpl_from_design).pack(side="right")
+        box = ttk.Frame(parent)
+        box.pack(fill="both", expand=True, pady=(4, 0))
+        self.zpl_box = tk.Text(box, height=8, width=30, wrap="none", font=("Consolas", 11), undo=True)
+        yscroll = ttk.Scrollbar(box, orient="vertical", command=self.zpl_box.yview)
+        xscroll = ttk.Scrollbar(box, orient="horizontal", command=self.zpl_box.xview)
+        self.zpl_box.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        yscroll.pack(side="right", fill="y")
+        xscroll.pack(side="bottom", fill="x")
+        self.zpl_box.pack(side="left", fill="both", expand=True)
+        self.zpl_box.tag_configure("command", foreground="#1d4ed8")
+        self.zpl_box.tag_configure("field", background="#dbeafe")
+        self.zpl_box.bind("<<Modified>>", self._zpl_modified)
+        self.zpl_box.bind("<Control-Return>", lambda e: (self.print_label(), "break")[1])
+        self._zpl_view, self._zpl_selected = None, None
+        ttk.Label(parent, text="The preview follows what you type. Drag a field on the preview to move it; "
+                               "its ^FO or ^FT numbers change to match.",
+                  style="Muted.TLabel", wraplength=330, justify="left").pack(anchor="w", pady=(6, 0))
+
+    def _zpl_text(self):
+        return self.zpl_box.get("1.0", "end-1c")
+
+    def _zpl_modified(self, _event):
+        if self.zpl_box.edit_modified():
+            self.zpl_box.edit_modified(False)
+            text = self._zpl_text()
+            self.zpl_box.tag_remove("command", "1.0", "end")
+            for m in re.finditer(r"[\^~][A-Za-z@][A-Za-z0-9@]?", text):
+                self.zpl_box.tag_add("command", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+            self.refresh()
+
+    def _zpl_from_design(self, ask=True):
+        """Fill the ZPL tab with the label from the Simple or Advanced tab."""
+        label = self.current_label()
+        typed = ld.Design.from_text(self.simple_box.get("1.0", "end-1c"))
+        design = self.design if not self.design.is_empty() else typed
+        if label is None or design.is_empty():
+            if ask:
+                messagebox.showinfo(APP_NAME, "Make a label on the Simple or Advanced tab first.", parent=self)
+            return
+        if ask and self._zpl_text().strip() and not messagebox.askyesno(
+                APP_NAME, "Replace the ZPL here with the label from the other tabs?", parent=self):
+            return
+        p = self.current_printer()
+        self.zpl_box.delete("1.0", "end")
+        self.zpl_box.insert("1.0", ld.build_zpl(ld.render(copy.deepcopy(design), label), p.shift_x, p.shift_y))
+        self.zpl_box.edit_separator()
 
     def _build_items(self, parent):
         tree_frame = ttk.Frame(parent)
@@ -1288,6 +1344,9 @@ class App(tk.Tk):
 
     def in_simple_mode(self):
         return self.tabs.index(self.tabs.select()) == 0
+
+    def in_zpl_mode(self):
+        return self.tabs.index(self.tabs.select()) == 2
 
     def active_design(self):
         """What would print right now: the Simple tab's text, or the Advanced tab's items."""
@@ -1575,7 +1634,7 @@ class App(tk.Tk):
         self._fill_tree(select=[i + delta for i in chosen])
 
     def _delete_items(self):
-        if not self.selected:
+        if not self.selected or self.in_zpl_mode():
             return
         first = min(self.selected)
         for i in sorted(self.selected, reverse=True):
@@ -1605,6 +1664,10 @@ class App(tk.Tk):
         self.v_auto_layout.set(False)
 
     def _new_label(self):
+        if self.in_zpl_mode():
+            self.zpl_box.delete("1.0", "end")
+            self.zpl_box.focus_set()
+            return
         if self.in_simple_mode():
             self.simple_box.delete("1.0", "end")
             self.simple_box.focus_set()
@@ -1620,7 +1683,12 @@ class App(tk.Tk):
             self.refresh()
 
     def _tab_changed(self, _event=None):
-        if self.in_simple_mode():
+        if self.in_zpl_mode():
+            if not self._zpl_text().strip():
+                self._zpl_from_design(ask=False)  # start from what's on the other tabs
+            self.preview_frame.configure(text="Preview: drag a field to move it")
+            self.zpl_box.focus_set()
+        elif self.in_simple_mode():
             self.preview_frame.configure(text="Preview")
             self.simple_box.focus_set()
         else:
@@ -1695,8 +1763,15 @@ class App(tk.Tk):
             c.create_text(cw / 2, ch / 2, text="Add a printer to get started", fill="#6b7280")
             self.warn_label.configure(text="")
             return
-        design = self.active_design()
-        rendered = ld.render(design, label)
+        zpl_mode = self.in_zpl_mode()
+        if zpl_mode:
+            text = self._zpl_text()
+            rendered = self._zpl_view = zv.parse(text, label)
+            empty = not text.strip()
+        else:
+            design = self.active_design()
+            rendered = ld.render(design, label)
+            empty = design.is_empty()
         scale = min((cw - 40) / label.width, (ch - 40) / label.height)
         lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
@@ -1713,7 +1788,11 @@ class App(tk.Tk):
             c.create_rectangle(*box, fill=bg, outline="")
         c.create_rectangle(x0, y0, x0 + lw, y0 + lh, outline="#6b7280")
 
-        for i in ([] if self.in_simple_mode() else self.selected):
+        if zpl_mode and self._zpl_selected is not None and self._zpl_selected < len(rendered.fields):
+            f = rendered.fields[self._zpl_selected]
+            c.create_rectangle(x0 + f.x * scale - 2, y0 + f.y * scale - 2, x0 + (f.x + f.w) * scale + 2,
+                               y0 + (f.y + f.h) * scale + 2, outline="#2563eb", dash=(4, 2))
+        for i in ([] if self.in_simple_mode() or zpl_mode else self.selected):
             if i >= len(self.design.elements):
                 continue
             e = self.design.elements[i]
@@ -1721,9 +1800,12 @@ class App(tk.Tk):
             c.create_rectangle(bx, by, bx + bw, by + bh, outline="#2563eb", dash=(4, 2))
             if len(self.selected) == 1:
                 c.create_rectangle(bx + bw - 4, by + bh - 4, bx + bw + 4, by + bh + 4, fill="#2563eb", outline="")
-        if design.is_empty():
-            c.create_text(cw / 2, ch / 2, text="Type your label text on the left", fill="#9ca3af")
+        if empty:
+            c.create_text(cw / 2, ch / 2, text="Type ZPL on the left" if zpl_mode else "Type your label text on the left",
+                          fill="#9ca3af")
         problems = rendered.errors + rendered.warnings
+        if zpl_mode and rendered.settings:
+            problems.append("Changes printer settings when printed: " + self._settings_words(rendered.settings))
         self.warn_label.configure(text="\n".join(problems), style="Bad.TLabel" if rendered.errors else "Warn.TLabel")
 
     def _draw_mark(self, mark, x0, y0, scale):
@@ -1743,6 +1825,15 @@ class App(tk.Tk):
                           "right": ("ne", x + mark.w * scale)}[mark.align]
             c.create_text(tx, y, text=mark.text, anchor=anchor, font=(self.preview_family, -px, "bold"),
                           fill="black")
+        elif mark.kind == "box":  # ^GB: a box or line, mark.module = border thickness
+            filled = mark.module * 2 >= min(mark.w, mark.h)
+            color = "white" if mark.text == "W" else "black"
+            if filled:
+                c.create_rectangle(x, y, x + mark.w * scale, y + mark.h * scale, fill=color, outline="")
+            else:
+                t = mark.module * scale
+                c.create_rectangle(x + t / 2, y + t / 2, x + (mark.w - mark.module / 2) * scale,
+                                   y + (mark.h - mark.module / 2) * scale, outline=color, width=max(1, t))
         elif mark.kind == "bars":
             start = None
             for i, bar in enumerate(mark.pattern + [False]):
@@ -1769,6 +1860,9 @@ class App(tk.Tk):
 
     def _canvas_press(self, event):
         self._drag = None
+        if self._view and self.in_zpl_mode():
+            self._zpl_press(event)
+            return
         if not self._view or self.in_simple_mode():
             return
         self.canvas.focus_set()
@@ -1791,8 +1885,59 @@ class App(tk.Tk):
         self._sync_tree_selection()
         self._drag = ("move", x, y, {i: (els[i].x, els[i].y, els[i].w, els[i].h) for i in self.selected})
 
+    def _zpl_press(self, event):
+        """Select the ZPL field under the pointer, show its lines, and get ready to move it."""
+        x0, y0, scale = self._view
+        x, y = (event.x - x0) / scale, (event.y - y0) / scale
+        fields = self._zpl_view.fields if self._zpl_view else []
+        hit = next((i for i in reversed(range(len(fields)))
+                    if fields[i].x <= x <= fields[i].x + fields[i].w and fields[i].y <= y <= fields[i].y + fields[i].h),
+                   None)
+        self._zpl_selected = hit
+        self.zpl_box.tag_remove("field", "1.0", "end")
+        if hit is not None:
+            f = fields[hit]
+            start, end = f.source_span
+            self.zpl_box.tag_add("field", f"1.0+{start}c", f"1.0+{end}c")
+            self.zpl_box.see(f"1.0+{start}c")
+            if f.origin_span:
+                self.zpl_box.edit_separator()
+                self._drag = ("zpl", x, y, hit, f.origin)
+        self.refresh()
+
+    def _zpl_drag(self, event):
+        x0, y0, scale = self._view
+        _mode, sx, sy, index, (ox, oy) = self._drag
+        dx, dy = round((event.x - x0) / scale - sx), round((event.y - y0) / scale - sy)
+        fields = self._zpl_view.fields if self._zpl_view else []
+        if index >= len(fields) or not fields[index].origin_span:
+            return
+        new = f"{max(0, ox + dx)},{max(0, oy + dy)}"
+        start, end = fields[index].origin_span
+        if self._zpl_text()[start:end] == new:
+            return
+        self.zpl_box.delete(f"1.0+{start}c", f"1.0+{end}c")
+        self.zpl_box.insert(f"1.0+{start}c", new)
+        # redraw now, so the next step of the drag finds the field where it is
+        self._zpl_view = zv.parse(self._zpl_text(), self.current_label())
+        f = self._zpl_view.fields[index] if index < len(self._zpl_view.fields) else None
+        self.zpl_box.tag_remove("field", "1.0", "end")
+        if f:
+            self.zpl_box.tag_add("field", f"1.0+{f.source_span[0]}c", f"1.0+{f.source_span[1]}c")
+
+    @staticmethod
+    def _settings_words(settings):
+        seen = []
+        for code, what in settings:
+            if f"{what} ({code})" not in seen:
+                seen.append(f"{what} ({code})")
+        return ", ".join(seen)
+
     def _canvas_drag(self, event):
         if not self._drag or not self._view:
+            return
+        if self._drag[0] == "zpl":
+            self._zpl_drag(event)
             return
         x0, y0, scale = self._view
         mode, sx, sy, start = self._drag
@@ -1818,11 +1963,18 @@ class App(tk.Tk):
         self.refresh()
 
     def exact_preview(self):
-        p, label, design = self.current_printer(), self.current_label(), self.active_design()
-        if not p or design.is_empty():
-            messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
-            return
-        zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
+        p, label = self.current_printer(), self.current_label()
+        if self.in_zpl_mode():
+            zpl = self._zpl_text()
+            if not p or not zpl.strip():
+                messagebox.showinfo(APP_NAME, "Pick a printer and type some ZPL first.", parent=self)
+                return
+        else:
+            design = self.active_design()
+            if not p or design.is_empty():
+                messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
+                return
+            zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
         self.set_status("Getting exact preview from labelary.com...")
 
         def done(png, error):
@@ -1849,10 +2001,59 @@ class App(tk.Tk):
 
     # ----- printing -----
 
+    def _print_zpl(self, p):
+        """Send the ZPL tab's text as typed (plus ^PQ for copies when it has none)."""
+        text = self._zpl_text()
+        if not text.strip():
+            messagebox.showinfo(APP_NAME, "Type some ZPL first.", parent=self)
+            return
+        view = zv.parse(text, self.current_label())
+        if view.errors:
+            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(view.errors), parent=self)
+            return
+        try:
+            copies = int(self.copies_var.get())
+            if not 1 <= copies <= MAX_COPIES:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(APP_NAME, f"Copies must be a whole number from 1 to {MAX_COPIES}.", parent=self)
+            return
+        if view.settings and not messagebox.askyesno(
+                APP_NAME, "This ZPL also changes the printer's own settings: "
+                f"{self._settings_words(view.settings)}.\n\nThose stay on the printer and change how labels "
+                "from other programs print too. Print anyway?", icon="warning", parent=self):
+            return
+        if copies > CONFIRM_COPIES_OVER and not messagebox.askyesno(
+                APP_NAME, f"Print {copies} labels on {p.name}?", parent=self):
+            return
+        zpl = zv.with_copies(text, copies)
+        self.print_btn.configure(state="disabled")
+        self.set_status(f"Sending to {p.name}...")
+
+        def done(_result, error):
+            self.print_btn.configure(state="normal")
+            if error:
+                self.set_status(f"Print failed: {describe_error(error)}", "Bad.TLabel")
+                messagebox.showerror(APP_NAME, f"Could not print on {p.name} ({p.where}).\n\n"
+                                     f"{describe_error(error)}", parent=self)
+                return
+            note = ""
+            if not self.stock_is_default():
+                self._fill_stock()  # a non-default stock is a one-off; back to the printer's default
+                self.refresh()
+                note = " Label stock is back to the printer's default."
+            self.set_status(f"Sent the ZPL to {p.name}.{note}", "Ok.TLabel")
+            self.check_status(quiet=True)
+
+        self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
+
     def print_label(self):
         p = self.current_printer()
         if not p:
             messagebox.showinfo(APP_NAME, "Add a printer first (Manage printers...).", parent=self)
+            return
+        if self.in_zpl_mode():
+            self._print_zpl(p)
             return
         design = self.active_design()
         if design.is_empty():
