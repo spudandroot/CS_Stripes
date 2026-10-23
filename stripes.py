@@ -151,6 +151,7 @@ def load_settings():
         "printers": printers,
         "last_printer": data.get("last_printer"),
         "recent": data.get("recent", []),
+        "show_zpl": data.get("show_zpl") is True,
     }
 
 
@@ -1154,9 +1155,10 @@ class App(tk.Tk):
 
         # Bottom: copies + print
         bottom = ttk.Frame(outer)
-        bottom.pack(fill="x", pady=(12, 0))
+        bottom.pack(fill="x", pady=(12, 0), side="bottom", before=body)  # keeps Print visible in a short window
         ttk.Label(bottom, text="Copies:", font=("Segoe UI", 11)).pack(side="left")
         self.copies_var = tk.StringVar(value="1")
+        self.copies_var.trace_add("write", lambda *a: self.v_show_zpl.get() and self.refresh())  # ^PQ in Show ZPL
         ttk.Spinbox(bottom, from_=1, to=MAX_COPIES, width=6, textvariable=self.copies_var,
                     font=("Segoe UI", 11)).pack(side="left", padx=6)
         ttk.Button(bottom, text="Exact preview (online)", command=self.exact_preview).pack(side="left", padx=12)
@@ -1164,7 +1166,7 @@ class App(tk.Tk):
         self.print_btn.pack(side="right")
 
         self.status = ttk.Label(outer, text="Ready. Tip: Ctrl+P prints.", style="Muted.TLabel")
-        self.status.pack(anchor="w", pady=(8, 0))
+        self.status.pack(anchor="w", pady=(8, 0), side="bottom", before=bottom)
 
     def _build_simple(self, parent):
         ttk.Label(parent, text="Type your label, one line per row:").pack(anchor="w")
@@ -1175,6 +1177,11 @@ class App(tk.Tk):
         ttk.Label(parent, text="Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
                                "size per line, use the Advanced tab.",
                   style="Muted.TLabel", wraplength=330, justify="left").pack(anchor="w", pady=(6, 0))
+        self.v_show_zpl = tk.BooleanVar(value=self.settings["show_zpl"])
+        self._zpl_panels = []
+        ttk.Checkbutton(parent, text="Show ZPL", variable=self.v_show_zpl,
+                        command=self._show_zpl_toggled).pack(anchor="w", pady=(6, 0))
+        self._add_zpl_panel(parent)
 
     def _build_zpl(self, parent):
         top = ttk.Frame(parent)
@@ -1313,6 +1320,61 @@ class App(tk.Tk):
         self.v_auto_layout = tk.BooleanVar(value=True)
         ttk.Checkbutton(options, text="Auto layout (stack items to fill the label)", variable=self.v_auto_layout,
                         command=self._auto_layout_toggled).pack(side="left")
+        ttk.Checkbutton(options, text="Show ZPL", variable=self.v_show_zpl,
+                        command=self._show_zpl_toggled).pack(side="right")
+        self._add_zpl_panel(parent)
+
+    # ----- "Show ZPL" on the Simple and Advanced tabs -----
+
+    def _add_zpl_panel(self, parent):
+        """A read-only box under the tab's controls showing the ZPL that will be sent."""
+        frame = ttk.Frame(parent)
+        text = tk.Text(frame, height=7, width=30, wrap="none", font=("Consolas", 10), state="disabled",
+                       background="#f8fafc")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        yscroll.pack(side="right", fill="y")
+        xscroll.pack(side="bottom", fill="x")
+        text.pack(side="left", fill="both", expand=True)
+        text.tag_configure("command", foreground="#1d4ed8")
+        self._zpl_panels.append((frame, text))
+        if self.v_show_zpl.get():
+            frame.pack(fill="x", pady=(4, 0))
+
+    def _show_zpl_toggled(self):
+        for frame, _text in self._zpl_panels:
+            if self.v_show_zpl.get():
+                frame.pack(fill="x", pady=(4, 0))
+            else:
+                frame.pack_forget()
+        self.update_idletasks()
+        if self.v_show_zpl.get() and self.state() == "normal" and self.winfo_height() < self.winfo_reqheight():
+            height = min(self.winfo_reqheight(), self.winfo_screenheight() - 80)
+            self.geometry(f"{self.winfo_width()}x{height}")  # grow to fit the box rather than squeeze
+        self.settings["show_zpl"] = self.v_show_zpl.get()
+        self.save()
+        self.refresh()
+
+    def _show_zpl(self, rendered, p):
+        """Put the ZPL for what's on the preview into the current tab's box."""
+        index = 0 if self.in_simple_mode() else 1
+        if not self.v_show_zpl.get() or index >= len(self._zpl_panels):
+            return
+        text = self._zpl_panels[index][1]
+        try:
+            copies = max(1, min(MAX_COPIES, int(self.copies_var.get())))
+        except ValueError:
+            copies = 1
+        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies) if rendered.marks else ""
+        if text.get("1.0", "end-1c") == zpl:
+            return
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", zpl)
+        for m in re.finditer(r"[\^~][A-Za-z@][A-Za-z0-9@]?", zpl):
+            text.tag_add("command", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        text.configure(state="disabled")  # still selectable, so it can be copied
 
     # ----- helpers -----
 
@@ -1772,6 +1834,7 @@ class App(tk.Tk):
             design = self.active_design()
             rendered = ld.render(design, label)
             empty = design.is_empty()
+            self._show_zpl(rendered, self.current_printer())
         scale = min((cw - 40) / label.width, (ch - 40) / label.height)
         lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
