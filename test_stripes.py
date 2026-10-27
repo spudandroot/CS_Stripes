@@ -418,6 +418,39 @@ class CheckPrinterTests(unittest.TestCase):
                          ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
 
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_start_reaches_the_first(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        self.assertFalse(zl.SingleInstance(path).signal_running())  # nothing running yet
+        got, arrived = [], threading.Event()
+        first = zl.SingleInstance(path)
+        first.listen(lambda message: (got.append(message), arrived.set()))
+        self.addCleanup(first.close)
+        self.assertTrue(zl.SingleInstance(path).signal_running("show"))
+        self.assertTrue(arrived.wait(2))
+        self.assertEqual(got, ["show"])
+
+    def test_wrong_key_or_stale_file_is_ignored(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        got = []
+        first = zl.SingleInstance(path)
+        first.listen(got.append)
+        self.addCleanup(first.close)
+        port = open(path).read().split()[0]
+        with open(path, "w") as f:
+            f.write(f"{port} not-the-key")
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        first.close()
+        with open(path, "w") as f:
+            f.write("1 stale")  # left over after a crash: nothing listens there
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        self.assertEqual(got, [])
+
+
 class VersionTests(unittest.TestCase):
     def test_versions(self):
         self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2, 1, 0))

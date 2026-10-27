@@ -13,6 +13,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -155,6 +156,7 @@ def load_settings():
         "recent": data.get("recent", []),
         "show_zpl": data.get("show_zpl") is True,
         "language": data.get("language") if data.get("language") in dict(i18n.LANGUAGES) else "en",
+        "tray_hint_shown": data.get("tray_hint_shown") is True,
     }
 
 
@@ -946,6 +948,89 @@ class Background:
         self.root.after(100, self._poll)
 
 
+TRAY_FLAG = "--tray"  # start hidden in the tray (the logon shortcut uses this)
+
+
+class SingleInstance:
+    """Only one Stripes per user. The running copy listens on a port on this PC only
+    (127.0.0.1) and notes the port, with a random key, in the user's profile; a second
+    start finds it there, asks it to show its window, and exits."""
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(os.path.dirname(cache_folder()), "instance.txt")
+        self.server = None
+
+    def signal_running(self, message="show"):
+        """Hand `message` to a copy that's already running. True if one answered."""
+        try:
+            with open(self.path, encoding="ascii") as f:
+                port, key = f.read().split()
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=1) as s:
+                s.sendall(f"{key} {message}\n".encode("ascii"))
+                return s.recv(16).startswith(b"ok")
+        except (OSError, ValueError):
+            return False
+
+    def listen(self, on_message):
+        """Become the running copy: on_message(text) is called (on a worker thread) for each request."""
+        key = secrets.token_hex(16)
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w", encoding="ascii") as f:
+            f.write(f"{self.server.getsockname()[1]} {key}")
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = self.server.accept()
+                except OSError:
+                    return  # closed
+                with conn:
+                    try:
+                        conn.settimeout(2)
+                        got, _, message = conn.recv(256).decode("ascii", "replace").strip().partition(" ")
+                        if secrets.compare_digest(got, key):
+                            conn.sendall(b"ok")
+                            on_message(message)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=serve, daemon=True).start()
+
+    def close(self):
+        if self.server:
+            self.server.close()
+
+
+class Tray:
+    """Stripes' icon in the notification area. pystray runs it on its own thread, so each
+    menu click is handed to the window's thread with app.call."""
+
+    def __init__(self, app):
+        import pystray
+        from PIL import Image
+        image = Image.open(resource_path(os.path.join("assets", "icon-48.png")))
+        menu = pystray.Menu(
+            # Labels are functions so the menu follows the English/Español switch
+            pystray.MenuItem(lambda item: tr("Open Stripes"), lambda icon, item: app.call(app.show), default=True),
+            pystray.MenuItem(lambda item: tr("Printer monitor"), lambda icon, item: app.call(app.show_monitor)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: tr("Quit Stripes"), lambda icon, item: app.call(app.quit_app)))
+        self.icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        self.icon.run_detached()
+
+    def notify(self, text):
+        try:
+            self.icon.notify(text, APP_NAME)
+        except Exception:  # notifications are a nicety
+            pass
+
+    def stop(self):
+        self.icon.stop()
+
+
 def resource_path(name):
     """Files bundled into the .exe are unpacked to sys._MEIPASS."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -961,8 +1046,10 @@ def pick_font_family(root):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, start_hidden=False):
         super().__init__()
+        if start_hidden:
+            self.withdraw()  # starting at logon: just the tray icon
         self.title(f"{APP_NAME} {display_version(VERSION)}")
         self.minsize(900, 640)
         try:
@@ -1019,7 +1106,15 @@ class App(tk.Tk):
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Closing the window keeps Stripes running in the tray, so it opens instantly next
+        # time; Quit is on the tray icon's menu. Without a tray, closing quits as before.
+        self.tray = None
+        if sys.platform == "win32":
+            try:
+                self.tray = Tray(self)
+            except Exception:
+                self.tray = None
+        self.protocol("WM_DELETE_WINDOW", self.hide_to_tray if self.tray else self._on_close)
 
     # ----- deployment log -----
 
@@ -1031,6 +1126,36 @@ class App(tk.Tk):
     def _heartbeat(self):
         self._log(lambda log: log.write(running=True))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
+
+    # ----- tray -----
+
+    def call(self, func):
+        """Run func on the window's thread (for the tray and the single-instance listener)."""
+        self.bg.results.put((lambda result, error: func(), None, None))
+
+    def show(self):
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)  # Windows won't otherwise bring it to the front
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    def show_monitor(self):
+        self.open_monitor()
+        self.monitor.lift()
+
+    def hide_to_tray(self):
+        self.withdraw()
+        if not self.settings.get("tray_hint_shown"):
+            self.tray.notify(tr("Stripes is still running. Click its icon to open it; "
+                                "right-click it to quit."))
+            self.settings["tray_hint_shown"] = True
+            self.save()
+
+    def quit_app(self):
+        if self.tray:
+            self.tray.stop()
+        self._on_close()
 
     def _on_close(self, event="Closed"):
         if self.deployment:  # don't let a slow share hold up closing
@@ -3064,14 +3189,46 @@ class PrinterDialog(tk.Toplevel):
                   (tr("Calibration started."), "Ok.TLabel"))
 
 
+def self_check(out_path):
+    """Used by the release build: prove the built exe can load what it needs (Tk, Pillow
+    for the preview, the tray, QR codes, its icon), then write its version to out_path."""
+    from PIL import Image, ImageTk
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        ImageTk.PhotoImage(Image.new("1", (8, 8)), master=root)
+        ld.qr_matrix("Stripes")
+        Image.open(resource_path(os.path.join("assets", "icon-48.png"))).load()
+        if sys.platform == "win32":
+            import pystray._win32  # noqa: F401 (the tray's Windows backend, loaded by name at run time)
+    finally:
+        root.destroy()
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"ok {VERSION}\n")
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
+        self_check(sys.argv[2])
+        return
+    start_hidden = TRAY_FLAG in sys.argv[1:]
+    instance = SingleInstance()
+    # Already running? Bring that window forward (or, from the logon shortcut, do nothing).
+    if instance.signal_running("tray" if start_hidden else "show"):
+        return
     if sys.platform == "win32":
         try:  # sharp text on high-DPI screens
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    App().mainloop()
+    app = App(start_hidden=start_hidden)
+    try:
+        instance.listen(lambda message: message == "show" and app.call(app.show))
+    except OSError:
+        pass  # can't listen: a second start just opens a second window
+    app.mainloop()
+    instance.close()
 
 
 if __name__ == "__main__":

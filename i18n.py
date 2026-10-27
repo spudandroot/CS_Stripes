@@ -481,6 +481,11 @@ ES = {
     "duplicate name": "nombre repetido",
     "needs a host (IP address) or windows_name": "necesita host (dirección IP) o windows_name",
     "Printer {name}: unknown stock '{stock}'": "Impresora {name}: tipo de etiqueta desconocido '{stock}'",
+    # Tray
+    "Open Stripes": "Abrir Stripes",
+    "Quit Stripes": "Salir de Stripes",
+    "Stripes is still running. Click its icon to open it; right-click it to quit.":
+        "Stripes sigue abierto. Haga clic en su icono para abrirlo; haga clic derecho para salir.",
 }
 
 _ENGLISH = {spanish: english for english, spanish in ES.items()}
