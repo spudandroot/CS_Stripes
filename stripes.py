@@ -9,16 +9,15 @@ import copy
 import gc
 import getpass
 import glob
-import hashlib
 import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import queue
@@ -31,6 +30,9 @@ import tkinter.font
 from tkinter import ttk, messagebox, filedialog
 
 import label_design as ld
+import zpl_view as zv
+import i18n
+from i18n import tr, N_
 
 APP_NAME = "Stripes"
 try:
@@ -51,8 +53,6 @@ MODELS = {
 MAX_RECENT = 20
 MAX_COPIES = 9999
 CONFIRM_COPIES_OVER = 50
-UPDATE_URL = "https://github.com/spudandroot/CS_Stripes/releases"
-UPDATE_CHECK_HOURS = 6
 HEARTBEAT_MINUTES = 15
 
 
@@ -73,7 +73,6 @@ class Printer:
     shift_x: int = 0   # nudge everything right (+) or left (-), in dots
     shift_y: int = 0   # nudge everything down (+) or up (-), in dots
     stock: str = ""    # id of the printer's default label stock (company printers)
-    expected: dict = field(default_factory=dict)  # how the printer should be set up; checked, never sent
 
     @property
     def dpmm(self):
@@ -81,7 +80,7 @@ class Printer:
 
     @property
     def where(self):
-        return f"Windows printer '{self.windows_name}'" if self.windows_name else f"IP {self.host}"
+        return tr("Windows printer '{name}'", name=self.windows_name) if self.windows_name else f"IP {self.host}"
 
     @property
     def size_text(self):
@@ -154,6 +153,9 @@ def load_settings():
         "printers": printers,
         "last_printer": data.get("last_printer"),
         "recent": data.get("recent", []),
+        "show_zpl": data.get("show_zpl") is True,
+        "language": data.get("language") if data.get("language") in dict(i18n.LANGUAGES) else "en",
+        "tray_hint_shown": data.get("tray_hint_shown") is True,
     }
 
 
@@ -204,10 +206,10 @@ def _entries(data, key):
 
 
 def parse_config(folder):
-    """Read printers.json and (optional) stock.json from a folder.
+    """Read printers.json and the optional stock.json from a folder.
 
-    Raises OSError/ValueError if printers.json itself can't be read; bad entries
-    are skipped and listed in the returned problems.
+    Returns (printers, stock, problems). Raises OSError/ValueError if
+    printers.json itself can't be read; bad entries are skipped and listed in problems.
     """
     problems = []
     try:
@@ -216,20 +218,20 @@ def parse_config(folder):
         stock_data = {}
     except (OSError, ValueError) as e:
         stock_data = {}
-        problems.append(f"Could not read stock.json: {e}")
+        problems.append(tr("Could not read stock.json: {error}", error=e))
     stock, by_id = [], {}
     for i, d in enumerate(_entries(stock_data, "stock")):
         try:
             st = Stock.from_dict(d)
             st.width_in, st.height_in = float(st.width_in), float(st.height_in)
             if st.width_in <= 0 or st.height_in <= 0:
-                raise ValueError("width_in and height_in must be above 0")
+                raise ValueError(tr("width_in and height_in must be above 0"))
             if st.media not in MEDIA_TYPES:
-                raise ValueError(f"media must be one of {', '.join(MEDIA_TYPES)}")
+                raise ValueError(tr("media must be one of {choices}", choices=", ".join(MEDIA_TYPES)))
             if st.id in by_id:
-                raise ValueError("duplicate id")
+                raise ValueError(tr("duplicate id"))
         except (TypeError, ValueError) as e:
-            problems.append(f"stock.json entry {i + 1} skipped: {e}")
+            problems.append(tr("stock.json entry {n} skipped: {error}", n=i + 1, error=e))
             continue
         by_id[st.id] = st
         stock.append(st)
@@ -240,21 +242,19 @@ def parse_config(folder):
         try:
             p = Printer.from_dict(d)
             if p.dpi not in DPI_TO_DPMM:
-                raise ValueError(f"dpi must be one of {', '.join(map(str, DPI_TO_DPMM))}")
+                raise ValueError(tr("dpi must be one of {choices}", choices=", ".join(map(str, DPI_TO_DPMM))))
             if not p.host and not p.windows_name:
-                raise ValueError("needs a host (IP address) or windows_name")
+                raise ValueError(tr("needs a host (IP address) or windows_name"))
             if p.name in names:
-                raise ValueError("duplicate name")
-            if not isinstance(p.expected, dict):
-                raise ValueError("expected must be a {...} object")
+                raise ValueError(tr("duplicate name"))
         except (TypeError, ValueError) as e:
-            problems.append(f"printers.json entry {i + 1} skipped: {e}")
+            problems.append(tr("printers.json entry {n} skipped: {error}", n=i + 1, error=e))
             continue
         if p.stock:
             if p.stock in by_id:
                 p.width_in, p.height_in = by_id[p.stock].width_in, by_id[p.stock].height_in
             else:
-                problems.append(f"Printer {p.name}: unknown stock '{p.stock}'")
+                problems.append(tr("Printer {name}: unknown stock '{stock}'", name=p.name, stock=p.stock))
                 p.stock = ""
         names.add(p.name)
         printers.append(p)
@@ -298,10 +298,11 @@ def load_company_config():
         except (OSError, ValueError) as e:
             cached = load_cached_config(folder)
             if cached:
-                cached.problems.insert(0, f"Couldn't read the company settings from {folder}; "
-                                          f"using the copy saved {cached.cached_at}.")
+                cached.problems.insert(0, tr("Couldn't read the company settings from {folder}; "
+                                             "using the copy saved {when}.", folder=folder, when=cached.cached_at))
                 return cached
-            return CompanyConfig(source=folder, problems=[f"Couldn't read the company settings from {folder}: {e}"])
+            problem = tr("Couldn't read the company settings from {folder}: {error}", folder=folder, error=e)
+            return CompanyConfig(source=folder, problems=[problem])
         try:
             save_cache(folder)
         except OSError:
@@ -313,7 +314,7 @@ def load_company_config():
                 printers, stock, problems = parse_config(local)
             except (OSError, ValueError) as e:
                 path = os.path.join(local, "printers.json")
-                return CompanyConfig(source=local, problems=[f"Could not read {path}: {e}"])
+                return CompanyConfig(source=local, problems=[tr("Could not read {path}: {error}", path=path, error=e)])
             return CompanyConfig(printers, stock, local, problems)
     return CompanyConfig()
 
@@ -357,16 +358,17 @@ def send_raw(host, port, data, timeout=5):
         s.shutdown(socket.SHUT_WR)
 
 
-_PRINT_MODES = {"0": "Rewind", "1": "Peel-off", "2": "Tear-off", "3": "Cutter", "4": "Applicator",
-                "5": "Delayed cut", "6": "Linerless peel", "7": "Linerless rewind", "8": "Partial cutter",
-                "9": "RFID", "K": "Kiosk", "S": "Stream"}
+_PRINT_MODES = {"0": N_("Rewind"), "1": N_("Peel-off"), "2": N_("Tear-off"), "3": N_("Cutter"),
+                "4": N_("Applicator"), "5": N_("Delayed cut"), "6": N_("Linerless peel"),
+                "7": N_("Linerless rewind"), "8": N_("Partial cutter"), "9": "RFID", "K": N_("Kiosk"),
+                "S": N_("Stream")}
 
 
 def parse_host_status_details(reply):
     """Everything a ~HS (host status) reply tells us, by name."""
     parts = re.findall(rb"\x02(.*?)\x03", reply, re.S)
     if len(parts) < 2:
-        raise ValueError("The printer sent an unexpected status reply.")
+        raise ValueError(tr("The printer sent an unexpected status reply."))
     s1 = parts[0].decode("ascii", "replace").split(",")
     s2 = parts[1].decode("ascii", "replace").split(",")
 
@@ -390,10 +392,11 @@ def parse_host_status_details(reply):
     }
 
 
-_STATUS_PROBLEMS = [("paper_out", "Out of labels"), ("paused", "Paused"), ("head_open", "Print head open"),
-                    ("ribbon_out", "Ribbon out"), ("under_temp", "Print head too cold"),
-                    ("over_temp", "Print head too hot"), ("buffer_full", "Receive buffer full"),
-                    ("corrupt_ram", "Printer memory error")]
+# Problems are kept in English (they're also keys, e.g. PrinterMonitor.FIXES); tr() them to show them.
+_STATUS_PROBLEMS = [("paper_out", N_("Out of labels")), ("paused", N_("Paused")),
+                    ("head_open", N_("Print head open")), ("ribbon_out", N_("Ribbon out")),
+                    ("under_temp", N_("Print head too cold")), ("over_temp", N_("Print head too hot")),
+                    ("buffer_full", N_("Receive buffer full")), ("corrupt_ram", N_("Printer memory error"))]
 
 
 def status_problems(details):
@@ -419,42 +422,6 @@ def query_status_details(host, port, timeout=3):
 
 def query_status(host, port, timeout=3):
     return status_problems(query_status_details(host, port, timeout))
-
-
-# Lines of the printer's configuration report (^HH) that we compare with the spec.
-_REPORT_FIELDS = {
-    "DARKNESS": "darkness",
-    "PRINT SPEED": "speed",
-    "PRINT MODE": "print_mode",
-    "MEDIA TYPE": "media",
-    "PRINT WIDTH": "print_width",
-}
-_REPORT_MEDIA = {"GAP/NOTCH": "gap", "NON-CONTINUOUS": "gap", "WEB": "gap", "MARK": "mark",
-                 "BLACK MARK": "mark", "CONTINUOUS": "continuous"}
-
-
-def parse_config_report(text):
-    """Pull the settings we care about out of a ^HH configuration report.
-
-    Report lines look like "  +10.0               DARKNESS" (value, then name).
-    Anything unrecognised is skipped, so an unexpected format just means fewer checks.
-    """
-    found = {}
-    for line in text.splitlines():
-        m = re.match(r"^\s*(\S.*?)\s{2,}([A-Z][A-Z0-9 ./-]*?)\s*$", line)
-        if not m or m.group(2) not in _REPORT_FIELDS:
-            continue
-        key, value = _REPORT_FIELDS[m.group(2)], m.group(1).strip().upper()
-        number = re.match(r"[+-]?\d+(\.\d+)?", value)
-        if key in ("darkness", "speed") and number:
-            found[key] = float(number.group())
-        elif key == "print_width" and number:
-            found[key] = int(float(number.group()))
-        elif key == "print_mode":
-            found[key] = value.lower().replace(" ", "-")  # TEAR OFF -> tear-off
-        elif key == "media":
-            found[key] = _REPORT_MEDIA.get(value, value.lower())
-    return found
 
 
 def parse_config_lines(text):
@@ -483,21 +450,16 @@ def query_config_report(host, port, timeout=4):
     return reply.decode("ascii", "replace")
 
 
-def query_config(host, port, timeout=4):
-    """The settings we compare with the spec, from the configuration report."""
-    return parse_config_report(query_config_report(host, port, timeout))
-
-
 # Device details that Link-OS printers (ZD, ZT, ...) report over Set-Get-Do. Read-only.
 SGD_INFO = {
-    "device.friendly_name": "Name on printer",
-    "device.unique_id": "Serial number",
-    "appl.name": "Firmware",
-    "odometer.total_label_count": "Labels printed (lifetime)",
-    "odometer.total_print_length": "Printed length (lifetime)",
-    "device.uptime": "Uptime",
-    "interface.network.active.mac_addr": "MAC address",
-    "head.resolution.in_dpi": "Resolution (dpi)",
+    "device.friendly_name": N_("Name on printer"),
+    "device.unique_id": N_("Serial number"),
+    "appl.name": N_("Firmware"),
+    "odometer.total_label_count": N_("Labels printed (lifetime)"),
+    "odometer.total_print_length": N_("Printed length (lifetime)"),
+    "device.uptime": N_("Uptime"),
+    "interface.network.active.mac_addr": N_("MAC address"),
+    "head.resolution.in_dpi": N_("Resolution (dpi)"),
 }
 
 
@@ -527,55 +489,29 @@ def query_sgd(host, port, names, timeout=4):
             for name, value in zip(names, values)}
 
 
-_SPEC_LABELS = {"darkness": "Darkness", "speed": "Speed", "print_mode": "Print mode",
-                "media": "Media type", "print_width": "Print width"}
+def check_printer(printer, stock=None):
+    """Status problems, and whether the labels loaded look like `stock`.
 
-
-def spec_differences(expected, actual):
-    """Human-readable differences between a printer's spec and what it reports."""
-    diffs = []
-    for key, label in _SPEC_LABELS.items():
-        if key not in expected or key not in actual:
-            continue
-        want, have = expected[key], actual[key]
-        if isinstance(have, (int, float)):
-            try:
-                same = abs(float(want) - have) < 0.05
-            except (TypeError, ValueError):
-                same = False
-        else:
-            same = str(want).strip().lower().replace(" ", "-") == have
-        if not same:
-            diffs.append(f"{label} is {have:g}" if isinstance(have, float) else f"{label} is {have}")
-            diffs[-1] += f" (spec says {want})"
-    return diffs
-
-
-def check_printer(printer):
-    """Status problems, plus spec differences for company printers with a spec.
-
-    Returns (problems, differences); differences is None when not checked.
+    Returns (problems, label problem or None). Only printers we know the IP of can say
+    how long their labels are.
     """
-    problems = printer_problems(printer)
-    if not (printer.expected and printer.host):
-        return problems, None
-    try:
-        return problems, spec_differences(printer.expected, query_config(printer.host, printer.port))
-    except OSError:
-        return problems, None
+    if not printer.host:
+        return windows_printer_problems(printer.windows_name), None
+    details = query_status_details(printer.host, printer.port)
+    return status_problems(details), check_label_length(printer, stock, details.get("label_length_dots"))
 
 
 def describe_error(exc):
     if isinstance(exc, socket.timeout):
-        return "No answer from the printer (timed out). Is it on and connected?"
+        return tr("No answer from the printer (timed out). Is it on and connected?")
     if isinstance(exc, ConnectionRefusedError):
-        return "The printer refused the connection. Check the IP address and port."
+        return tr("The printer refused the connection. Check the IP address and port.")
     if isinstance(exc, socket.gaierror):
-        return "Unknown printer address. Check the IP address."
+        return tr("Unknown printer address. Check the IP address.")
     if win32print is not None and exc.__class__.__name__ == "error" and len(getattr(exc, "args", ())) >= 3:
-        return f"Windows printer error: {exc.args[2]}"  # pywintypes.error
+        return tr("Windows printer error: {error}", error=exc.args[2])  # pywintypes.error
     if isinstance(exc, OSError) and exc.strerror:
-        return f"Network error: {exc.strerror}"
+        return tr("Network error: {error}", error=exc.strerror)
     return str(exc) or exc.__class__.__name__
 
 
@@ -592,12 +528,12 @@ _PORT_IP = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})")
 
 # Spooler status bits (PRINTER_STATUS_*) worth telling the user about.
 _SPOOLER_PROBLEMS = [
-    (0x00000080, "Offline"),
-    (0x00000010, "Out of labels"),
-    (0x00000001, "Paused"),
-    (0x00400000, "Door/head open"),
-    (0x00000008, "Label jam"),
-    (0x00000002, "Error"),
+    (0x00000080, N_("Offline")),
+    (0x00000010, N_("Out of labels")),
+    (0x00000001, N_("Paused")),
+    (0x00400000, N_("Door/head open")),
+    (0x00000008, N_("Label jam")),
+    (0x00000002, N_("Error")),
 ]
 
 
@@ -639,7 +575,7 @@ def is_zebra(windows_name, driver):
 def list_windows_printers():
     """Return [(Printer guess, is_zebra)] for every printer installed in Windows."""
     if win32print is None:
-        raise RuntimeError("Windows printer support is not available (pywin32 is not installed).")
+        raise RuntimeError(tr("Windows printer support is not available (pywin32 is not installed)."))
     flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
     infos = win32print.EnumPrinters(flags, None, 2)
     addresses = _port_addresses()
@@ -653,7 +589,7 @@ def list_windows_printers():
 
 def print_windows_raw(windows_name, data):
     if win32print is None:
-        raise RuntimeError("Windows printer support is not available (pywin32 is not installed).")
+        raise RuntimeError(tr("Windows printer support is not available (pywin32 is not installed)."))
     h = win32print.OpenPrinter(windows_name)
     try:
         win32print.StartDocPrinter(h, 1, ("Stripes label", None, "RAW"))
@@ -669,7 +605,7 @@ def print_windows_raw(windows_name, data):
 
 def windows_printer_problems(windows_name):
     if win32print is None:
-        raise RuntimeError("Windows printer support is not available (pywin32 is not installed).")
+        raise RuntimeError(tr("Windows printer support is not available (pywin32 is not installed)."))
     h = win32print.OpenPrinter(windows_name)
     try:
         status = win32print.GetPrinter(h, 2)["Status"]
@@ -702,8 +638,6 @@ class PrinterSnapshot:
     status: dict = field(default_factory=dict)    # from ~HS
     problems: list = field(default_factory=list)
     report: list = field(default_factory=list)    # (name, value) lines of the configuration report
-    settings: dict = field(default_factory=dict)  # the ones compared with the spec
-    diffs: list = None                             # None when there's no spec to compare with
     info: dict = field(default_factory=dict)      # Set-Get-Do device details
     queue_jobs: int = None                         # jobs in the Windows print queue
     response_ms: int = None
@@ -712,25 +646,42 @@ class PrinterSnapshot:
     def activity(self):
         remaining, waiting = self.status.get("labels_remaining"), self.status.get("formats_waiting")
         if remaining:
-            return f"Printing: {remaining} label{'s' if remaining != 1 else ''} left in this job"
+            if remaining == 1:
+                return tr("Printing: 1 label left in this job")
+            return tr("Printing: {n} labels left in this job", n=remaining)
         if waiting:
-            return f"{waiting} job{'s' if waiting != 1 else ''} waiting"
+            return tr("1 job waiting") if waiting == 1 else tr("{n} jobs waiting", n=waiting)
         if self.status.get("label_waiting"):
-            return "Label waiting to be taken"
-        return "Idle"
+            return tr("Label waiting to be taken")
+        return tr("Idle")
 
     @property
     def state(self):
         """(text, kind) for the status badge: kind is ok, busy, warn, bad or off."""
         if not self.reachable:
-            return "Not reachable", "off"
+            return tr("Not reachable"), "off"
         if self.problems:
-            return self.problems[0], "bad"
+            return tr(self.problems[0]), "bad"
         if self.status.get("labels_remaining") or self.status.get("formats_waiting"):
-            return "Printing", "busy"
-        if self.diffs:
-            return "Ready (differs from spec)", "warn"
-        return "Ready", "ok"
+            return tr("Printing"), "busy"
+        return tr("Ready"), "ok"
+
+
+# Zebras measure labels from the start of one to the start of the next, so the length they
+# report includes the gap: 1 in labels on a 0.07 in gap measure 1.07 in.
+LABEL_GAP_ALLOWANCE_IN = 0.25
+LABEL_SHORT_ALLOWANCE_IN = 0.1  # calibration varies a little
+
+
+def check_label_length(printer, stock, length_dots):
+    """Whether the labels a printer measured look like `stock`: None if so (or we can't tell),
+    otherwise what's wrong, e.g. "Labels loaded are 1.57 in long, not 2 x 1 in"."""
+    if not (stock and length_dots) or stock.media == "continuous":
+        return None
+    length = length_dots / (printer.dpmm * 25.4)
+    if -LABEL_SHORT_ALLOWANCE_IN <= length - stock.height_in <= LABEL_GAP_ALLOWANCE_IN:
+        return None
+    return tr("Labels loaded are {length} in long, not {stock}", length=f"{length:.2f}", stock=stock.name)
 
 
 def windows_queue_jobs(windows_name):
@@ -765,11 +716,9 @@ def inspect_printer(printer):
     snap.problems = status_problems(snap.status)
     try:
         text = query_config_report(printer.host, printer.port)
-        snap.report, snap.settings = parse_config_lines(text), parse_config_report(text)
+        snap.report = parse_config_lines(text)
     except OSError:
         pass
-    if printer.expected and snap.settings:
-        snap.diffs = spec_differences(printer.expected, snap.settings)
     if is_link_os(printer):
         try:
             snap.info = query_sgd(printer.host, printer.port, SGD_INFO)
@@ -827,6 +776,7 @@ class DeploymentLog:
     the installed version, updates and a heartbeat while Stripes is open."""
 
     MAX_EVENTS = 50
+    OBSOLETE = ("pending_update", "last_update_error", "beta")  # left by builds that updated themselves
 
     def __init__(self, folder, computer=None, user=None):
         self.folder = folder
@@ -850,6 +800,8 @@ class DeploymentLog:
             if not os.path.isdir(self.folder):
                 return False
             record = self.read()
+            for key in self.OBSOLETE:
+                record.pop(key, None)
             now = _now()
             record.setdefault("first_seen", now)
             record.update(computer=self.computer, user=self.user, last_seen=now, **fields)
@@ -864,7 +816,7 @@ class DeploymentLog:
 
     def started(self, version, exe):
         previous = self.read().get("version")
-        fields = dict(version=version, exe=exe, last_start=_now(), running=True, pending_update=None,
+        fields = dict(version=version, exe=exe, last_start=_now(), running=True,
                       windows=platform.platform())
         if previous is None:
             event = f"Installed ({version})"
@@ -875,10 +827,6 @@ class DeploymentLog:
             event = None
         return self.write(event, **fields)
 
-    def update_failed(self, message):
-        last = self.read().get("last_update_error") or {}
-        event = None if last.get("message") == message else f"Update check failed: {message}"
-        return self.write(event, last_update_error={"at": _now(), "message": message})
 
 
 def read_deployment(folder):
@@ -918,56 +866,13 @@ def remove_download_mark(path):
 
 
 # --------------------------------------------------------------------------
-# Self-update
+# Versions
 # --------------------------------------------------------------------------
 
 def parse_version(text):
     """'v1.2.3' -> (1, 2, 3); None for anything else (e.g. development builds)."""
     m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
     return tuple(int(n) for n in m.groups()) if m else None
-
-
-def _fetch(url, timeout=60):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.read()
-
-
-def check_for_update(current=None, fetch=_fetch):
-    """The newest release's version if it's newer than this one, else None."""
-    mine = parse_version(VERSION if current is None else current)
-    if mine is None:
-        return None
-    latest = fetch(f"{UPDATE_URL}/latest/download/version.txt").decode("ascii", "replace").strip()
-    theirs = parse_version(latest)
-    return latest if theirs and theirs > mine else None
-
-
-def folder_is_writable(folder):
-    try:
-        with tempfile.TemporaryFile(dir=folder):
-            return True
-    except OSError:
-        return False
-
-
-def install_update(version, exe_path, fetch=_fetch):
-    """Download a release and put it in place of exe_path, for the next start.
-
-    Windows lets a running program be renamed but not overwritten, so the
-    running exe is moved aside (Stripes.exe.old-...) and the new one takes its
-    name. Old copies are cleaned up on a later start.
-    """
-    base = f"{UPDATE_URL}/download/{version}"
-    data = fetch(f"{base}/Stripes.exe", timeout=600)
-    expected = fetch(f"{base}/Stripes.exe.sha256").decode("ascii", "replace").strip().upper()
-    if hashlib.sha256(data).hexdigest().upper() != expected:
-        raise ValueError("the download was damaged (checksum mismatch)")
-    new = exe_path + ".new"
-    with open(new, "wb") as f:
-        f.write(data)
-    if os.path.exists(exe_path):
-        os.replace(exe_path, f"{exe_path}.old-{int(time.time() * 1000)}")
-    os.replace(new, exe_path)
 
 
 def remove_old_versions(exe_path):
@@ -983,7 +888,8 @@ def remove_old_versions(exe_path):
 # --------------------------------------------------------------------------
 
 class Background:
-    """Run slow work (network) off the UI thread and report back on it."""
+    """Run slow work (network, printers, the share) on a worker thread, then hand the
+    result back to the UI thread, so the window never freezes while it waits."""
 
     def __init__(self, root):
         self.root = root
@@ -1014,6 +920,89 @@ class Background:
         self.root.after(100, self._poll)
 
 
+TRAY_FLAG = "--tray"  # start hidden in the tray (the logon shortcut uses this)
+
+
+class SingleInstance:
+    """Only one Stripes per user. The running copy listens on a port on this PC only
+    (127.0.0.1) and notes the port, with a random key, in the user's profile; a second
+    start finds it there, asks it to show its window, and exits."""
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(os.path.dirname(cache_folder()), "instance.txt")
+        self.server = None
+
+    def signal_running(self, message="show"):
+        """Hand `message` to a copy that's already running. True if one answered."""
+        try:
+            with open(self.path, encoding="ascii") as f:
+                port, key = f.read().split()
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=1) as s:
+                s.sendall(f"{key} {message}\n".encode("ascii"))
+                return s.recv(16).startswith(b"ok")
+        except (OSError, ValueError):
+            return False
+
+    def listen(self, on_message):
+        """Become the running copy: on_message(text) is called (on a worker thread) for each request."""
+        key = secrets.token_hex(16)
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w", encoding="ascii") as f:
+            f.write(f"{self.server.getsockname()[1]} {key}")
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = self.server.accept()
+                except OSError:
+                    return  # closed
+                with conn:
+                    try:
+                        conn.settimeout(2)
+                        got, _, message = conn.recv(256).decode("ascii", "replace").strip().partition(" ")
+                        if secrets.compare_digest(got, key):
+                            conn.sendall(b"ok")
+                            on_message(message)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=serve, daemon=True).start()
+
+    def close(self):
+        if self.server:
+            self.server.close()
+
+
+class Tray:
+    """Stripes' icon in the notification area. pystray runs it on its own thread, so each
+    menu click is handed to the window's thread with app.call."""
+
+    def __init__(self, app):
+        import pystray
+        from PIL import Image
+        image = Image.open(resource_path(os.path.join("assets", "icon-48.png")))
+        menu = pystray.Menu(
+            # Labels are functions so the menu follows the English/Español switch
+            pystray.MenuItem(lambda item: tr("Open Stripes"), lambda icon, item: app.call(app.show), default=True),
+            pystray.MenuItem(lambda item: tr("Printer monitor"), lambda icon, item: app.call(app.show_monitor)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: tr("Quit Stripes"), lambda icon, item: app.call(app.quit_app)))
+        self.icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        self.icon.run_detached()
+
+    def notify(self, text):
+        try:
+            self.icon.notify(text, APP_NAME)
+        except Exception:  # notifications are a nicety
+            pass
+
+    def stop(self):
+        self.icon.stop()
+
+
 def resource_path(name):
     """Files bundled into the .exe are unpacked to sys._MEIPASS."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -1029,8 +1018,10 @@ def pick_font_family(root):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, start_hidden=False):
         super().__init__()
+        if start_hidden:
+            self.withdraw()  # starting at logon: just the tray icon
         self.title(f"{APP_NAME} {VERSION}")
         self.minsize(900, 640)
         try:
@@ -1038,6 +1029,7 @@ class App(tk.Tk):
         except tk.TclError:
             pass  # .ico window icons only work on Windows
         self.settings = load_settings()
+        i18n.set_language(self.settings["language"])
         # Show the saved copy of the server's settings straight away; the server
         # itself is read in the background (it can be slow when unreachable).
         self.config_folder = configured_folder()
@@ -1077,15 +1069,24 @@ class App(tk.Tk):
         else:
             self._show_config_problems()
             self._maybe_first_run()
-        if getattr(sys, "frozen", False):  # only the built .exe updates itself
+        # Updates are installed by IT (Group Policy copies the new exe from the share);
+        # Stripes doesn't update itself.
+        if getattr(sys, "frozen", False):
             remove_download_mark(sys.executable)
-            remove_old_versions(sys.executable)
-            self.after(3000, self._check_for_update)
+            remove_old_versions(sys.executable)  # leftovers from when it did
         folder = status_folder()
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Closing the window keeps Stripes running in the tray, so it opens instantly next
+        # time; Quit is on the tray icon's menu. Without a tray, closing quits as before.
+        self.tray = None
+        if sys.platform == "win32":
+            try:
+                self.tray = Tray(self)
+            except Exception:
+                self.tray = None
+        self.protocol("WM_DELETE_WINDOW", self.hide_to_tray if self.tray else self._on_close)
 
     # ----- deployment log -----
 
@@ -1097,6 +1098,36 @@ class App(tk.Tk):
     def _heartbeat(self):
         self._log(lambda log: log.write(running=True))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
+
+    # ----- tray -----
+
+    def call(self, func):
+        """Run func on the window's thread (for the tray and the single-instance listener)."""
+        self.bg.results.put((lambda result, error: func(), None, None))
+
+    def show(self):
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)  # Windows won't otherwise bring it to the front
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    def show_monitor(self):
+        self.open_monitor()
+        self.monitor.lift()
+
+    def hide_to_tray(self):
+        self.withdraw()
+        if not self.settings.get("tray_hint_shown"):
+            self.tray.notify(tr("Stripes is still running. Click its icon to open it; "
+                                "right-click it to quit."))
+            self.settings["tray_hint_shown"] = True
+            self.save()
+
+    def quit_app(self):
+        if self.tray:
+            self.tray.stop()
+        self._on_close()
 
     def _on_close(self, event="Closed"):
         if self.deployment:  # don't let a slow share hold up closing
@@ -1112,49 +1143,6 @@ class App(tk.Tk):
             func(*args, **kwargs)
         except OSError:
             pass
-
-    # ----- self-update -----
-
-    def _check_for_update(self):
-        exe = sys.executable
-
-        def work():
-            latest = check_for_update()
-            if not latest:
-                return None
-            if not folder_is_writable(os.path.dirname(exe)):
-                return "available", latest
-            install_update(latest, exe)
-            return "installed", latest
-
-        def done(result, error):
-            if error:
-                self._log(lambda log: log.update_failed(describe_error(error)))
-            if error or not result:
-                # offline or nothing new: look again later
-                self.after(UPDATE_CHECK_HOURS * 3600 * 1000, self._check_for_update)
-                return
-            kind, version = result
-            if kind == "installed":
-                self._log(lambda log: log.write(f"Downloaded {version}; finishes when Stripes restarts",
-                                                pending_update=version, last_update_error=None))
-                self.update_label.configure(text=f"Stripes {version} is ready.", style="Ok.TLabel")
-                self.update_button.pack(side="right", padx=(8, 0), before=self.update_label)
-            else:
-                self.update_label.configure(text=f"Stripes {version} is available; this copy can't update itself.",
-                                            style="Warn.TLabel")
-
-        self.bg.run(work, done)
-
-    def _restart_to_update(self):
-        if not self.active_design().is_empty() and not messagebox.askyesno(
-                APP_NAME, "Restart Stripes now? The label you're working on will be cleared.", parent=self):
-            return
-        # PYINSTALLER_RESET_ENVIRONMENT makes the new copy start fresh rather
-        # than reuse this one's unpacked files.
-        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
-        subprocess.Popen([sys.executable], env=env, close_fds=True)
-        self._on_close()
 
     @property
     def company(self):
@@ -1200,29 +1188,36 @@ class App(tk.Tk):
         titles = ttk.Frame(header)
         titles.pack(side="left")
         ttk.Label(titles, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(titles, text="Zebra label printing", style="Muted.TLabel").pack(anchor="w")
-        self.update_label = ttk.Label(header, text=f"Version {VERSION}", style="Muted.TLabel")
-        self.update_label.pack(side="right")
-        self.update_button = ttk.Button(header, text="Restart to update", command=self._restart_to_update)
+        ttk.Label(titles, text=tr("Zebra label printing"), style="Muted.TLabel").pack(anchor="w")
+        corner = ttk.Frame(header)
+        corner.pack(side="right", anchor="n")
+        switch = ttk.Frame(corner)  # English | Español
+        switch.pack(anchor="e")
+        self.v_language = tk.StringVar(value=i18n.language())
+        for code, name in i18n.LANGUAGES:
+            ttk.Radiobutton(switch, text=name, value=code, variable=self.v_language, style="Toolbutton",
+                            command=self._language_changed).pack(side="left")
+        self.update_label = ttk.Label(corner, text=tr("Version {version}", version=VERSION), style="Muted.TLabel")
+        self.update_label.pack(anchor="e", pady=(4, 0))
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
         # Printer row
         top = ttk.Frame(outer)
         top.pack(fill="x")
-        ttk.Label(top, text="Printer:").pack(side="left")
+        ttk.Label(top, text=tr("Printer:")).pack(side="left")
         self.printer_var = tk.StringVar()
         self.printer_box = ttk.Combobox(top, textvariable=self.printer_var, state="readonly", width=34)
         self.printer_box.pack(side="left", padx=(6, 8))
         self.printer_box.bind("<<ComboboxSelected>>", lambda e: self._printer_changed())
-        ttk.Button(top, text="Check printer", command=self.check_status).pack(side="left")
-        ttk.Button(top, text="Manage printers...", command=self.manage_printers).pack(side="left", padx=6)
-        ttk.Button(top, text="Printer monitor", command=self.open_monitor).pack(side="left")
+        ttk.Button(top, text=tr("Check printer"), command=self.check_status).pack(side="left")
+        ttk.Button(top, text=tr("Manage printers..."), command=self.manage_printers).pack(side="left", padx=6)
+        ttk.Button(top, text=tr("Printer monitor"), command=self.open_monitor).pack(side="left")
         self.printer_status = ttk.Label(top, text="", style="Muted.TLabel")
         self.printer_status.pack(side="left", padx=8)
 
         stock_row = ttk.Frame(outer)
         stock_row.pack(fill="x", pady=(6, 8))
-        ttk.Label(stock_row, text="Label stock:").pack(side="left")
+        ttk.Label(stock_row, text=tr("Label stock:")).pack(side="left")
         self.stock_box = ttk.Combobox(stock_row, state="readonly", width=34)
         self.stock_box.pack(side="left", padx=(6, 8))
         self.stock_box.bind("<<ComboboxSelected>>", lambda e: self._stock_changed())
@@ -1235,27 +1230,30 @@ class App(tk.Tk):
         body.columnconfigure(1, weight=3, uniform="cols")
         body.rowconfigure(0, weight=1)
 
-        # Left: Simple tab (just type) and Advanced tab (items, barcodes, pictures...)
+        # Left: Simple tab (just type), Advanced tab (items, barcodes, pictures...) and ZPL tab
         left = ttk.Frame(body)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         self.tabs = ttk.Notebook(left)
         self.tabs.pack(fill="both", expand=True)
         simple, advanced = ttk.Frame(self.tabs, padding=8), ttk.Frame(self.tabs, padding=8)
-        self.tabs.add(simple, text="  Simple  ")
-        self.tabs.add(advanced, text="  Advanced  ")
+        zpl = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(simple, text=f"  {tr('Simple')}  ")
+        self.tabs.add(advanced, text=f"  {tr('Advanced')}  ")
+        self.tabs.add(zpl, text="  ZPL  ")
         self._build_simple(simple)
         self._build_items(advanced)
+        self._build_zpl(zpl)
         self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
         recent_row = ttk.Frame(left)
         recent_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(recent_row, text="Recent:").pack(side="left")
+        ttk.Label(recent_row, text=tr("Recent:")).pack(side="left")
         self.recent_box = ttk.Combobox(recent_row, state="readonly")
         self.recent_box.pack(side="left", fill="x", expand=True, padx=6)
         self.recent_box.bind("<<ComboboxSelected>>", lambda e: self._load_recent())
-        ttk.Button(recent_row, text="New label", command=self._new_label).pack(side="left")
+        ttk.Button(recent_row, text=tr("New label"), command=self._new_label).pack(side="left")
         self._fill_recent()
 
-        right = self.preview_frame = ttk.LabelFrame(body, text="Preview", padding=8)
+        right = self.preview_frame = ttk.LabelFrame(body, text=tr("Preview"), padding=8)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         self.canvas = tk.Canvas(right, background="#e5e7eb", highlightthickness=0, width=420, height=300)
         self.canvas.pack(fill="both", expand=True)
@@ -1266,40 +1264,98 @@ class App(tk.Tk):
         self.canvas.bind("<Delete>", lambda e: self._delete_items())
         self.warn_label = ttk.Label(right, text="", style="Warn.TLabel", wraplength=420, justify="left")
         self.warn_label.pack(fill="x", pady=(6, 0))
-        ttk.Label(right, text="On-screen preview is approximate.", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(right, text=tr("On-screen preview is approximate."), style="Muted.TLabel").pack(anchor="w")
 
         # Bottom: copies + print
         bottom = ttk.Frame(outer)
-        bottom.pack(fill="x", pady=(12, 0))
-        ttk.Label(bottom, text="Copies:", font=("Segoe UI", 11)).pack(side="left")
+        bottom.pack(fill="x", pady=(12, 0), side="bottom", before=body)  # keeps Print visible in a short window
+        ttk.Label(bottom, text=tr("Copies:"), font=("Segoe UI", 11)).pack(side="left")
         self.copies_var = tk.StringVar(value="1")
+        self.copies_var.trace_add("write", lambda *a: self.v_show_zpl.get() and self.refresh())  # ^PQ in Show ZPL
         ttk.Spinbox(bottom, from_=1, to=MAX_COPIES, width=6, textvariable=self.copies_var,
                     font=("Segoe UI", 11)).pack(side="left", padx=6)
-        ttk.Button(bottom, text="Exact preview (online)", command=self.exact_preview).pack(side="left", padx=12)
-        self.print_btn = ttk.Button(bottom, text="Print", style="Print.TButton", command=self.print_label)
+        ttk.Button(bottom, text=tr("Exact preview (online)"), command=self.exact_preview).pack(side="left", padx=12)
+        self.print_btn = ttk.Button(bottom, text=tr("Print"), style="Print.TButton", command=self.print_label)
         self.print_btn.pack(side="right")
 
-        self.status = ttk.Label(outer, text="Ready. Tip: Ctrl+P prints.", style="Muted.TLabel")
-        self.status.pack(anchor="w", pady=(8, 0))
+        self.status = ttk.Label(outer, text=tr("Ready. Tip: Ctrl+P prints."), style="Muted.TLabel")
+        self.status.pack(anchor="w", pady=(8, 0), side="bottom", before=bottom)
 
     def _build_simple(self, parent):
-        ttk.Label(parent, text="Type your label, one line per row:").pack(anchor="w")
+        ttk.Label(parent, text=tr("Type your label, one line per row:")).pack(anchor="w")
         self.simple_box = tk.Text(parent, height=8, width=30, wrap="none", font=("Segoe UI", 14), undo=True)
         self.simple_box.pack(fill="both", expand=True, pady=(4, 0))
         self.simple_box.bind("<<Modified>>", self._simple_modified)
         self.simple_box.bind("<Control-Return>", lambda e: (self.print_label(), "break")[1])
-        ttk.Label(parent, text="Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
-                               "size per line, use the Advanced tab.",
+        ttk.Label(parent, text=tr("Text is sized to fill the label. For barcodes, QR codes, pictures or a different "
+                                  "size per line, use the Advanced tab."),
                   style="Muted.TLabel", wraplength=330, justify="left").pack(anchor="w", pady=(6, 0))
+        self.v_show_zpl = tk.BooleanVar(value=self.settings["show_zpl"])
+        self._zpl_panels = []
+        ttk.Checkbutton(parent, text=tr("Show ZPL"), variable=self.v_show_zpl,
+                        command=self._show_zpl_toggled).pack(anchor="w", pady=(6, 0))
+        self._add_zpl_panel(parent)
+
+    def _build_zpl(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        ttk.Label(top, text=tr("ZPL, printed exactly as typed:")).pack(side="left")
+        ttk.Button(top, text=tr("From my label"), command=self._zpl_from_design).pack(side="right")
+        box = ttk.Frame(parent)
+        box.pack(fill="both", expand=True, pady=(4, 0))
+        self.zpl_box = tk.Text(box, height=8, width=30, wrap="none", font=("Consolas", 11), undo=True)
+        yscroll = ttk.Scrollbar(box, orient="vertical", command=self.zpl_box.yview)
+        xscroll = ttk.Scrollbar(box, orient="horizontal", command=self.zpl_box.xview)
+        self.zpl_box.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        yscroll.pack(side="right", fill="y")
+        xscroll.pack(side="bottom", fill="x")
+        self.zpl_box.pack(side="left", fill="both", expand=True)
+        self.zpl_box.tag_configure("command", foreground="#1d4ed8")
+        self.zpl_box.tag_configure("field", background="#dbeafe")
+        self.zpl_box.bind("<<Modified>>", self._zpl_modified)
+        self.zpl_box.bind("<Control-Return>", lambda e: (self.print_label(), "break")[1])
+        self._zpl_view, self._zpl_selected = None, None
+        ttk.Label(parent, text=tr("The preview follows what you type. Drag a field on the preview to move it; "
+                                  "its ^FO or ^FT numbers change to match."),
+                  style="Muted.TLabel", wraplength=330, justify="left").pack(anchor="w", pady=(6, 0))
+
+    def _zpl_text(self):
+        return self.zpl_box.get("1.0", "end-1c")
+
+    def _zpl_modified(self, _event):
+        if self.zpl_box.edit_modified():
+            self.zpl_box.edit_modified(False)
+            text = self._zpl_text()
+            self.zpl_box.tag_remove("command", "1.0", "end")
+            for m in re.finditer(r"[\^~][A-Za-z@][A-Za-z0-9@]?", text):
+                self.zpl_box.tag_add("command", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+            self.refresh()
+
+    def _zpl_from_design(self, ask=True):
+        """Fill the ZPL tab with the label from the Simple or Advanced tab."""
+        label = self.current_label()
+        typed = ld.Design.from_text(self.simple_box.get("1.0", "end-1c"))
+        design = self.design if not self.design.is_empty() else typed
+        if label is None or design.is_empty():
+            if ask:
+                messagebox.showinfo(APP_NAME, tr("Make a label on the Simple or Advanced tab first."), parent=self)
+            return
+        if ask and self._zpl_text().strip() and not messagebox.askyesno(
+                APP_NAME, tr("Replace the ZPL here with the label from the other tabs?"), parent=self):
+            return
+        p = self.current_printer()
+        self.zpl_box.delete("1.0", "end")
+        self.zpl_box.insert("1.0", ld.build_zpl(ld.render(copy.deepcopy(design), label), p.shift_x, p.shift_y))
+        self.zpl_box.edit_separator()
 
     def _build_items(self, parent):
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(tree_frame, columns=("item", "size", "align"), show="headings",
                                  selectmode="extended", height=6)
-        for col, title, width, stretch in (("item", "Item", 200, True), ("size", "Size", 60, False),
-                                           ("align", "Align", 60, False)):
-            self.tree.heading(col, text=title, anchor="w")
+        for col, title, width, stretch in (("item", N_("Item"), 200, True), ("size", N_("Size"), 60, False),
+                                           ("align", N_("Align"), 80, False)):
+            self.tree.heading(col, text=tr(title), anchor="w")
             self.tree.column(col, width=width, stretch=stretch, anchor="w")
         scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -1310,13 +1366,14 @@ class App(tk.Tk):
 
         add_row = ttk.Frame(parent)
         add_row.pack(fill="x", pady=(6, 0))
-        for text, kind in (("+ Text", "text"), ("+ Barcode", "barcode"), ("+ QR code", "qr"), ("+ Picture", "image")):
-            ttk.Button(add_row, text=text, command=lambda k=kind: self._add_item(k)).pack(side="left", padx=(0, 4))
+        for text, kind in ((N_("+ Text"), "text"), (N_("+ Barcode"), "barcode"), (N_("+ QR code"), "qr"),
+                           (N_("+ Picture"), "image")):
+            ttk.Button(add_row, text=tr(text), command=lambda k=kind: self._add_item(k)).pack(side="left", padx=(0, 4))
         move_row = ttk.Frame(parent)
         move_row.pack(fill="x", pady=(4, 0))
-        ttk.Button(move_row, text="Move up", command=lambda: self._move_items(-1)).pack(side="left")
-        ttk.Button(move_row, text="Move down", command=lambda: self._move_items(1)).pack(side="left", padx=4)
-        ttk.Button(move_row, text="Delete", command=self._delete_items).pack(side="left")
+        ttk.Button(move_row, text=tr("Move up"), command=lambda: self._move_items(-1)).pack(side="left")
+        ttk.Button(move_row, text=tr("Move down"), command=lambda: self._move_items(1)).pack(side="left", padx=4)
+        ttk.Button(move_row, text=tr("Delete"), command=self._delete_items).pack(side="left")
 
         ttk.Separator(parent).pack(fill="x", pady=8)
 
@@ -1334,7 +1391,7 @@ class App(tk.Tk):
             getattr(self, f"v_{name}").trace_add("write", lambda *a, n=name: self._prop_changed(n))
 
         self.row_value = ttk.Frame(self.props)
-        self.value_label = ttk.Label(self.row_value, text="Text:", width=7)
+        self.value_label = ttk.Label(self.row_value, text=tr("Text:"), width=9)
         self.value_label.pack(side="left")
         self.value_entry = ttk.Entry(self.row_value, textvariable=self.v_value, font=("Segoe UI", 12))
         self.value_entry.pack(side="left", fill="x", expand=True)
@@ -1343,40 +1400,95 @@ class App(tk.Tk):
         self.value_entry.bind("<Down>", lambda e: self._step_selection(1))
 
         self.row_size = ttk.Frame(self.props)
-        ttk.Label(self.row_size, text="Size:", width=7).pack(side="left")
-        ttk.Radiobutton(self.row_size, text="Fit", variable=self.v_size_auto, value=True).pack(side="left")
-        ttk.Radiobutton(self.row_size, text="Fixed:", variable=self.v_size_auto, value=False).pack(side="left",
+        ttk.Label(self.row_size, text=tr("Size:"), width=9).pack(side="left")
+        ttk.Radiobutton(self.row_size, text=tr("Fit"), variable=self.v_size_auto, value=True).pack(side="left")
+        ttk.Radiobutton(self.row_size, text=tr("Fixed:"), variable=self.v_size_auto, value=False).pack(side="left",
                                                                                                   padx=(8, 0))
         self.size_spin = ttk.Spinbox(self.row_size, from_=4, to=200, width=5, textvariable=self.v_size)
         self.size_spin.pack(side="left", padx=4)
         ttk.Label(self.row_size, text="pt").pack(side="left")
 
         self.row_code = ttk.Frame(self.props)
-        ttk.Label(self.row_code, text="Type:", width=7).pack(side="left")
+        ttk.Label(self.row_code, text=tr("Type:"), width=9).pack(side="left")
         ttk.Combobox(self.row_code, textvariable=self.v_symbology, values=list(ld.SYMBOLOGIES.values()),
                      state="readonly", width=10).pack(side="left")
-        ttk.Checkbutton(self.row_code, text="Show digits", variable=self.v_show_text).pack(side="left", padx=8)
+        ttk.Checkbutton(self.row_code, text=tr("Show digits"), variable=self.v_show_text).pack(side="left", padx=8)
 
         self.row_picture = ttk.Frame(self.props)
-        ttk.Label(self.row_picture, text="Picture:", width=7).pack(side="left")
-        ttk.Button(self.row_picture, text="Change...", command=self._change_picture).pack(side="left")
-        ttk.Checkbutton(self.row_picture, text="Dither (for photos)", variable=self.v_dither).pack(side="left",
+        ttk.Label(self.row_picture, text=tr("Picture:"), width=9).pack(side="left")
+        ttk.Button(self.row_picture, text=tr("Change..."), command=self._change_picture).pack(side="left")
+        ttk.Checkbutton(self.row_picture, text=tr("Dither (for photos)"), variable=self.v_dither).pack(side="left",
                                                                                                 padx=8)
 
         self.row_align = ttk.Frame(self.props)
-        ttk.Label(self.row_align, text="Align:", width=7).pack(side="left")
-        for value, text in (("left", "Left"), ("center", "Center"), ("right", "Right")):
-            ttk.Radiobutton(self.row_align, text=text, variable=self.v_align, value=value).pack(side="left",
+        ttk.Label(self.row_align, text=tr("Align:"), width=9).pack(side="left")
+        for value, text in (("left", N_("Left")), ("center", N_("Center")), ("right", N_("Right"))):
+            ttk.Radiobutton(self.row_align, text=tr(text), variable=self.v_align, value=value).pack(side="left",
                                                                                                 padx=(0, 8))
-        self.props_hint = ttk.Label(self.props, text="Add an item, or select one to change it.\n"
-                                                     "Ctrl+click or Shift+click to select several.",
+        self.props_hint = ttk.Label(self.props, text=tr("Add an item, or select one to change it.\n"
+                                                        "Ctrl+click or Shift+click to select several."),
                                     style="Muted.TLabel")
 
         options = ttk.Frame(parent)
         options.pack(fill="x", pady=(10, 0))
         self.v_auto_layout = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options, text="Auto layout (stack items to fill the label)", variable=self.v_auto_layout,
+        ttk.Checkbutton(options, text=tr("Auto layout (stack items to fill the label)"), variable=self.v_auto_layout,
                         command=self._auto_layout_toggled).pack(side="left")
+        ttk.Checkbutton(options, text=tr("Show ZPL"), variable=self.v_show_zpl,
+                        command=self._show_zpl_toggled).pack(side="right")
+        self._add_zpl_panel(parent)
+
+    # ----- "Show ZPL" on the Simple and Advanced tabs -----
+
+    def _add_zpl_panel(self, parent):
+        """A read-only box under the tab's controls showing the ZPL that will be sent."""
+        frame = ttk.Frame(parent)
+        text = tk.Text(frame, height=7, width=30, wrap="none", font=("Consolas", 10), state="disabled",
+                       background="#f8fafc")
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        yscroll.pack(side="right", fill="y")
+        xscroll.pack(side="bottom", fill="x")
+        text.pack(side="left", fill="both", expand=True)
+        text.tag_configure("command", foreground="#1d4ed8")
+        self._zpl_panels.append((frame, text))
+        if self.v_show_zpl.get():
+            frame.pack(fill="x", pady=(4, 0))
+
+    def _show_zpl_toggled(self):
+        for frame, _text in self._zpl_panels:
+            if self.v_show_zpl.get():
+                frame.pack(fill="x", pady=(4, 0))
+            else:
+                frame.pack_forget()
+        self.update_idletasks()
+        if self.v_show_zpl.get() and self.state() == "normal" and self.winfo_height() < self.winfo_reqheight():
+            height = min(self.winfo_reqheight(), self.winfo_screenheight() - 80)
+            self.geometry(f"{self.winfo_width()}x{height}")  # grow to fit the box rather than squeeze
+        self.settings["show_zpl"] = self.v_show_zpl.get()
+        self.save()
+        self.refresh()
+
+    def _show_zpl(self, rendered, p):
+        """Put the ZPL for what's on the preview into the current tab's box."""
+        index = 0 if self.in_simple_mode() else 1
+        if not self.v_show_zpl.get() or index >= len(self._zpl_panels):
+            return
+        text = self._zpl_panels[index][1]
+        try:
+            copies = max(1, min(MAX_COPIES, int(self.copies_var.get())))
+        except ValueError:
+            copies = 1
+        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies) if rendered.marks else ""
+        if text.get("1.0", "end-1c") == zpl:
+            return
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", zpl)
+        for m in re.finditer(r"[\^~][A-Za-z@][A-Za-z0-9@]?", zpl):
+            text.tag_add("command", f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+        text.configure(state="disabled")  # still selectable, so it can be copied
 
     # ----- helpers -----
 
@@ -1409,6 +1521,9 @@ class App(tk.Tk):
     def in_simple_mode(self):
         return self.tabs.index(self.tabs.select()) == 0
 
+    def in_zpl_mode(self):
+        return self.tabs.index(self.tabs.select()) == 2
+
     def active_design(self):
         """What would print right now: the Simple tab's text, or the Advanced tab's items."""
         if self.in_simple_mode():
@@ -1426,14 +1541,60 @@ class App(tk.Tk):
         try:
             save_settings(self.settings)
         except OSError as e:
-            messagebox.showerror(APP_NAME, f"Could not save settings:\n{e}", parent=self)
+            messagebox.showerror(APP_NAME, tr("Could not save settings:\n{error}", error=e), parent=self)
+
+    # ----- language -----
+
+    def _language_changed(self):
+        code = self.v_language.get()
+        if code == i18n.language():
+            return
+        i18n.set_language(code)
+        self.settings["language"] = code
+        self.save()
+        self._retranslate(self)
+        # Text the app works out as it goes
+        self.update_label.configure(text=tr("Version {version}", version=VERSION))
+        current = self.stock_box.current()
+        self.stock_box["values"] = self._stock_labels()
+        if current >= 0:
+            self.stock_box.current(current)
+        self._update_info()
+        self._fill_tree()
+        self._fill_recent()
+        self.set_status(tr("Ready. Tip: Ctrl+P prints."))
+        self.check_status(quiet=True)
+        if getattr(self, "monitor", None) and self.monitor.winfo_exists():
+            self.monitor._close()  # its cards are built from scratch; quicker to open it again
+            self.open_monitor()
+        self.refresh()
+
+    @staticmethod
+    def _retranslate(widget):
+        """Switch the fixed text of a window and everything in it to the current language."""
+        if isinstance(widget, (tk.Tk, tk.Toplevel)):
+            widget.title(i18n.retranslate(widget.title()))
+        try:
+            text = widget.cget("text")
+        except tk.TclError:
+            text = None  # Text, Canvas, Entry... have no text option
+        if isinstance(text, str) and text:
+            widget.configure(text=i18n.retranslate(text))
+        if isinstance(widget, ttk.Notebook):
+            for tab in widget.tabs():
+                widget.tab(tab, text=i18n.retranslate(widget.tab(tab, "text")))
+        if isinstance(widget, ttk.Treeview):
+            for col in widget["columns"]:
+                widget.heading(col, text=i18n.retranslate(widget.heading(col, "text")))
+        for child in widget.winfo_children():
+            App._retranslate(child)
 
     # ----- printers -----
 
     def _first_run(self):
-        messagebox.showinfo(APP_NAME, "Welcome! Let's set up your Zebra printers.\n\n"
-                            "Click 'Add from Windows...' to pick printers already installed on this PC, "
-                            "then check each one's label size.", parent=self)
+        messagebox.showinfo(APP_NAME, tr("Welcome! Let's set up your Zebra printers.\n\n"
+                                         "Click 'Add from Windows...' to pick printers already installed on this PC, "
+                                         "then check each one's label size."), parent=self)
         self.manage_printers()
 
     def _load_printer_list(self, select=None):
@@ -1448,13 +1609,8 @@ class App(tk.Tk):
     def _fill_stock(self):
         """List the label stock, selecting the printer's default (also used to reset it)."""
         p = self.base_printer()
-        self.stock_options, labels = [], []
-        if p and not p.stock:
-            self.stock_options.append(None)
-            labels.append(f"Printer's own size ({p.width_in:g} x {p.height_in:g} in)")
-        for st in self.cfg.stock:
-            self.stock_options.append(st)
-            labels.append(f"{st.name}  (default)" if p and st.id == p.stock else st.name)
+        self.stock_options = ([None] if p and not p.stock else []) + list(self.cfg.stock)
+        labels = self._stock_labels()
         self.stock_box["values"] = labels
         default = next((i for i, st in enumerate(self.stock_options) if st and p and st.id == p.stock), 0)
         if labels:
@@ -1463,21 +1619,29 @@ class App(tk.Tk):
             self.stock_box.set("")
         self._update_info()
 
+    def _stock_labels(self):
+        p = self.base_printer()
+        return [tr("Printer's own size ({w} x {h} in)", w=f"{p.width_in:g}", h=f"{p.height_in:g}") if st is None
+                else tr("{name}  (default)", name=st.name) if p and st.id == p.stock else st.name
+                for st in self.stock_options]
+
     def _stock_changed(self):
         self._update_info()
+        self.check_status(quiet=True)  # are those labels the ones loaded?
         self.refresh()
 
     def _update_info(self):
         p = self.current_printer()
         if not p:
-            self.size_label.configure(text="No printer set up yet. Click 'Manage printers...'.",
+            self.size_label.configure(text=tr("No printer set up yet. Click 'Manage printers...'."),
                                       style="Muted.TLabel")
             return
-        text = f"{p.model} via {p.where}, {p.dpi} dpi  |  {p.width_in:g} x {p.height_in:g} in"
+        text = tr("{model} via {where}, {dpi} dpi  |  {w} x {h} in", model=p.model, where=p.where, dpi=p.dpi,
+                  w=f"{p.width_in:g}", h=f"{p.height_in:g}")
         if self.stock_is_default():
             self.size_label.configure(text=text, style="Muted.TLabel")
         else:
-            self.size_label.configure(text=text + "  |  one-off stock, resets after printing",
+            self.size_label.configure(text=text + tr("  |  one-off stock, resets after printing"),
                                       style="Warn.TLabel")
 
     def _printer_changed(self, remember=True):
@@ -1498,29 +1662,26 @@ class App(tk.Tk):
             return
         self._status_seq += 1
         seq = self._status_seq
-        self.printer_status.configure(text="Checking...", style="Muted.TLabel")
+        self.printer_status.configure(text=tr("Checking..."), style="Muted.TLabel")
 
         def done(result, error):
             if seq != self._status_seq:
                 return  # a newer check has started
             if error:
-                self.printer_status.configure(text="Not reachable", style="Bad.TLabel")
+                self.printer_status.configure(text=tr("Not reachable"), style="Bad.TLabel")
                 if not quiet:
                     messagebox.showwarning(APP_NAME, f"{p.name}: {describe_error(error)}", parent=self)
                 return
-            problems, diffs = result
+            problems, wrong_labels = result
             if problems:
-                self.printer_status.configure(text=", ".join(problems), style="Bad.TLabel")
-            elif diffs:
-                self.printer_status.configure(text="Ready (differs from spec)", style="Warn.TLabel")
+                self.printer_status.configure(text=", ".join(map(tr, problems)), style="Bad.TLabel")
+            elif wrong_labels:
+                self.printer_status.configure(text=wrong_labels, style="Warn.TLabel")
             else:
-                self.printer_status.configure(text="Ready", style="Ok.TLabel")
-            if diffs and not quiet:
-                messagebox.showinfo(APP_NAME, f"{p.name}'s settings differ from its spec:\n\n- "
-                                    + "\n- ".join(diffs) + "\n\nLabels still print; tell IT if they look wrong.",
-                                    parent=self)
+                self.printer_status.configure(text=tr("Ready"), style="Ok.TLabel")
 
-        self.bg.run(lambda: check_printer(p), done)
+        stock = self.selected_stock()
+        self.bg.run(lambda: check_printer(p, stock), done)
 
     def open_monitor(self):
         if getattr(self, "monitor", None) and self.monitor.winfo_exists():
@@ -1536,7 +1697,7 @@ class App(tk.Tk):
 
     # ----- label items -----
 
-    KIND_NAMES = {"text": "Text", "barcode": "Barcode", "qr": "QR code", "image": "Picture"}
+    KIND_NAMES = {"text": N_("Text"), "barcode": N_("Barcode"), "qr": N_("QR code"), "image": N_("Picture")}
     NEW_ITEM_IN = {"text": 0.25, "barcode": 0.5, "qr": 0.8, "image": 0.6}  # starting height, manual layout
 
     def selected_elements(self):
@@ -1544,11 +1705,11 @@ class App(tk.Tk):
 
     def _row_values(self, e):
         if e.kind == "text":
-            item = e.value or "(blank line)"
-            size = "Fit" if e.size_pt is None else f"{e.size_pt:g} pt"
+            item = e.value or tr("(blank line)")
+            size = tr("Fit") if e.size_pt is None else f"{e.size_pt:g} pt"
         else:
-            item, size = f"{self.KIND_NAMES[e.kind]}: {e.value}" if e.kind != "image" else "Picture", ""
-        return item, size, e.align.capitalize()
+            item, size = f"{tr(self.KIND_NAMES[e.kind])}: {e.value}" if e.kind != "image" else tr("Picture"), ""
+        return item, size, tr(e.align.capitalize())
 
     def _fill_tree(self, select=None):
         if select is not None:
@@ -1587,7 +1748,7 @@ class App(tk.Tk):
         self._loading_props = True
         try:
             if single and first.kind != "image":
-                self.value_label.configure(text="Text:" if first.kind == "text" else "Data:")
+                self.value_label.configure(text=tr("Text:") if first.kind == "text" else tr("Data:"))
                 self.v_value.set(first.value)
                 self.row_value.pack(fill="x", pady=2)
             if all(e.kind == "text" for e in els):
@@ -1644,14 +1805,14 @@ class App(tk.Tk):
 
     def _choose_picture(self):
         path = filedialog.askopenfilename(
-            parent=self, title="Choose a picture",
-            filetypes=[("Pictures", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff"), ("All files", "*.*")])
+            parent=self, title=tr("Choose a picture"),
+            filetypes=[(tr("Pictures"), "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff"), (tr("All files"), "*.*")])
         if not path:
             return None
         try:
             return ld.load_picture(path)
         except Exception as e:  # any unreadable file
-            messagebox.showerror(APP_NAME, f"Couldn't open that picture:\n{e}", parent=self)
+            messagebox.showerror(APP_NAME, tr("Couldn't open that picture:\n{error}", error=e), parent=self)
             return None
 
     def _add_item(self, kind, focus=True):
@@ -1697,7 +1858,7 @@ class App(tk.Tk):
         self._fill_tree(select=[i + delta for i in chosen])
 
     def _delete_items(self):
-        if not self.selected:
+        if not self.selected or self.in_zpl_mode():
             return
         first = min(self.selected)
         for i in sorted(self.selected, reverse=True):
@@ -1727,6 +1888,10 @@ class App(tk.Tk):
         self.v_auto_layout.set(False)
 
     def _new_label(self):
+        if self.in_zpl_mode():
+            self.zpl_box.delete("1.0", "end")
+            self.zpl_box.focus_set()
+            return
         if self.in_simple_mode():
             self.simple_box.delete("1.0", "end")
             self.simple_box.focus_set()
@@ -1742,8 +1907,13 @@ class App(tk.Tk):
             self.refresh()
 
     def _tab_changed(self, _event=None):
-        if self.in_simple_mode():
-            self.preview_frame.configure(text="Preview")
+        if self.in_zpl_mode():
+            if not self._zpl_text().strip():
+                self._zpl_from_design(ask=False)  # start from what's on the other tabs
+            self.preview_frame.configure(text=tr("Preview: drag a field to move it"))
+            self.zpl_box.focus_set()
+        elif self.in_simple_mode():
+            self.preview_frame.configure(text=tr("Preview"))
             self.simple_box.focus_set()
         else:
             # First time in Advanced: start from what was typed, to refine it.
@@ -1752,7 +1922,7 @@ class App(tk.Tk):
                 self.design = typed
                 self.v_auto_layout.set(True)
                 self._fill_tree(select=[0])
-            self.preview_frame.configure(text="Preview: drag items to move them, drag the corner to resize")
+            self.preview_frame.configure(text=tr("Preview: drag items to move them, drag the corner to resize"))
             self.value_entry.focus_set()
         self.refresh()
 
@@ -1765,9 +1935,9 @@ class App(tk.Tk):
         try:
             design = ld.Design.from_dict(r)
         except (TypeError, ValueError, AttributeError):
-            return "(unreadable)"
+            return tr("(unreadable)")
         parts = [e.title for e in design.elements if e.kind != "text" or e.value.strip()]
-        title = " / ".join(parts) or "(empty)"
+        title = " / ".join(parts) or tr("(empty)")
         return title if len(title) <= 50 else title[:49] + "..."
 
     def _load_recent(self):
@@ -1777,7 +1947,7 @@ class App(tk.Tk):
         try:
             design = ld.Design.from_dict(copy.deepcopy(self.settings["recent"][i]))
         except (TypeError, ValueError, AttributeError):
-            messagebox.showerror(APP_NAME, "That recent label couldn't be loaded.", parent=self)
+            messagebox.showerror(APP_NAME, tr("That recent label couldn't be loaded."), parent=self)
             return
         self.recent_box.set("")
         text = design.simple_text()
@@ -1814,11 +1984,19 @@ class App(tk.Tk):
         label = self.current_label()
         if label is None:
             self._view = None
-            c.create_text(cw / 2, ch / 2, text="Add a printer to get started", fill="#6b7280")
+            c.create_text(cw / 2, ch / 2, text=tr("Add a printer to get started"), fill="#6b7280")
             self.warn_label.configure(text="")
             return
-        design = self.active_design()
-        rendered = ld.render(design, label)
+        zpl_mode = self.in_zpl_mode()
+        if zpl_mode:
+            text = self._zpl_text()
+            rendered = self._zpl_view = zv.parse(text, label)
+            empty = not text.strip()
+        else:
+            design = self.active_design()
+            rendered = ld.render(design, label)
+            empty = design.is_empty()
+            self._show_zpl(rendered, self.current_printer())
         scale = min((cw - 40) / label.width, (ch - 40) / label.height)
         lw, lh = label.width * scale, label.height * scale
         x0, y0 = (cw - lw) / 2, (ch - lh) / 2
@@ -1835,7 +2013,11 @@ class App(tk.Tk):
             c.create_rectangle(*box, fill=bg, outline="")
         c.create_rectangle(x0, y0, x0 + lw, y0 + lh, outline="#6b7280")
 
-        for i in ([] if self.in_simple_mode() else self.selected):
+        if zpl_mode and self._zpl_selected is not None and self._zpl_selected < len(rendered.fields):
+            f = rendered.fields[self._zpl_selected]
+            c.create_rectangle(x0 + f.x * scale - 2, y0 + f.y * scale - 2, x0 + (f.x + f.w) * scale + 2,
+                               y0 + (f.y + f.h) * scale + 2, outline="#2563eb", dash=(4, 2))
+        for i in ([] if self.in_simple_mode() or zpl_mode else self.selected):
             if i >= len(self.design.elements):
                 continue
             e = self.design.elements[i]
@@ -1843,9 +2025,13 @@ class App(tk.Tk):
             c.create_rectangle(bx, by, bx + bw, by + bh, outline="#2563eb", dash=(4, 2))
             if len(self.selected) == 1:
                 c.create_rectangle(bx + bw - 4, by + bh - 4, bx + bw + 4, by + bh + 4, fill="#2563eb", outline="")
-        if design.is_empty():
-            c.create_text(cw / 2, ch / 2, text="Type your label text on the left", fill="#9ca3af")
+        if empty:
+            hint = tr("Type ZPL on the left") if zpl_mode else tr("Type your label text on the left")
+            c.create_text(cw / 2, ch / 2, text=hint, fill="#9ca3af")
         problems = rendered.errors + rendered.warnings
+        if zpl_mode and rendered.settings:
+            problems.append(tr("Changes printer settings when printed: {what}",
+                               what=self._settings_words(rendered.settings)))
         self.warn_label.configure(text="\n".join(problems), style="Bad.TLabel" if rendered.errors else "Warn.TLabel")
 
     def _draw_mark(self, mark, x0, y0, scale):
@@ -1865,6 +2051,15 @@ class App(tk.Tk):
                           "right": ("ne", x + mark.w * scale)}[mark.align]
             c.create_text(tx, y, text=mark.text, anchor=anchor, font=(self.preview_family, -px, "bold"),
                           fill="black")
+        elif mark.kind == "box":  # ^GB: a box or line, mark.module = border thickness
+            filled = mark.module * 2 >= min(mark.w, mark.h)
+            color = "white" if mark.text == "W" else "black"
+            if filled:
+                c.create_rectangle(x, y, x + mark.w * scale, y + mark.h * scale, fill=color, outline="")
+            else:
+                thick = mark.module * scale
+                c.create_rectangle(x + thick / 2, y + thick / 2, x + (mark.w - mark.module / 2) * scale,
+                                   y + (mark.h - mark.module / 2) * scale, outline=color, width=max(1, thick))
         elif mark.kind == "bars":
             start = None
             for i, bar in enumerate(mark.pattern + [False]):
@@ -1891,6 +2086,9 @@ class App(tk.Tk):
 
     def _canvas_press(self, event):
         self._drag = None
+        if self._view and self.in_zpl_mode():
+            self._zpl_press(event)
+            return
         if not self._view or self.in_simple_mode():
             return
         self.canvas.focus_set()
@@ -1913,8 +2111,59 @@ class App(tk.Tk):
         self._sync_tree_selection()
         self._drag = ("move", x, y, {i: (els[i].x, els[i].y, els[i].w, els[i].h) for i in self.selected})
 
+    def _zpl_press(self, event):
+        """Select the ZPL field under the pointer, show its lines, and get ready to move it."""
+        x0, y0, scale = self._view
+        x, y = (event.x - x0) / scale, (event.y - y0) / scale
+        fields = self._zpl_view.fields if self._zpl_view else []
+        hit = next((i for i in reversed(range(len(fields)))
+                    if fields[i].x <= x <= fields[i].x + fields[i].w and fields[i].y <= y <= fields[i].y + fields[i].h),
+                   None)
+        self._zpl_selected = hit
+        self.zpl_box.tag_remove("field", "1.0", "end")
+        if hit is not None:
+            f = fields[hit]
+            start, end = f.source_span
+            self.zpl_box.tag_add("field", f"1.0+{start}c", f"1.0+{end}c")
+            self.zpl_box.see(f"1.0+{start}c")
+            if f.origin_span:
+                self.zpl_box.edit_separator()
+                self._drag = ("zpl", x, y, hit, f.origin)
+        self.refresh()
+
+    def _zpl_drag(self, event):
+        x0, y0, scale = self._view
+        _mode, sx, sy, index, (ox, oy) = self._drag
+        dx, dy = round((event.x - x0) / scale - sx), round((event.y - y0) / scale - sy)
+        fields = self._zpl_view.fields if self._zpl_view else []
+        if index >= len(fields) or not fields[index].origin_span:
+            return
+        new = f"{max(0, ox + dx)},{max(0, oy + dy)}"
+        start, end = fields[index].origin_span
+        if self._zpl_text()[start:end] == new:
+            return
+        self.zpl_box.delete(f"1.0+{start}c", f"1.0+{end}c")
+        self.zpl_box.insert(f"1.0+{start}c", new)
+        # redraw now, so the next step of the drag finds the field where it is
+        self._zpl_view = zv.parse(self._zpl_text(), self.current_label())
+        f = self._zpl_view.fields[index] if index < len(self._zpl_view.fields) else None
+        self.zpl_box.tag_remove("field", "1.0", "end")
+        if f:
+            self.zpl_box.tag_add("field", f"1.0+{f.source_span[0]}c", f"1.0+{f.source_span[1]}c")
+
+    @staticmethod
+    def _settings_words(settings):
+        seen = []
+        for code, what in settings:
+            if f"{tr(what)} ({code})" not in seen:
+                seen.append(f"{tr(what)} ({code})")
+        return ", ".join(seen)
+
     def _canvas_drag(self, event):
         if not self._drag or not self._view:
+            return
+        if self._drag[0] == "zpl":
+            self._zpl_drag(event)
             return
         x0, y0, scale = self._view
         mode, sx, sy, start = self._drag
@@ -1940,21 +2189,29 @@ class App(tk.Tk):
         self.refresh()
 
     def exact_preview(self):
-        p, label, design = self.current_printer(), self.current_label(), self.active_design()
-        if not p or design.is_empty():
-            messagebox.showinfo(APP_NAME, "Pick a printer and add something to the label first.", parent=self)
-            return
-        zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
-        self.set_status("Getting exact preview from labelary.com...")
+        p, label = self.current_printer(), self.current_label()
+        if self.in_zpl_mode():
+            zpl = self._zpl_text()
+            if not p or not zpl.strip():
+                messagebox.showinfo(APP_NAME, tr("Pick a printer and type some ZPL first."), parent=self)
+                return
+        else:
+            design = self.active_design()
+            if not p or design.is_empty():
+                messagebox.showinfo(APP_NAME, tr("Pick a printer and add something to the label first."), parent=self)
+                return
+            zpl = ld.build_zpl(ld.render(design, label), p.shift_x, p.shift_y)
+        self.set_status(tr("Getting exact preview from labelary.com..."))
 
         def done(png, error):
             if error:
-                self.set_status("Exact preview failed.", "Bad.TLabel")
-                messagebox.showerror(APP_NAME, f"Could not get the preview from labelary.com:\n{error}", parent=self)
+                self.set_status(tr("Exact preview failed."), "Bad.TLabel")
+                messagebox.showerror(APP_NAME, tr("Could not get the preview from labelary.com:\n{error}", error=error),
+                                     parent=self)
                 return
-            self.set_status("Exact preview shown.")
+            self.set_status(tr("Exact preview shown."))
             win = tk.Toplevel(self)
-            win.title("Exact preview")
+            win.title(tr("Exact preview"))
             win.configure(background="#e5e7eb")
             img = tk.PhotoImage(data=png)
             factor = max(1, -(-max(img.width(), img.height()) // 700))  # shrink very large labels
@@ -1963,7 +2220,7 @@ class App(tk.Tk):
             lbl = tk.Label(win, image=img, borderwidth=1, relief="solid")
             lbl.image = img
             lbl.pack(padx=20, pady=20)
-            ttk.Label(win, text="Rendered by labelary.com from the exact data that will be sent to the printer.",
+            ttk.Label(win, text=tr("Rendered by labelary.com from the exact data that will be sent to the printer."),
                       style="Muted.TLabel").pack(padx=20, pady=(0, 12))
             win.transient(self)
 
@@ -1971,51 +2228,105 @@ class App(tk.Tk):
 
     # ----- printing -----
 
-    def print_label(self):
-        p = self.current_printer()
-        if not p:
-            messagebox.showinfo(APP_NAME, "Add a printer first (Manage printers...).", parent=self)
+    def _print_zpl(self, p):
+        """Send the ZPL tab's text as typed (plus ^PQ for copies when it has none)."""
+        text = self._zpl_text()
+        if not text.strip():
+            messagebox.showinfo(APP_NAME, tr("Type some ZPL first."), parent=self)
             return
-        design = self.active_design()
-        if design.is_empty():
-            messagebox.showinfo(APP_NAME, "Type something on the label first.", parent=self)
-            return
-        rendered = ld.render(design, self.current_label())
-        if rendered.errors:
-            messagebox.showerror(APP_NAME, "Fix these before printing:\n\n" + "\n".join(rendered.errors), parent=self)
+        view = zv.parse(text, self.current_label())
+        if view.errors:
+            messagebox.showerror(APP_NAME, tr("Fix these before printing:") + "\n\n" + "\n".join(view.errors),
+                                 parent=self)
             return
         try:
             copies = int(self.copies_var.get())
             if not 1 <= copies <= MAX_COPIES:
                 raise ValueError
         except ValueError:
-            messagebox.showerror(APP_NAME, f"Copies must be a whole number from 1 to {MAX_COPIES}.", parent=self)
+            messagebox.showerror(APP_NAME, tr("Copies must be a whole number from 1 to {max}.", max=MAX_COPIES),
+                                 parent=self)
             return
-        if rendered.warnings and not messagebox.askyesno(
-                APP_NAME, "\n".join(rendered.warnings) + "\n\nPrint anyway?", parent=self):
+        if view.settings and not messagebox.askyesno(
+                APP_NAME, tr("This ZPL also changes the printer's own settings: {what}.\n\nThose stay on the "
+                             "printer and change how labels from other programs print too. Print anyway?",
+                             what=self._settings_words(view.settings)), icon="warning", parent=self):
             return
         if copies > CONFIRM_COPIES_OVER and not messagebox.askyesno(
-                APP_NAME, f"Print {copies} labels on {p.name}?", parent=self):
+                APP_NAME, tr("Print {n} labels on {name}?", n=copies, name=p.name), parent=self):
             return
-
-        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
+        zpl = zv.with_copies(text, copies)
         self.print_btn.configure(state="disabled")
-        self.set_status(f"Sending to {p.name}...")
-        label_word = "label" if copies == 1 else "labels"
+        self.set_status(tr("Sending to {name}...", name=p.name))
 
         def done(_result, error):
             self.print_btn.configure(state="normal")
             if error:
-                self.set_status(f"Print failed: {describe_error(error)}", "Bad.TLabel")
-                messagebox.showerror(APP_NAME, f"Could not print on {p.name} ({p.where}).\n\n"
-                                     f"{describe_error(error)}", parent=self)
+                self.set_status(tr("Print failed: {error}", error=describe_error(error)), "Bad.TLabel")
+                messagebox.showerror(APP_NAME, tr("Could not print on {name} ({where}).", name=p.name, where=p.where)
+                                     + "\n\n" + describe_error(error), parent=self)
                 return
             note = ""
             if not self.stock_is_default():
                 self._fill_stock()  # a non-default stock is a one-off; back to the printer's default
                 self.refresh()
-                note = " Label stock is back to the printer's default."
-            self.set_status(f"Sent {copies} {label_word} to {p.name}.{note}", "Ok.TLabel")
+                note = " " + tr("Label stock is back to the printer's default.")
+            self.set_status(tr("Sent the ZPL to {name}.", name=p.name) + note, "Ok.TLabel")
+            self.check_status(quiet=True)
+
+        self.bg.run(lambda: send_label(p, zpl.encode("utf-8")), done)
+
+    def print_label(self):
+        p = self.current_printer()
+        if not p:
+            messagebox.showinfo(APP_NAME, tr("Add a printer first (Manage printers...)."), parent=self)
+            return
+        if self.in_zpl_mode():
+            self._print_zpl(p)
+            return
+        design = self.active_design()
+        if design.is_empty():
+            messagebox.showinfo(APP_NAME, tr("Type something on the label first."), parent=self)
+            return
+        rendered = ld.render(design, self.current_label())
+        if rendered.errors:
+            messagebox.showerror(APP_NAME, tr("Fix these before printing:") + "\n\n" + "\n".join(rendered.errors),
+                                 parent=self)
+            return
+        try:
+            copies = int(self.copies_var.get())
+            if not 1 <= copies <= MAX_COPIES:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(APP_NAME, tr("Copies must be a whole number from 1 to {max}.", max=MAX_COPIES),
+                                 parent=self)
+            return
+        if rendered.warnings and not messagebox.askyesno(
+                APP_NAME, "\n".join(rendered.warnings) + "\n\n" + tr("Print anyway?"), parent=self):
+            return
+        if copies > CONFIRM_COPIES_OVER and not messagebox.askyesno(
+                APP_NAME, tr("Print {n} labels on {name}?", n=copies, name=p.name), parent=self):
+            return
+
+        zpl = ld.build_zpl(rendered, p.shift_x, p.shift_y, copies)
+        self.print_btn.configure(state="disabled")
+        self.set_status(tr("Sending to {name}...", name=p.name))
+
+        def done(_result, error):
+            self.print_btn.configure(state="normal")
+            if error:
+                self.set_status(tr("Print failed: {error}", error=describe_error(error)), "Bad.TLabel")
+                messagebox.showerror(APP_NAME, tr("Could not print on {name} ({where}).", name=p.name, where=p.where)
+                                     + "\n\n" + describe_error(error), parent=self)
+                return
+            note = ""
+            if not self.stock_is_default():
+                self._fill_stock()  # a non-default stock is a one-off; back to the printer's default
+                self.refresh()
+                note = " " + tr("Label stock is back to the printer's default.")
+            sent = (tr("Sent 1 label to {name}.", name=p.name) if copies == 1
+                    else tr("Sent {n} labels to {name}.", n=copies, name=p.name))
+            self.set_status(sent + note, "Ok.TLabel")
             self._remember(design)
             self.check_status(quiet=True)
 
@@ -2025,7 +2336,20 @@ class App(tk.Tk):
 class PrinterMonitor(tk.Toplevel):
     """Live view of every printer: status, activity, settings and device details."""
 
-    REFRESH = {"Every 5 seconds": 5, "Every 10 seconds": 10, "Every 30 seconds": 30, "Every minute": 60, "Off": 0}
+    FIXES = {"Out of labels": N_("Load a new roll and close the head."),
+             "Paused": N_("Press Pause on the printer to resume."),
+             "Print head open": N_("Close the print head."),
+             "Ribbon out": N_("Load a new ribbon."),
+             "Print head too cold": N_("Let the printer warm up."),
+             "Print head too hot": N_("Let the printer cool down before printing more."),
+             "Receive buffer full": N_("Wait for it to finish, or turn it off and on."),
+             "Printer memory error": N_("Turn the printer off and on."),
+             "Not reachable": N_("Check that it's turned on and its network cable is plugged in.")}
+    LABEL_FIX = N_("Load the right roll, then calibrate the printer so it measures it again.")
+    URGENCY = {"bad": 0, "off": 1, "warn": 2}  # cards with problems go first; the rest keep their order
+
+    REFRESH = {N_("Every 5 seconds"): 5, N_("Every 10 seconds"): 10, N_("Every 30 seconds"): 30,
+               N_("Every minute"): 60, N_("Off"): 0}
     COLORS = {"ok": "#15803d", "busy": "#2563eb", "warn": "#b45309", "bad": "#b91c1c", "off": "#6b7280",
               "wait": "#9ca3af"}
     CARD, MUTED, TEXT = "#ffffff", "#6b7280", "#111827"
@@ -2033,28 +2357,30 @@ class PrinterMonitor(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
         self.app = app
-        self.title("Printer monitor")
+        self.title(tr("Printer monitor"))
         self.geometry("1180x780")
         self.minsize(760, 480)
         self.configure(background="#f3f4f6")
-        self.snapshots, self.pending, self.cards = {}, set(), {}
+        self.snapshots, self.pending, self.cards, self.expanded, self.kinds = {}, set(), {}, set(), {}
         self._timer = None
 
         bar = ttk.Frame(self, padding=(14, 12, 14, 6))
         bar.pack(fill="x")
-        titles = ttk.Frame(bar)
-        titles.pack(side="left")
-        ttk.Label(titles, text="Printer monitor", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        self.summary = ttk.Label(titles, text="Checking printers...", style="Muted.TLabel")
-        self.summary.pack(anchor="w")
-        ttk.Button(bar, text="Refresh now", command=self.refresh).pack(side="right")
-        self.refresh_var = tk.StringVar(value="Every 10 seconds")
-        box = ttk.Combobox(bar, textvariable=self.refresh_var, values=list(self.REFRESH), state="readonly", width=16)
+        ttk.Button(bar, text=tr("Refresh now"), command=self.refresh).pack(side="right")
+        self.all_button = ttk.Button(bar, text=tr("More info for all"), command=self._toggle_all)
+        self.all_button.pack(side="right", padx=(0, 8))
+        self.refresh_var = tk.StringVar(value=tr("Every 10 seconds"))
+        box = ttk.Combobox(bar, textvariable=self.refresh_var, values=[tr(k) for k in self.REFRESH], state="readonly",
+                           width=16)
         box.pack(side="right", padx=8)
         box.bind("<<ComboboxSelected>>", lambda e: self._schedule())
-        ttk.Label(bar, text="Auto refresh:").pack(side="right")
-        self.updated = ttk.Label(bar, text="", style="Muted.TLabel")
-        self.updated.pack(side="right", padx=14)
+        ttk.Label(bar, text=tr("Auto refresh:")).pack(side="right")
+        # Packed last so the buttons keep their room and a long summary is what gets cut
+        titles = ttk.Frame(bar)
+        titles.pack(side="left", fill="x", expand=True)
+        ttk.Label(titles, text=tr("Printer monitor"), font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        self.summary = ttk.Label(titles, text=tr("Checking printers..."), style="Muted.TLabel")
+        self.summary.pack(anchor="w")
 
         # Scrollable grid of printer cards
         holder = tk.Frame(self, background="#f3f4f6")
@@ -2087,15 +2413,23 @@ class PrinterMonitor(tk.Toplevel):
         self.cards = {}
         printers = self.printers()
         if not printers:
-            tk.Label(self.grid_frame, text="No printers set up yet.", background="#f3f4f6",
+            tk.Label(self.grid_frame, text=tr("No printers set up yet."), background="#f3f4f6",
                      foreground=self.MUTED).grid(row=0, column=0, pady=40)
-        for i, p in enumerate(printers):
+        for p in printers:
             outer = tk.Frame(self.grid_frame, background=self.COLORS["wait"])
-            outer.grid(row=i // 2, column=i % 2, sticky="nsew", padx=6, pady=6)
             body = tk.Frame(outer, background=self.CARD, padx=12, pady=10)
             body.pack(side="right", fill="both", expand=True, padx=(5, 0))
             self.cards[p.name] = (outer, body)
             self._render(p, None)
+        self._arrange()
+
+    def _arrange(self):
+        order = sorted(enumerate(self.printers()),
+                       key=lambda ip: (self.URGENCY.get(self.kinds.get(ip[1].name), 9), ip[0]))
+        for i, (_, p) in enumerate(order):
+            outer = self.cards[p.name][0]
+            if outer.grid_info().get("row") != i // 2 or outer.grid_info().get("column") != i % 2:
+                outer.grid(row=i // 2, column=i % 2, sticky="new", padx=6, pady=6)
 
     def refresh(self):
         names = [p.name for p in self.printers()]
@@ -2116,13 +2450,14 @@ class PrinterMonitor(tk.Toplevel):
         self.snapshots[printer.name] = snap
         if printer.name in self.cards:
             self._render(printer, snap)
+            self._arrange()
         self._summarize()
 
     def _schedule(self):
         if self._timer:
             self.after_cancel(self._timer)
             self._timer = None
-        seconds = self.REFRESH.get(self.refresh_var.get(), 0)
+        seconds = {tr(k): v for k, v in self.REFRESH.items()}.get(self.refresh_var.get(), 0)
         if seconds:
             self._timer = self.after(seconds * 1000, self._tick)
 
@@ -2138,18 +2473,18 @@ class PrinterMonitor(tk.Toplevel):
         self.destroy()
 
     def _summarize(self):
-        snaps = [self.snapshots[p.name] for p in self.printers() if p.name in self.snapshots]
         counts = {}
-        for s in snaps:
-            kind = s.state[1]
+        for p in self.printers():
+            kind = self.kinds.get(p.name)
             counts[kind] = counts.get(kind, 0) + 1
-        parts = [f"{len(self.printers())} printers"]
-        for kind, word in (("ok", "ready"), ("busy", "printing"), ("warn", "differ from spec"),
-                           ("bad", "need attention"), ("off", "not reachable")):
+        # Most urgent first, so a narrow window cuts the good news rather than the problems
+        parts = []
+        for kind, word in (("bad", N_("need attention")), ("off", N_("not reachable")), ("warn", N_("to check")),
+                           ("busy", N_("printing")), ("ok", N_("ready"))):
             if counts.get(kind):
-                parts.append(f"{counts[kind]} {word}")
-        self.summary.configure(text="  ·  ".join(parts))
-        self.updated.configure(text=f"Updated {datetime.now().strftime('%I:%M:%S %p').lstrip('0')}")
+                parts.append(f"{counts[kind]} {tr(word)}")
+        parts.append(tr("updated {time}", time=datetime.now().strftime('%I:%M:%S %p').lstrip('0')))
+        self.summary.configure(text=" · ".join(parts))
 
     # ----- one printer card -----
 
@@ -2157,106 +2492,149 @@ class PrinterMonitor(tk.Toplevel):
         outer, body = self.cards[p.name]
         for child in body.winfo_children():
             child.destroy()
-        state, kind = snap.state if snap else ("Checking...", "wait")
+        stock = next((st for st in self.app.cfg.stock if st.id == p.stock), None)
+        wrong_labels = (check_label_length(p, stock, snap.status.get("label_length_dots"))
+                        if snap and snap.reachable else None)
+        state, kind = snap.state if snap else (tr("Checking..."), "wait")
+        if wrong_labels and kind == "ok":
+            state, kind = tr("Wrong labels?"), "warn"
         outer.configure(background=self.COLORS[kind])
+        self.kinds[p.name] = kind
 
+        # 1. What needs attention
         head = tk.Frame(body, background=self.CARD)
         head.pack(fill="x")
         tk.Label(head, text=p.name, font=("Segoe UI", 13, "bold"), background=self.CARD,
                  foreground=self.TEXT).pack(side="left")
         tk.Label(head, text=f" {state} ", font=("Segoe UI", 9, "bold"), background=self.COLORS[kind],
                  foreground="white").pack(side="right")
-        where = f"{p.host}" if p.host else f"Windows printer '{p.windows_name}'"
-        stock = next((s.name for s in self.app.cfg.stock if s.id == p.stock), None)
-        subtitle = " · ".join(x for x in (p.model, where, f"{p.dpi} dpi",
-                                          stock or f'{p.width_in:g} x {p.height_in:g} in') if x)
-        tk.Label(body, text=subtitle, background=self.CARD, foreground=self.MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w")
+        if snap is not None:
+            # Each problem, then what to do about it
+            issues = [(tr(problem), "bad", "bold", self.FIXES.get(problem)) for problem in snap.problems]
+            if wrong_labels:
+                issues.append((wrong_labels, "warn", "normal", self.LABEL_FIX))
+            if not snap.reachable:
+                issues.append((snap.error or tr("No answer."), "off", "normal", self.FIXES["Not reachable"]))
+            for text, color, weight, fix in issues:
+                tk.Label(body, text=f"● {text}", background=self.CARD, foreground=self.COLORS[color],
+                         font=("Segoe UI", 10, weight), wraplength=500, justify="left").pack(anchor="w", pady=(3, 0))
+                if fix:
+                    tk.Label(body, text=tr(fix), background=self.CARD, foreground=self.TEXT, font=("Segoe UI", 9),
+                             wraplength=480, justify="left").pack(anchor="w", padx=(16, 0))
+            facts = []
+            if snap.reachable:
+                facts.append((tr("Now"), snap.activity))
+            if snap.queue_jobs:
+                facts.append((tr("Windows queue"), tr("1 job waiting") if snap.queue_jobs == 1
+                              else tr("{n} jobs waiting", n=snap.queue_jobs)))
+            facts.append((tr("Label stock"), stock.name if stock else
+                          tr("{w} x {h} in (none set)", w=f"{p.width_in:g}", h=f"{p.height_in:g}")))
+            grid = tk.Frame(body, background=self.CARD)
+            grid.pack(fill="x", pady=(6, 0))
+            for r, (name, value) in enumerate(facts):
+                tk.Label(grid, text=name, background=self.CARD, foreground=self.MUTED,
+                         font=("Segoe UI", 10)).grid(row=r, column=0, sticky="nw", padx=(0, 10))
+                tk.Label(grid, text=value, background=self.CARD, foreground=self.TEXT, font=("Segoe UI", 10, "bold"),
+                         wraplength=430, justify="left").grid(row=r, column=1, sticky="w")
+
+        # 2. Which printer it is
+        serial = snap.info.get("device.unique_id") if snap else None
+        where = p.host or tr("Windows printer '{name}'", name=p.windows_name)
+        ident = " · ".join(x for x in (p.model, where, f"SN {serial}" if serial else None) if x)
+        tk.Label(body, text=ident, background=self.CARD, foreground=self.MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
         if snap is None:
             return
 
-        for problem in snap.problems:
-            tk.Label(body, text=f"● {problem}", background=self.CARD, foreground=self.COLORS["bad"],
-                     font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
-        for diff in snap.diffs or []:
-            tk.Label(body, text=f"● {diff}", background=self.CARD,
-                     foreground=self.COLORS["warn"]).pack(anchor="w")
-        if not snap.reachable:
-            tk.Label(body, text=snap.error or "No answer.", background=self.CARD, foreground=self.MUTED,
-                     wraplength=480, justify="left").pack(anchor="w", pady=(6, 0))
-
+        # 3. Everything else, on request
+        expanded = p.name in self.expanded
+        more = "▾ " + tr("Less info") if expanded else "▸ " + tr("More info")
+        toggle = tk.Label(body, text=more, background=self.CARD,
+                          foreground=self.COLORS["busy"], cursor="hand2", font=("Segoe UI", 9, "underline"))
+        toggle.pack(anchor="w", pady=(6, 0))
+        toggle.bind("<Button-1>", lambda e: self._toggle(p))
+        if not expanded:
+            return
         rows = self._details(p, snap)
         if rows:
             grid = tk.Frame(body, background=self.CARD)
-            grid.pack(fill="x", pady=(8, 0))
+            grid.pack(fill="x", pady=(4, 0))
             for i, (name, value) in enumerate(rows):
                 r, c = i // 2, (i % 2) * 2
                 tk.Label(grid, text=name, background=self.CARD, foreground=self.MUTED,
                          font=("Segoe UI", 9)).grid(row=r, column=c, sticky="w", padx=(0, 8))
                 tk.Label(grid, text=value, background=self.CARD, foreground=self.TEXT,
-                         font=("Segoe UI", 9, "bold")).grid(row=r, column=c + 1, sticky="w", padx=(0, 18))
-
+                         font=("Segoe UI", 9, "bold")).grid(row=r, column=c + 1, sticky="w", padx=(0, 12))
         foot = tk.Frame(body, background=self.CARD)
         foot.pack(fill="x", pady=(8, 0))
         checked = snap.checked_at.strftime("%I:%M:%S %p").lstrip("0")
-        timing = f"Checked {checked}" + (f" · answered in {snap.response_ms} ms" if snap.response_ms is not None else "")
+        timing = tr("Checked {time}", time=checked) + (" · " + tr("answered in {ms} ms", ms=snap.response_ms)
+                                                       if snap.response_ms is not None else "")
         tk.Label(foot, text=timing, background=self.CARD, foreground=self.MUTED,
                  font=("Segoe UI", 8)).pack(side="left")
         if snap.reachable and (snap.report or snap.info):
-            ttk.Button(foot, text="Full report...", command=lambda: self._full_report(p, snap)).pack(side="right")
+            ttk.Button(foot, text=tr("Full report..."), command=lambda: self._full_report(p, snap)).pack(side="right")
+
+    def _toggle(self, p):
+        self.expanded ^= {p.name}
+        self._render(p, self.snapshots.get(p.name))
+
+    def _toggle_all(self):
+        names = {p.name for p in self.printers()}
+        self.expanded = set() if self.expanded >= names else names
+        self.all_button.configure(text=tr("Less info for all") if self.expanded else tr("More info for all"))
+        for p in self.printers():
+            if p.name in self.cards:
+                self._render(p, self.snapshots.get(p.name))
 
     def _details(self, p, snap):
         """(name, value) pairs worth showing, only for what the printer actually told us."""
         st, report, info = snap.status, dict(snap.report), snap.info
         dots_per_inch = p.dpmm * 25.4
         rows = []
-        if snap.reachable:
-            rows.append(("Activity", snap.activity))
-        if snap.queue_jobs is not None:
-            rows.append(("Windows queue", f"{snap.queue_jobs} job{'s' if snap.queue_jobs != 1 else ''}"))
         if info.get("odometer.total_label_count"):
-            rows.append(("Labels printed", self._number(info["odometer.total_label_count"])))
+            rows.append((tr("Labels printed"), self._number(info["odometer.total_label_count"])))
         if info.get("odometer.total_print_length"):
-            rows.append(("Printed length", self._length(info["odometer.total_print_length"])))
+            rows.append((tr("Printed length"), self._length(info["odometer.total_print_length"])))
         if "DARKNESS" in report:
-            rows.append(("Darkness", report["DARKNESS"].lstrip("+")))
+            rows.append((tr("Darkness"), report["DARKNESS"].lstrip("+")))
         if "PRINT SPEED" in report:
-            rows.append(("Speed", report["PRINT SPEED"].lower()))
+            rows.append((tr("Speed"), report["PRINT SPEED"].lower()))
         mode = st.get("print_mode") or report.get("PRINT MODE", "").title()
         if mode:
-            rows.append(("Print mode", mode))
+            rows.append((tr("Print mode"), tr(mode)))
         if "MEDIA TYPE" in report:
-            rows.append(("Media", report["MEDIA TYPE"].title()))
+            rows.append((tr("Media"), report["MEDIA TYPE"].title()))
         sensor = report.get("SENSOR SELECT") or report.get("SENSOR TYPE")
         if sensor:
-            rows.append(("Sensor", sensor.title()))
+            rows.append((tr("Sensor"), sensor.title()))
         if st:
-            rows.append(("Printing method", "Thermal transfer (ribbon)" if st.get("thermal_transfer")
-                         else "Direct thermal"))
-        width = snap.settings.get("print_width")
+            rows.append((tr("Printing method"), tr("Ribbon") if st.get("thermal_transfer") else tr("Direct thermal")))
+        width = re.match(r"\d+", report.get("PRINT WIDTH", "").strip())
         if width:
-            rows.append(("Print width", f"{width} dots ({width / dots_per_inch:.2f} in)"))
+            rows.append((tr("Print width"), tr("{n} in", n=f"{int(width.group()) / dots_per_inch:.2f}")))
         length = st.get("label_length_dots")
         if length:
-            rows.append(("Label length", f"{length} dots ({length / dots_per_inch:.2f} in)"))
-        for key, label in (("device.unique_id", "Serial number"), ("appl.name", "Firmware"),
-                           ("device.uptime", "Up for"), ("interface.network.active.mac_addr", "MAC address")):
+            rows.append((tr("Label length"), tr("{n} in, with the gap", n=f"{length / dots_per_inch:.2f}")))
+        for key, label in (("appl.name", N_("Firmware")), ("device.uptime", N_("Up for")),
+                           ("interface.network.active.mac_addr", N_("MAC address")),
+                           ("device.friendly_name", N_("Name on printer"))):
             if info.get(key):
-                rows.append((label, info[key]))
+                rows.append((tr(label), info[key]))
         if "appl.name" not in info and report.get("FIRMWARE"):
-            rows.append(("Firmware", report["FIRMWARE"].replace("<-", "").strip()))
-        if snap.diffs == []:
-            rows.append(("Spec", "Matches"))
+            rows.append((tr("Firmware"), report["FIRMWARE"].replace("<-", "").strip()))
         return rows
 
     @staticmethod
     def _length(text):
-        """'11291 INCHES, 28679 CENTIMETERS' -> '11,291 in (287 m)'."""
+        """'1303990 INCHES, 3312134 CENTIMETERS' -> '108,666 ft (33.1 km)'."""
         m = re.match(r"\s*(\d+)\s*INCH", text, re.I)
         if not m:
             return text.split(",")[0].strip().lower()
         inches = int(m.group(1))
-        return f"{inches:,} in ({inches * 0.0254:,.0f} m)"
+        metres = inches * 0.0254
+        metric = f"{metres / 1000:,.1f} km" if metres >= 1000 else f"{metres:,.0f} m"
+        return f"{inches / 12:,.0f} ft ({metric})"
 
     @staticmethod
     def _number(text):
@@ -2267,28 +2645,28 @@ class PrinterMonitor(tk.Toplevel):
 
     def _full_report(self, p, snap):
         win = tk.Toplevel(self)
-        win.title(f"{p.name}: full report")
+        win.title(tr("{name}: full report", name=p.name))
         win.geometry("560x620")
         frame = ttk.Frame(win, padding=10)
         frame.pack(fill="both", expand=True)
         tree = ttk.Treeview(frame, columns=("setting", "value"), show="headings")
-        tree.heading("setting", text="Setting", anchor="w")
-        tree.heading("value", text="Value", anchor="w")
+        tree.heading("setting", text=tr("Setting"), anchor="w")
+        tree.heading("value", text=tr("Value"), anchor="w")
         tree.column("setting", width=230, anchor="w")
         tree.column("value", width=290, anchor="w")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
         tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-        tree.insert("", "end", values=("— Device —", ""))
+        tree.insert("", "end", values=("— " + tr("Device") + " —", ""))
         for key, label in SGD_INFO.items():
             if snap.info.get(key):
-                tree.insert("", "end", values=(label, snap.info[key]))
-        tree.insert("", "end", values=("— Status —", ""))
+                tree.insert("", "end", values=(tr(label), snap.info[key]))
+        tree.insert("", "end", values=("— " + tr("Status") + " —", ""))
         for key, value in snap.status.items():
-            shown = ("Yes" if value else "No") if isinstance(value, bool) else ("?" if value is None else value)
+            shown = (tr("Yes") if value else tr("No")) if isinstance(value, bool) else ("?" if value is None else value)
             tree.insert("", "end", values=(key.replace("_", " ").capitalize(), shown))
-        tree.insert("", "end", values=("— Configuration report —", ""))
+        tree.insert("", "end", values=("— " + tr("Configuration report") + " —", ""))
         for name, value in snap.report:
             tree.insert("", "end", values=(name.title(), value))
         win.transient(self)
@@ -2297,82 +2675,83 @@ class PrinterMonitor(tk.Toplevel):
 class DeploymentWindow(tk.Toplevel):
     """Every PC/user running Stripes, from the shared status folder."""
 
-    COLUMNS = (("computer", "Computer", 110), ("user", "User", 100), ("version", "Version", 70),
-               ("status", "Status", 85), ("last_seen", "Last seen", 125), ("last_update", "Last update", 230),
-               ("first_seen", "Installed", 125), ("notes", "Notes", 280))
+    COLUMNS = (("computer", N_("Computer"), 110), ("user", N_("User"), 100), ("version", N_("Version"), 110),
+               ("status", N_("Status"), 85), ("last_seen", N_("Last seen"), 125),
+               ("last_update", N_("Last update"), 230),
+               ("first_seen", N_("Installed"), 125), ("notes", N_("Notes"), 280))
 
     def __init__(self, app, folder):
         super().__init__(app)
         self.app, self.folder = app, folder
-        self.title("Deployment status")
+        self.title(tr("Deployment status"))
         self.geometry("1100x480")
         self.transient(app)
         frame = ttk.Frame(self, padding=12)
         frame.pack(fill="both", expand=True)
-        self.summary = ttk.Label(frame, text="Loading...", font=("Segoe UI", 11, "bold"))
+        self.summary = ttk.Label(frame, text=tr("Loading..."), font=("Segoe UI", 11, "bold"))
         self.summary.pack(anchor="w")
-        ttk.Label(frame, text=f"From {folder}. Double-click a row for its history.",
+        ttk.Label(frame, text=tr("From {folder}. Double-click a row for its history.", folder=folder),
                   style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(table, columns=[c[0] for c in self.COLUMNS], show="headings")
         for key, title, width in self.COLUMNS:
-            self.tree.heading(key, text=title, anchor="w")
+            self.tree.heading(key, text=tr(title), anchor="w")
             self.tree.column(key, width=width, anchor="w", stretch=key == "notes")
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.tag_configure("behind", foreground="#b45309")
-        self.tree.tag_configure("problem", foreground="#b91c1c")
         self.tree.bind("<Double-1>", lambda e: self._show_history())
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(8, 0))
-        ttk.Button(buttons, text="Refresh", command=self.refresh).pack(side="left")
-        ttk.Button(buttons, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text=tr("Refresh"), command=self.refresh).pack(side="left")
+        ttk.Button(buttons, text=tr("Close"), command=self.destroy).pack(side="right")
         self.records = []
         self.refresh()
 
     def refresh(self):
-        self.summary.configure(text="Loading...")
+        self.summary.configure(text=tr("Loading..."))
         self.app.bg.run(lambda: read_deployment(self.folder), self._loaded)
 
     def _loaded(self, records, error):
         if not self.winfo_exists():
             return
         if error:
-            self.summary.configure(text=f"Couldn't read {self.folder}: {describe_error(error)}")
+            self.summary.configure(text=tr("Couldn't read {folder}: {error}", folder=self.folder,
+                                           error=describe_error(error)))
             return
         self.records = records
-        versions = [parse_version(r.get("version")) for r in records]
-        latest = max([v for v in versions if v] + [parse_version(VERSION) or (0, 0, 0)])
-        latest_text = "v" + ".".join(map(str, latest))
+        # "Behind" compares with the newest version seen (normally the one on the share)
+        versions = [parse_version(r.get("version")) for r in records] + [parse_version(VERSION)]
+        newest = max(filter(None, versions), default=None)
         self.tree.delete(*self.tree.get_children())
-        behind = open_now = 0
-        for i, (r, v) in enumerate(zip(records, versions)):
+        behind = on_newest = open_now = 0
+        for i, r in enumerate(records):
+            v = parse_version(r.get("version"))
             is_open = is_open_now(r)
             open_now += is_open
+            on_newest += bool(v) and v == newest
             notes, tag = [], ()
-            if v and v < latest:
+            if v and v < newest:
                 behind += 1
                 tag = ("behind",)
-            if r.get("pending_update"):
-                notes.append(f"{r['pending_update']} downloaded, waiting for restart")
-            error = r.get("last_update_error")
-            if isinstance(error, dict) and error.get("message"):
-                notes.append(f"Update problem: {error['message']}")
-                tag = ("problem",)
             if r.get("config", "server") != "server":
-                notes.append(f"Settings: {r.get('config')}")
+                notes.append(tr("Settings: {source}", source=r.get('config')))
             update = r.get("last_update") or {}
             last_update = (f"{update.get('from')} → {update.get('to')}  ({_short_time(update.get('at'))})"
                            if update else "")
             self.tree.insert("", "end", iid=str(i), tags=tag, values=(
                 r.get("computer", ""), r.get("user", ""), r.get("version", ""),
-                "Open now" if is_open else "Closed", _short_time(r.get("last_seen")), last_update,
+                tr("Open now") if is_open else tr("Closed"),
+                _short_time(r.get("last_seen")), last_update,
                 _short_time(r.get("first_seen")), "; ".join(notes)))
-        self.summary.configure(text=f"{len(records)} installs  ·  {open_now} open now  ·  "
-                                    f"{len(records) - behind} on {latest_text}  ·  {behind} behind")
+        parts = [tr("{n} installs", n=len(records)), tr("{n} open now", n=open_now)]
+        if newest:
+            parts.append(tr("{n} on {version}", n=on_newest, version="v" + ".".join(map(str, newest))))
+        parts.append(tr("{n} behind", n=behind))
+        self.summary.configure(text="  ·  ".join(parts))
 
     def _show_history(self):
         sel = self.tree.selection()
@@ -2380,12 +2759,13 @@ class DeploymentWindow(tk.Toplevel):
             return
         r = self.records[int(sel[0])]
         lines = [f"{e.get('at', '')}   {e.get('event', '')}" for e in reversed(r.get("events") or [])]
-        details = (f"{r.get('computer')} / {r.get('user')}\nVersion {r.get('version')}  ·  {r.get('windows', '')}\n"
-                   f"{r.get('exe', '')}\n\n" + ("\n".join(lines) or "No events yet."))
-        messagebox.showinfo("History", details, parent=self)
+        details = (f"{r.get('computer')} / {r.get('user')}\n"
+                   + tr("Version {version}", version=r.get('version')) + f"  ·  {r.get('windows', '')}\n"
+                   f"{r.get('exe', '')}\n\n" + ("\n".join(lines) or tr("No events yet.")))
+        messagebox.showinfo(tr("History"), details, parent=self)
 
 
-NO_WINDOWS_PRINTER = "(none - send straight to the IP address)"
+NO_WINDOWS_PRINTER = N_("(none - send straight to the IP address)")  # shown with tr()
 
 
 class PrinterDialog(tk.Toplevel):
@@ -2394,7 +2774,7 @@ class PrinterDialog(tk.Toplevel):
     def __init__(self, app):
         super().__init__(app)
         self.app = app
-        self.title("Manage printers")
+        self.title(tr("Manage printers"))
         self.resizable(False, False)
         self.transient(app)
         self.editing = None  # index into app.settings["printers"], or None for a new one
@@ -2407,16 +2787,16 @@ class PrinterDialog(tk.Toplevel):
 
         left = ttk.Frame(frame)
         left.grid(row=0, column=0, sticky="ns", padx=(0, 12))
-        ttk.Label(left, text="Printers in this app").pack(anchor="w")
+        ttk.Label(left, text=tr("Printers in this app")).pack(anchor="w")
         self.listbox = tk.Listbox(left, width=30, height=15, exportselection=False)
         self.listbox.pack(fill="y", expand=True)
         self.listbox.bind("<<ListboxSelect>>", lambda e: self._select())
         btns = ttk.Frame(left)
         btns.pack(fill="x", pady=(6, 0))
-        self.add_windows_btn = ttk.Button(btns, text="Add from Windows...", command=self._add_from_windows)
+        self.add_windows_btn = ttk.Button(btns, text=tr("Add from Windows..."), command=self._add_from_windows)
         self.add_windows_btn.pack(side="left")
-        ttk.Button(btns, text="Add by IP", command=self._new).pack(side="left", padx=4)
-        self.delete_btn = ttk.Button(btns, text="Delete", command=self._delete)
+        ttk.Button(btns, text=tr("Add by IP"), command=self._new).pack(side="left", padx=4)
+        self.delete_btn = ttk.Button(btns, text=tr("Delete"), command=self._delete)
         self.delete_btn.pack(side="left")
 
         form = ttk.Frame(frame)
@@ -2429,29 +2809,29 @@ class PrinterDialog(tk.Toplevel):
             widget.grid(row=r, column=1, sticky="w", pady=3)
             self.form_widgets.append(widget)
 
-        row(0, "Name", ttk.Entry(form, textvariable=self.vars["name"], width=30))
+        row(0, tr("Name"), ttk.Entry(form, textvariable=self.vars["name"], width=30))
         self.windows_box = ttk.Combobox(form, textvariable=self.vars["windows_name"], state="readonly", width=40)
         self.windows_box.bind("<<ComboboxSelected>>", lambda e: self._windows_printer_picked())
-        row(1, "Windows printer", self.windows_box)
-        row(2, "IP address", ttk.Entry(form, textvariable=self.vars["host"], width=18))
-        row(3, "Port", ttk.Entry(form, textvariable=self.vars["port"], width=8))
+        row(1, tr("Windows printer"), self.windows_box)
+        row(2, tr("IP address"), ttk.Entry(form, textvariable=self.vars["host"], width=18))
+        row(3, tr("Port"), ttk.Entry(form, textvariable=self.vars["port"], width=8))
         model = ttk.Combobox(form, textvariable=self.vars["model"], values=list(MODELS), state="readonly", width=10)
         model.bind("<<ComboboxSelected>>", lambda e: self._model_changed())
-        row(4, "Model", model)
-        row(5, "Label width (in)", ttk.Entry(form, textvariable=self.vars["width_in"], width=8))
-        row(6, "Label height (in)", ttk.Entry(form, textvariable=self.vars["height_in"], width=8))
-        row(7, "Resolution (dpi)", ttk.Combobox(form, textvariable=self.vars["dpi"],
+        row(4, tr("Model"), model)
+        row(5, tr("Label width (in)"), ttk.Entry(form, textvariable=self.vars["width_in"], width=8))
+        row(6, tr("Label height (in)"), ttk.Entry(form, textvariable=self.vars["height_in"], width=8))
+        row(7, tr("Resolution (dpi)"), ttk.Combobox(form, textvariable=self.vars["dpi"],
                                                 values=[str(d) for d in DPI_TO_DPMM], state="readonly", width=8))
-        row(8, "Shift right (dots)", ttk.Entry(form, textvariable=self.vars["shift_x"], width=8))
-        row(9, "Shift down (dots)", ttk.Entry(form, textvariable=self.vars["shift_y"], width=8))
+        row(8, tr("Shift right (dots)"), ttk.Entry(form, textvariable=self.vars["shift_x"], width=8))
+        row(9, tr("Shift down (dots)"), ttk.Entry(form, textvariable=self.vars["shift_y"], width=8))
 
         actions = ttk.Frame(form)
         actions.grid(row=10, column=0, columnspan=3, sticky="w", pady=(12, 0))
-        self.save_btn = ttk.Button(actions, text="Save printer", command=self._save)
+        self.save_btn = ttk.Button(actions, text=tr("Save printer"), command=self._save)
         self.save_btn.pack(side="left")
-        ttk.Button(actions, text="Test connection", command=self._test).pack(side="left", padx=6)
-        ttk.Button(actions, text="Print test label", command=self._test_label).pack(side="left")
-        self.calibrate_btn = ttk.Button(actions, text="Calibrate media", command=self._calibrate)
+        ttk.Button(actions, text=tr("Test connection"), command=self._test).pack(side="left", padx=6)
+        ttk.Button(actions, text=tr("Print test label"), command=self._test_label).pack(side="left")
+        self.calibrate_btn = ttk.Button(actions, text=tr("Calibrate media"), command=self._calibrate)
         self.calibrate_btn.pack(side="left", padx=6)
 
         self.msg = ttk.Label(form, text="", wraplength=460, justify="left")
@@ -2461,9 +2841,9 @@ class PrinterDialog(tk.Toplevel):
         bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         folder = status_folder()
         if folder:
-            ttk.Button(bottom, text="Deployment status...",
+            ttk.Button(bottom, text=tr("Deployment status..."),
                        command=lambda: self._open_deployment(folder)).pack(side="left")
-        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(bottom, text=tr("Close"), command=self.destroy).pack(side="right")
 
         self._fill_list()
         if self._rows():
@@ -2473,7 +2853,7 @@ class PrinterDialog(tk.Toplevel):
             self._select()
         else:
             self._new()
-            self.msg.configure(text="Click 'Add from Windows...' to pick printers installed on this PC.",
+            self.msg.configure(text=tr("Click 'Add from Windows...' to pick printers installed on this PC."),
                                style="Muted.TLabel")
         self._load_installed()
 
@@ -2483,7 +2863,7 @@ class PrinterDialog(tk.Toplevel):
     # ----- Windows printers -----
 
     def _load_installed(self):
-        self.windows_box["values"] = [NO_WINDOWS_PRINTER]
+        self.windows_box["values"] = [tr(NO_WINDOWS_PRINTER)]
         self.add_windows_btn.configure(state="disabled")
 
         def done(result, error):
@@ -2492,11 +2872,11 @@ class PrinterDialog(tk.Toplevel):
             self.add_windows_btn.configure(state="normal")
             if error:
                 self.installed = []
-                self.msg.configure(text=f"Couldn't list Windows printers: {describe_error(error)}",
+                self.msg.configure(text=tr("Couldn't list Windows printers: {error}", error=describe_error(error)),
                                    style="Bad.TLabel")
                 return
             self.installed = result
-            self.windows_box["values"] = [NO_WINDOWS_PRINTER] + [p.name for p, _ in result]
+            self.windows_box["values"] = [tr(NO_WINDOWS_PRINTER)] + [p.name for p, _ in result]
 
         self.app.bg.run(list_windows_printers, done)
 
@@ -2514,24 +2894,24 @@ class PrinterDialog(tk.Toplevel):
         taken = {p.windows_name for _, p in self._rows() if p.windows_name}
         choices = [(p, z) for p, z in self.installed if p.windows_name not in taken]
         if not self.installed:
-            messagebox.showinfo(APP_NAME, "No printers were found in Windows.", parent=self)
+            messagebox.showinfo(APP_NAME, tr("No printers were found in Windows."), parent=self)
             return
         if not choices:
-            messagebox.showinfo(APP_NAME, "All the printers installed in Windows are already added.", parent=self)
+            messagebox.showinfo(APP_NAME, tr("All the printers installed in Windows are already added."), parent=self)
             return
 
         win = tk.Toplevel(self)
-        win.title("Add printers from Windows")
+        win.title(tr("Add printers from Windows"))
         win.transient(self)
         body = ttk.Frame(win, padding=12)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="Pick the label printers to add (Ctrl+click to pick several).\n"
-                             "Zebra printers are listed first.").pack(anchor="w")
+        ttk.Label(body, text=tr("Pick the label printers to add (Ctrl+click to pick several).\n"
+                                "Zebra printers are listed first.")).pack(anchor="w")
         lb = tk.Listbox(body, width=60, height=min(14, max(5, len(choices))), selectmode="extended",
                         exportselection=False)
         lb.pack(fill="both", expand=True, pady=8)
         for i, (p, zebra) in enumerate(choices):
-            detail = f"{p.model}, {p.dpi} dpi" if p.model != "Other" else "model unknown"
+            detail = f"{p.model}, {p.dpi} dpi" if p.model != "Other" else tr("model unknown")
             lb.insert("end", f"{p.name}   ({detail})" if zebra else f"{p.name}")
             if zebra:
                 lb.selection_set(i)
@@ -2558,13 +2938,13 @@ class PrinterDialog(tk.Toplevel):
             self.listbox.selection_set(len(self.app.company) + len(printers) - len(picked))
             self._select()
             self.msg.configure(
-                text=f"Added {len(picked)} printer(s). Check the label size and dpi for each one, "
-                     "then 'Print test label'.", style="Ok.TLabel")
+                text=tr("Added {n} printer(s). Check the label size and dpi for each one, "
+                        "then 'Print test label'.", n=len(picked)), style="Ok.TLabel")
 
         row = ttk.Frame(body)
         row.pack(fill="x")
-        ttk.Button(row, text="Add selected", command=add).pack(side="right")
-        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right", padx=6)
+        ttk.Button(row, text=tr("Add selected"), command=add).pack(side="right")
+        ttk.Button(row, text=tr("Cancel"), command=win.destroy).pack(side="right", padx=6)
         lb.bind("<Double-Button-1>", lambda e: add())
         win.grab_set()
         win.wait_window()
@@ -2587,8 +2967,9 @@ class PrinterDialog(tk.Toplevel):
     def _fill_list(self):
         self.listbox.delete(0, "end")
         for kind, p in self._rows():
-            suffix = "  - company" if kind == "company" else ""
-            self.listbox.insert("end", f"{p.name}  ({p.width_in:g} x {p.height_in:g} in){suffix}")
+            suffix = tr("  - company") if kind == "company" else ""
+            size = tr("{w} x {h} in", w=f"{p.width_in:g}", h=f"{p.height_in:g}")
+            self.listbox.insert("end", f"{p.name}  ({size}){suffix}")
             if kind == "company":
                 self.listbox.itemconfigure("end", foreground="#1d4ed8")
 
@@ -2607,7 +2988,7 @@ class PrinterDialog(tk.Toplevel):
             if k in self.vars:
                 self.vars[k].set(f"{v:g}" if isinstance(v, float) else str(v))
         if not p.windows_name:
-            self.vars["windows_name"].set(NO_WINDOWS_PRINTER)
+            self.vars["windows_name"].set(tr(NO_WINDOWS_PRINTER))
 
     def _select(self):
         sel = self.listbox.curselection()
@@ -2619,8 +3000,8 @@ class PrinterDialog(tk.Toplevel):
         self._lock(self.company_selected)
         self._show(p)
         if self.company_selected:
-            self.msg.configure(text=f"Company printer, set by IT in {self.app.company_path}. "
-                                    "It can't be changed here.", style="Muted.TLabel")
+            self.msg.configure(text=tr("Company printer, set by IT in {folder}. It can't be changed here.",
+                                       folder=self.app.company_path), style="Muted.TLabel")
         else:
             self.msg.configure(text="", style="TLabel")
 
@@ -2630,7 +3011,7 @@ class PrinterDialog(tk.Toplevel):
         self._lock(False)
         self.listbox.selection_clear(0, "end")
         self._show(Printer(name=""))
-        self.msg.configure(text="Fill in the details and click 'Save printer'.", style="Muted.TLabel")
+        self.msg.configure(text=tr("Fill in the details and click 'Save printer'."), style="Muted.TLabel")
 
     def _model_changed(self):
         w, h = MODELS[self.vars["model"].get()]
@@ -2639,26 +3020,26 @@ class PrinterDialog(tk.Toplevel):
 
     def _read_form(self):
         v = {k: var.get().strip() for k, var in self.vars.items()}
-        windows_name = "" if v["windows_name"] == NO_WINDOWS_PRINTER else v["windows_name"]
+        windows_name = "" if v["windows_name"] == tr(NO_WINDOWS_PRINTER) else v["windows_name"]
         if not v["name"]:
-            raise ValueError("Give the printer a name.")
+            raise ValueError(tr("Give the printer a name."))
         if not windows_name and not v["host"]:
-            raise ValueError("Pick a Windows printer or enter the printer's IP address.")
+            raise ValueError(tr("Pick a Windows printer or enter the printer's IP address."))
         try:
             port = int(v["port"] or 9100)
             assert 1 <= port <= 65535
         except (ValueError, AssertionError):
-            raise ValueError("Port must be a number (normally 9100).")
+            raise ValueError(tr("Port must be a number (normally 9100)."))
         try:
             w, h = float(v["width_in"]), float(v["height_in"])
             assert 0.25 <= w <= 20 and 0.25 <= h <= 40
         except (ValueError, AssertionError):
-            raise ValueError("Label width and height must be in inches, e.g. 2 and 1.")
+            raise ValueError(tr("Label width and height must be in inches, e.g. 2 and 1."))
         try:
             sx, sy = int(v["shift_x"] or 0), int(v["shift_y"] or 0)
             assert -500 <= sx <= 500 and -500 <= sy <= 500
         except (ValueError, AssertionError):
-            raise ValueError("Shift must be a whole number of dots between -500 and 500.")
+            raise ValueError(tr("Shift must be a whole number of dots between -500 and 500."))
         return Printer(name=v["name"], host=v["host"], port=port, windows_name=windows_name,
                        model=v["model"] or "Other", width_in=w, height_in=h, dpi=int(v["dpi"] or 203),
                        shift_x=sx, shift_y=sy)
@@ -2677,12 +3058,12 @@ class PrinterDialog(tk.Toplevel):
         if not p:
             return
         if any(c.name == p.name for c in self.app.company):
-            self.msg.configure(text="A company printer already has that name.", style="Bad.TLabel")
+            self.msg.configure(text=tr("A company printer already has that name."), style="Bad.TLabel")
             return
         printers = self.app.settings["printers"]
         for i, other in enumerate(printers):
             if other.name == p.name and i != self.editing:
-                self.msg.configure(text="Another printer already has that name.", style="Bad.TLabel")
+                self.msg.configure(text=tr("Another printer already has that name."), style="Bad.TLabel")
                 return
         if self.editing is None:
             printers.append(p)
@@ -2697,14 +3078,14 @@ class PrinterDialog(tk.Toplevel):
         self.app.save()
         self._fill_list()
         self.listbox.selection_set(len(self.app.company) + self.editing)
-        self.msg.configure(text=f"Saved {p.name}.", style="Ok.TLabel")
+        self.msg.configure(text=tr("Saved {name}.", name=p.name), style="Ok.TLabel")
 
     def _delete(self):
         if self.editing is None or self.company_selected:
             return
         p = self.app.settings["printers"][self.editing]
-        if not messagebox.askyesno(APP_NAME, f"Remove {p.name} from this app?\n\n"
-                                   "(It stays installed in Windows.)", parent=self):
+        if not messagebox.askyesno(APP_NAME, tr("Remove {name} from this app?\n\n(It stays installed in Windows.)",
+                                                name=p.name), parent=self):
             return
         del self.app.settings["printers"][self.editing]
         self.app.save()
@@ -2714,7 +3095,7 @@ class PrinterDialog(tk.Toplevel):
     # ----- actions -----
 
     def _run(self, p, what, work, ok_text):
-        self.msg.configure(text=f"{what} {p.name}...", style="Muted.TLabel")
+        self.msg.configure(text=tr(what, name=p.name), style="Muted.TLabel")
 
         def done(result, error):
             if not self.winfo_exists():
@@ -2734,13 +3115,14 @@ class PrinterDialog(tk.Toplevel):
 
         def ok(problems):
             if problems:
-                return f"Connected, but the printer reports: {', '.join(problems)}.", "Warn.TLabel"
+                return (tr("Connected, but the printer reports: {problems}.",
+                           problems=", ".join(map(tr, problems))), "Warn.TLabel")
             if not p.host:
-                return ("Windows says the printer is ready. Add its IP address for a more reliable "
-                        "check.", "Ok.TLabel")
-            return "Connected. The printer is ready.", "Ok.TLabel"
+                return (tr("Windows says the printer is ready. Add its IP address for a more reliable "
+                           "check."), "Ok.TLabel")
+            return tr("Connected. The printer is ready."), "Ok.TLabel"
 
-        self._run(p, "Contacting", lambda: printer_problems(p), ok)
+        self._run(p, N_("Contacting {name}..."), lambda: printer_problems(p), ok)
 
     def _test_label(self):
         p = self._form_printer()
@@ -2750,28 +3132,62 @@ class PrinterDialog(tk.Toplevel):
         label = printer_label(p)
         zpl = ld.build_zpl(ld.render(ld.Design.from_text(text), label), p.shift_x, p.shift_y, 1,
                            border=(label.width, label.height))
-        self._run(p, "Printing a test label on", lambda: send_label(p, zpl.encode("utf-8")),
-                  ("Test label sent. The box should line up with the label's edges. "
-                   "If it's off, adjust Shift and save.", "Ok.TLabel"))
+        self._run(p, N_("Printing a test label on {name}..."), lambda: send_label(p, zpl.encode("utf-8")),
+                  (tr("Test label sent. The box should line up with the label's edges. "
+                      "If it's off, adjust Shift and save."), "Ok.TLabel"))
 
     def _calibrate(self):
         p = self._form_printer()
         if not p:
             return
-        if not messagebox.askyesno(APP_NAME, f"Calibrate {p.name}?\n\nThe printer will feed a few blank labels "
-                                   "to measure them. Do this after loading a new kind of label.", parent=self):
+        if not messagebox.askyesno(APP_NAME, tr("Calibrate {name}?\n\nThe printer will feed a few blank labels "
+                                                "to measure them. Do this after loading a new kind of label.",
+                                                name=p.name), parent=self):
             return
-        self._run(p, "Calibrating", lambda: send_label(p, b"~JC"), ("Calibration started.", "Ok.TLabel"))
+        self._run(p, N_("Calibrating {name}..."), lambda: send_label(p, b"~JC"),
+                  (tr("Calibration started."), "Ok.TLabel"))
+
+
+def self_check(out_path):
+    """Used by the release build: prove the built exe can load what it needs (Tk, Pillow
+    for the preview, the tray, QR codes, its icon), then write its version to out_path."""
+    from PIL import Image, ImageTk
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        ImageTk.PhotoImage(Image.new("1", (8, 8)), master=root)
+        ld.qr_matrix("Stripes")
+        Image.open(resource_path(os.path.join("assets", "icon-48.png"))).load()
+        if sys.platform == "win32":
+            import pystray._win32  # noqa: F401 (the tray's Windows backend, loaded by name at run time)
+    finally:
+        root.destroy()
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(f"ok {VERSION}\n")
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
+        self_check(sys.argv[2])
+        return
+    start_hidden = TRAY_FLAG in sys.argv[1:]
+    instance = SingleInstance()
+    # Already running? Bring that window forward (or, from the logon shortcut, do nothing).
+    if instance.signal_running("tray" if start_hidden else "show"):
+        return
     if sys.platform == "win32":
         try:  # sharp text on high-DPI screens
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    App().mainloop()
+    app = App(start_hidden=start_hidden)
+    try:
+        instance.listen(lambda message: message == "show" and app.call(app.show))
+    except OSError:
+        pass  # can't listen: a second start just opens a second window
+    app.mainloop()
+    instance.close()
 
 
 if __name__ == "__main__":

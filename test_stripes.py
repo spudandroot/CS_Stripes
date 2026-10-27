@@ -267,7 +267,6 @@ class CompanyConfigTests(unittest.TestCase):
         # label size comes from the printer's stock
         self.assertEqual((packing.stock, zl.label_dots(packing)), ("2x1-gap", (406, 203)))
         self.assertEqual((pallets.stock, zl.label_dots(pallets)), ("3x3-mark", (610, 610)))
-        self.assertEqual(pallets.expected["media"], "mark")
         self.assertTrue(all(p.port == 9100 and not p.windows_name for p in cfg.printers))
 
     def test_notepad_bom_and_bad_entries(self):
@@ -372,14 +371,23 @@ class MonitorTests(unittest.TestCase):
         fake = FakePrinter(hs_reply=HS_BUSY, config_report=ZD_REPORT.encode(),
                            sgd={"odometer.total_label_count": "19259"})
         self.addCleanup(fake.close)
-        p = zl.Printer(name="Gary", host="127.0.0.1", port=fake.port, model="ZD420", expected={"darkness": 10})
+        p = zl.Printer(name="Gary", host="127.0.0.1", port=fake.port, model="ZD420")
         snap = zl.inspect_printer(p)
         self.assertTrue(snap.reachable)
         self.assertEqual(snap.state, ("Printing", "busy"))
         self.assertEqual(snap.activity, "Printing: 24 labels left in this job")
-        self.assertEqual(snap.diffs, [])
         self.assertEqual(snap.info["odometer.total_label_count"], "19259")
         self.assertIn(("PRINT WIDTH", "406"), snap.report)
+
+    def test_label_length(self):
+        p = zl.Printer(name="Alaine", host="x", model="ZD420", dpi=203)
+        stock = zl.Stock("2x1-gap", "2 x 1 in", 2, 1, "gap")
+        self.assertIsNone(zl.check_label_length(p, stock, 217))  # 1.07 in: 1 in label plus its gap
+        self.assertIsNone(zl.check_label_length(p, stock, 196))  # 0.97 in: calibration wobble
+        self.assertEqual(zl.check_label_length(p, stock, 320), "Labels loaded are 1.57 in long, not 2 x 1 in")
+        self.assertIsNotNone(zl.check_label_length(p, stock, 180))  # 0.89 in: too short
+        self.assertIsNone(zl.check_label_length(p, None, 320))  # no stock: nothing to compare
+        self.assertIsNone(zl.check_label_length(p, stock, None))  # printer didn't say
 
     def test_unreachable_and_non_link_os(self):
         s = socket.socket()
@@ -392,82 +400,64 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(zl.is_link_os(zl.Printer(name="x", model="Other")))  # never sent SGD
 
 
-class SpecCheckTests(unittest.TestCase):
-    def test_parse_report(self):
-        self.assertEqual(zl.parse_config_report(ZD_REPORT), {
-            "darkness": 10.0, "speed": 6.0, "print_mode": "tear-off", "media": "gap", "print_width": 406})
-
-    def test_unknown_format_means_no_checks(self):
-        self.assertEqual(zl.parse_config_report("garbage\nmore garbage"), {})
-
-    def test_differences(self):
-        actual = zl.parse_config_report(ZD_REPORT)
-        same = {"print_width": 406, "media": "gap", "print_mode": "tear-off", "darkness": 10, "speed": 6,
-                "sensor": "transmissive"}
-        self.assertEqual(zl.spec_differences(same, actual), [])
-        diffs = zl.spec_differences({"darkness": 15, "print_mode": "peel-off", "print_width": 609}, actual)
-        self.assertEqual(diffs, ["Darkness is 10 (spec says 15)", "Print mode is tear-off (spec says peel-off)",
-                                 "Print width is 406 (spec says 609)"])
-
+class CheckPrinterTests(unittest.TestCase):
     def test_check_printer_over_network(self):
-        fake = FakePrinter(config_report=ZD_REPORT.encode())
+        fake = FakePrinter(hs_reply=HS_BUSY)
         self.addCleanup(fake.close)
-        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port, expected={"darkness": 12, "media": "gap"})
-        self.assertEqual(zl.check_printer(p), ([], ["Darkness is 10 (spec says 12)"]))
-        p.expected = {}
-        self.assertEqual(zl.check_printer(p), ([], None))  # no spec, no check
+        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port)
+        self.assertEqual(zl.check_printer(p), ([], None))  # no stock: status only
+        self.assertEqual(zl.check_printer(p, zl.Stock("3x3", "3 x 3 in", 3, 3, "gap")),
+                         ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
 
-class SelfUpdateTests(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        self.exe = os.path.join(self.dir, "Stripes.exe")
-        with open(self.exe, "wb") as f:
-            f.write(b"old version")
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_start_reaches_the_first(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        self.assertFalse(zl.SingleInstance(path).signal_running())  # nothing running yet
+        got, arrived = [], threading.Event()
+        first = zl.SingleInstance(path)
+        first.listen(lambda message: (got.append(message), arrived.set()))
+        self.addCleanup(first.close)
+        self.assertTrue(zl.SingleInstance(path).signal_running("show"))
+        self.assertTrue(arrived.wait(2))
+        self.assertEqual(got, ["show"])
 
-    def fake_github(self, files):
-        def fetch(url, timeout=60):
-            for suffix, data in files.items():
-                if url.endswith(suffix):
-                    return data
-            raise OSError(f"404 {url}")
-        return fetch
+    def test_wrong_key_or_stale_file_is_ignored(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        got = []
+        first = zl.SingleInstance(path)
+        first.listen(got.append)
+        self.addCleanup(first.close)
+        port = open(path).read().split()[0]
+        with open(path, "w") as f:
+            f.write(f"{port} not-the-key")
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        first.close()
+        with open(path, "w") as f:
+            f.write("1 stale")  # left over after a crash: nothing listens there
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        self.assertEqual(got, [])
 
+
+class VersionTests(unittest.TestCase):
     def test_versions(self):
         self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2))
         self.assertIsNone(zl.parse_version("dev-abc1234"))
-        fetch = self.fake_github({"/latest/download/version.txt": b"v1.10.0\n"})
-        self.assertEqual(zl.check_for_update("v1.9.9", fetch), "v1.10.0")  # not a text comparison
-        self.assertIsNone(zl.check_for_update("v1.10.0", fetch))
-        self.assertIsNone(zl.check_for_update("v2.0.0", fetch))
-        self.assertIsNone(zl.check_for_update("dev-abc1234", fetch))  # development builds never update
+        self.assertIsNone(zl.parse_version("v1.4.0-beta.2"))  # betas are gone
+        self.assertLess(zl.parse_version("v1.9.9"), zl.parse_version("v1.10.0"))  # not a text comparison
 
-    def test_install_swaps_the_exe(self):
-        import hashlib
-        new = b"new version"
-        fetch = self.fake_github({"/download/v1.1.0/Stripes.exe": new,
-                                  "/download/v1.1.0/Stripes.exe.sha256": hashlib.sha256(new).hexdigest().encode()})
-        zl.install_update("v1.1.0", self.exe, fetch)
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), new)
-        olds = [n for n in os.listdir(self.dir) if n.startswith("Stripes.exe.old-")]
-        self.assertEqual(len(olds), 1)  # the running copy, moved aside
-        zl.remove_old_versions(self.exe)
-        self.assertEqual(os.listdir(self.dir), ["Stripes.exe"])
-
-    def test_damaged_download_leaves_current_copy(self):
-        fetch = self.fake_github({"/download/v1.1.0/Stripes.exe": b"truncated",
-                                  "/download/v1.1.0/Stripes.exe.sha256": b"0" * 64})
-        with self.assertRaises(ValueError):
-            zl.install_update("v1.1.0", self.exe, fetch)
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), b"old version")
-        self.assertEqual(os.listdir(self.dir), ["Stripes.exe"])
-
-    def test_writable_folder(self):
-        self.assertTrue(zl.folder_is_writable(self.dir))
-        self.assertFalse(zl.folder_is_writable(os.path.join(self.dir, "missing")))
+    def test_old_copies_cleaned_up(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = os.path.join(d, "Stripes.exe")
+        for name in ("Stripes.exe", "Stripes.exe.old-123", "Stripes.exe.new"):
+            open(os.path.join(d, name), "w").close()
+        zl.remove_old_versions(exe)
+        self.assertEqual(os.listdir(d), ["Stripes.exe"])
 
 
 class DeploymentLogTests(unittest.TestCase):
@@ -487,11 +477,10 @@ class DeploymentLogTests(unittest.TestCase):
         first_seen = r["first_seen"]
 
         log.started("v1.2.0", "x")  # plain restart: no new event
-        log.write("Downloaded v1.3.0; finishes when Stripes restarts", pending_update="v1.3.0")
-        log.started("v1.3.0", "x")
+        log.started("v1.3.0", "x")  # Group Policy copied a new exe
         r = log.read()
         self.assertEqual(r["first_seen"], first_seen)
-        self.assertEqual((r["version"], r["pending_update"]), ("v1.3.0", None))
+        self.assertEqual(r["version"], "v1.3.0")
         self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.2.0", "v1.3.0"))
         self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v1.2.0 -> v1.3.0")
 
@@ -499,17 +488,20 @@ class DeploymentLogTests(unittest.TestCase):
         log.write(running=False, last_closed=zl._now())
         self.assertFalse(zl.is_open_now(log.read()))
 
+    def test_self_update_fields_dropped(self):
+        log = self.log()
+        with open(log.path, "w", encoding="utf-8") as f:  # written by a build that updated itself
+            f.write('{"version": "v1.4.0-beta.2", "beta": true, "pending_update": "v1.4.0",'
+                    ' "last_update_error": {"message": "offline"}}')
+        log.started("v1.5.0", "x")
+        r = log.read()
+        self.assertEqual(r["version"], "v1.5.0")
+        self.assertFalse({"beta", "pending_update", "last_update_error"} & set(r))
+
     def test_stale_heartbeat_is_not_open(self):
         from datetime import datetime, timedelta
         old = (datetime.now() - timedelta(hours=2)).isoformat(sep=" ", timespec="seconds")
         self.assertFalse(zl.is_open_now({"running": True, "last_seen": old}))
-
-    def test_repeated_update_errors_logged_once(self):
-        log = self.log()
-        log.update_failed("No answer")
-        log.update_failed("No answer")
-        log.update_failed("Something else")
-        self.assertEqual(len(log.read()["events"]), 2)
 
     def test_events_are_capped(self):
         log = self.log()

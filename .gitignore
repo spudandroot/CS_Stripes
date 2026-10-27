@@ -5,6 +5,7 @@ build/
 dist/
 *.spec
 stripes_version.py
+version_info.txt
 # Company-specific config never goes in this public repo (examples/config is the template)
 /printers.json
 /stock.json

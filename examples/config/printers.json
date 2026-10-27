@@ -1,8 +1,6 @@
 {
   "printers": [
-    {"name": "Packing ZD420", "host": "192.0.2.10", "model": "ZD420", "dpi": 203, "stock": "2x1-gap",
-     "expected": {"print_width": 406, "media": "gap", "print_mode": "tear-off", "darkness": 10, "speed": 6}},
-    {"name": "Pallets ZT410", "host": "192.0.2.20", "model": "ZT410", "dpi": 203, "stock": "3x3-mark",
-     "expected": {"print_width": 610, "media": "mark", "print_mode": "peel-off", "darkness": 9.7, "speed": 6}}
+    {"name": "Packing ZD420", "host": "192.0.2.10", "model": "ZD420", "dpi": 203, "stock": "2x1-gap"},
+    {"name": "Pallets ZT410", "host": "192.0.2.20", "model": "ZT410", "dpi": 203, "stock": "3x3-mark"}
   ]
 }

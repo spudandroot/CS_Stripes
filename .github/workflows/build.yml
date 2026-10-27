@@ -1,8 +1,15 @@
 name: Build
 
-# Every push is tested and built. To publish a release (which every copy of
-# Stripes then updates itself to), either push a version tag like v1.2.0, or use
-# Actions > Build > Run workflow and type the version.
+# Every push is tested and built. To publish a release, either push a version tag
+# like v1.2.0, or use Actions > Build > Run workflow and type the version. Only
+# commits on main can be released; the build refuses anything else. Stripes
+# doesn't update itself: IT puts the release's Stripes.exe on the share and Group
+# Policy copies it to PCs (see README).
+#
+# Releases are code-signed with Azure Artifact Signing (account ArrowfarmsSigning,
+# profile Stripes-Signing). Only the sign job can sign: it runs in the "release"
+# environment, whose secrets hold the Azure IDs, and Azure only accepts that environment.
+# "Sign only" signs a build without publishing it, to test signing.
 on:
   push:
     branches: [main]
@@ -11,9 +18,13 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Version to release, e.g. v1.2.0 (leave empty to just build)"
+        description: "Version to release, e.g. v1.2.0 (empty: just build)"
         required: false
         default: ""
+      sign:
+        description: "Sign only (test signing without publishing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -21,8 +32,12 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.stamp.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history, to check that a release is on main
 
       - uses: actions/setup-python@v5
         with:
@@ -35,6 +50,7 @@ jobs:
         run: python -m unittest -v
 
       - name: Stamp version
+        id: stamp
         shell: pwsh
         env:
           RELEASE: ${{ inputs.release }}
@@ -43,25 +59,88 @@ jobs:
                elseif ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
                else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
           if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.2.0" }
-          "VERSION = `"$v`"" | Out-File -Encoding utf8 stripes_version.py
-          "STRIPES_VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          if ($env:RELEASE -or $env:GITHUB_REF_TYPE -eq "tag") {
+            git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+            if ($LASTEXITCODE) { throw "Only main is released. Merge into main first, then release from main." }
+          }
+          python make_version.py $v
+          if ($LASTEXITCODE) { throw "make_version.py failed" }
+          "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
       - name: Build Stripes.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" stripes.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --hidden-import pystray._win32 --version-file version_info.txt stripes.py
 
-      - name: Checksum and version files
+      # The exe is windowed, so it can't print errors: have it load everything it needs
+      # (Tk, Pillow, the tray) and write what it is to a file, before anything is published.
+      - name: Check the exe starts
         shell: pwsh
         run: |
-          (Get-FileHash dist\Stripes.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii -NoNewline dist\Stripes.exe.sha256
-          $env:STRIPES_VERSION | Out-File -Encoding ascii -NoNewline dist\version.txt
+          $out = Join-Path $PWD "self-check.txt"
+          Start-Process -FilePath dist\Stripes.exe -ArgumentList "--self-check", "`"$out`"" -Wait
+          $got = Get-Content $out -ErrorAction SilentlyContinue
+          if ($got -ne "ok ${{ steps.stamp.outputs.version }}") { throw "Stripes.exe self-check failed: '$got'" }
+          Write-Output $got
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Stripes
+          name: Stripes-${{ steps.stamp.outputs.version }}-unsigned
+          path: dist/Stripes.exe
+
+  sign:
+    needs: build
+    if: github.ref_type == 'tag' || inputs.release != '' || inputs.sign
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      STRIPES_VERSION: ${{ needs.build.outputs.version }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Stripes-${{ env.STRIPES_VERSION }}-unsigned
+          path: dist
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Stripes.exe
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: ArrowfarmsSigning
+          certificate-profile-name: Stripes-Signing
+          files: ${{ github.workspace }}\dist\Stripes.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist\Stripes.exe
+          Write-Output "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne "Valid") { throw "Stripes.exe is not validly signed: $($sig.StatusMessage)" }
+
+      # Stripes.exe keeps its plain name so it can go straight onto the share that
+      # Group Policy copies from. Stripes-<version>.exe is the same file, for people.
+      - name: Versioned copy
+        shell: pwsh
+        run: Copy-Item dist\Stripes.exe "dist\Stripes-$env:STRIPES_VERSION.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stripes-${{ env.STRIPES_VERSION }}
           path: dist/*
 
       - name: Publish release
         if: github.ref_type == 'tag' || inputs.release != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes
+        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe "dist/Stripes-${{ env.STRIPES_VERSION }}.exe" --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes
