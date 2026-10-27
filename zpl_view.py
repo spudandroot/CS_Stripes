@@ -322,8 +322,10 @@ def _emit(view, st, label, field_end):
             align = {"C": "center", "R": "right"}.get(just, "left")
             lines = _wrap(data.replace("\\&", "\n"), width, fh)[:max_lines]
             top = y if kind == "FO" else y - fh
+            # the printer puts ^FB-centered text left of center; show it where it prints
+            left = x - round(ld.FB_CENTER_SHIFT * fh) if align == "center" else x
             for i, line in enumerate(lines):
-                marks.append(ld.Mark("text", x, top + i * (fh + spacing), width, fh,
+                marks.append(ld.Mark("text", left, top + i * (fh + spacing), width, fh,
                                      text=line, text_h=fh, align=align))
         else:
             width = max(1, int(ld.text_em(data) * fw))

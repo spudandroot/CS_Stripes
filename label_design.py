@@ -30,6 +30,29 @@ _WEIGHTS = {"text": 1.0, "barcode": 1.4, "qr": 2.2, "image": 2.2}
 _MIN_IN = {"barcode": 0.25, "qr": 0.3, "image": 0.2}
 _MAX_IN = {"barcode": 1.0}
 
+# Zebra font 0, as measured on labelary.com and a real printer, in fractions of the
+# font height: capitals run from the top of the field to the baseline at CAP_HEIGHT.
+CAP_HEIGHT = 0.75
+# Advance width of each character in Zebra font 0, as a fraction of its height, measured
+# from labelary.com renders (which match the printers). Used to draw the preview.
+FONT0_WIDTHS = {
+    ' ': 0.296, '!': 0.294, '"': 0.48, '#': 0.48, '$': 0.48, '%': 0.904, '&': 0.608, "'": 0.294,
+    '(': 0.294, ')': 0.294, '*': 0.48, '+': 0.904, ',': 0.294, '-': 0.904, '.': 0.294, '/': 0.294,
+    '0': 0.48, '1': 0.48, '2': 0.48, '3': 0.48, '4': 0.48, '5': 0.48, '6': 0.48, '7': 0.48,
+    '8': 0.48, '9': 0.48, ':': 0.294, ';': 0.294, '<': 0.996, '=': 0.904, '>': 0.996, '?': 0.442,
+    '@': 0.904, 'A': 0.554, 'B': 0.554, 'C': 0.534, 'D': 0.59, 'E': 0.498, 'F': 0.498, 'G': 0.59,
+    'H': 0.608, 'I': 0.278, 'J': 0.442, 'K': 0.554, 'L': 0.48, 'M': 0.756, 'N': 0.608, 'O': 0.572,
+    'P': 0.554, 'Q': 0.572, 'R': 0.59, 'S': 0.534, 'T': 0.498, 'U': 0.608, 'V': 0.534, 'W': 0.812,
+    'X': 0.554, 'Y': 0.554, 'Z': 0.498, '[': 0.294, '\\': 0.48, ']': 0.294, '^': 0.498, '_': 0.498,
+    '`': 0.294, 'a': 0.462, 'b': 0.498, 'c': 0.442, 'd': 0.498, 'e': 0.48, 'f': 0.278, 'g': 0.498,
+    'h': 0.498, 'i': 0.258, 'j': 0.258, 'k': 0.442, 'l': 0.258, 'm': 0.756, 'n': 0.498, 'o': 0.48,
+    'p': 0.498, 'q': 0.498, 'r': 0.332, 's': 0.424, 't': 0.278, 'u': 0.498, 'v': 0.442, 'w': 0.664,
+    'x': 0.442, 'y': 0.442, 'z': 0.388, '{': 0.498, '|': 0.498, '}': 0.498, '~': 0.996,
+}
+# Text centered with ^FB prints this much of its height left of center (0.145-0.154
+# measured at heights 100-586), so centered fields are moved right by it.
+FB_CENTER_SHIFT = 0.15
+
 
 # --------------------------------------------------------------------------
 # Model
@@ -160,6 +183,11 @@ def char_em(c):
 
 def text_em(s):
     return sum(char_em(c) for c in s)
+
+
+def printed_em(s):
+    """Width of `s` in font 0 as printed, in font heights (text_em errs wide, for fitting)."""
+    return sum(FONT0_WIDTHS.get(c) or char_em(c) for c in s)
 
 
 def text_fit_height(text, width):
@@ -582,7 +610,8 @@ def build_zpl(rendered, shift_x=0, shift_y=0, copies=1, border=None):
         e = mk.element
         if mk.kind == "text":
             just = {"left": "L", "center": "C", "right": "R"}[mk.align]
-            out.append(f"{pos(mk.x, mk.y)}^A0N,{mk.text_h},{mk.text_h}"
+            nudge = round(FB_CENTER_SHIFT * mk.text_h) if just == "C" else 0
+            out.append(f"{pos(mk.x + nudge, mk.y)}^A0N,{mk.text_h},{mk.text_h}"
                        f"^FB{mk.w},1,0,{just},0^FH^FD{zpl_escape(mk.text)}^FS")
         elif mk.kind == "bars":
             data = zpl_escape(e.value)
