@@ -6,10 +6,12 @@ Needs pywin32 for Windows printers; everything else is standard library.
 """
 
 import copy
+import functools
 import gc
 import getpass
 import glob
 import json
+import math
 import os
 import platform
 import re
@@ -1017,6 +1019,48 @@ def pick_font_family(root):
     return "TkDefaultFont"
 
 
+# Preview text is drawn from a font file, so it can be squeezed to the printer's
+# condensed width (Tk can't stretch text). The first one found is used.
+PREVIEW_FONT_FILES = ("ARIALNB.TTF", "arialbd.ttf", "LiberationSansNarrow-Bold.ttf", "LiberationSans-Bold.ttf",
+                      "DejaVuSans-Bold.ttf")
+
+
+def find_preview_font():
+    """Path of a bold font file for the preview, or None (then Tk draws the text)."""
+    folders = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")]
+    if os.environ.get("LOCALAPPDATA"):  # fonts installed for one user
+        folders.append(os.path.join(os.environ["LOCALAPPDATA"], "Microsoft", "Windows", "Fonts"))
+    folders += glob.glob("/usr/share/fonts/**/", recursive=True)
+    for name in PREVIEW_FONT_FILES:
+        for folder in folders:
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _preview_font(path, size):
+    from PIL import ImageFont
+    return ImageFont.truetype(path, size)
+
+
+def text_image(text, height, font_file):
+    """`text` drawn the way the printer's font 0 is, at font height `height` pixels:
+    capitals from the top of the image down to the baseline at CAP_HEIGHT, squeezed
+    to the printer's condensed width. Black on transparent."""
+    from PIL import Image, ImageDraw
+    cap = -_preview_font(font_file, 200).getbbox("H", anchor="ls")[1]  # cap height at size 200
+    font = _preview_font(font_file, max(1, round(200 * ld.CAP_HEIGHT * height / cap)))
+    advance = max(1, font.getlength(text))
+    ink = Image.new("L", (math.ceil(advance) + 2, max(1, round(height * 1.1))), 0)  # room for descenders
+    ImageDraw.Draw(ink).text((1, round(ld.CAP_HEIGHT * height)), text, font=font, fill=255, anchor="ls")
+    ink = ink.resize((max(1, round(ld.printed_em(text) * height)), ink.height), Image.LANCZOS)
+    img = Image.new("RGBA", ink.size, (0, 0, 0, 255))
+    img.putalpha(ink)
+    return img
+
+
 class App(tk.Tk):
     def __init__(self, start_hidden=False):
         super().__init__()
@@ -1041,6 +1085,7 @@ class App(tk.Tk):
         self.bg = Background(self)
         self.preview_family = pick_font_family(self)
         self.measure_font = tkinter.font.Font(self, family=self.preview_family, weight="bold")
+        self.preview_font_file = find_preview_font()
         self._refresh_pending = False
         self._status_seq = 0
         self.design = ld.Design([ld.Element("text")])
@@ -2038,11 +2083,18 @@ class App(tk.Tk):
         from PIL import Image, ImageTk
         c = self.canvas
         x, y = x0 + mark.x * scale, y0 + mark.y * scale
-        if mark.kind == "text":
+        if mark.kind == "text" and self.preview_font_file:
+            img = text_image(mark.text, max(1, round(mark.text_h * scale)), self.preview_font_file)
+            box_w = mark.w * scale
+            left = {"left": x, "center": x + (box_w - img.width) / 2, "right": x + box_w - img.width}[mark.align]
+            photo = ImageTk.PhotoImage(img, master=c)
+            self._preview_images.append(photo)  # Tk only keeps a weak reference
+            c.create_image(left, y, image=photo, anchor="nw")
+        elif mark.kind == "text":
             px = max(1, round(mark.text_h * scale))
             # Screen fonts are wider than the printer's condensed font, so shrink
             # to the width the printer will actually use.
-            printed_w = ld.text_em(mark.text) * mark.text_h * scale
+            printed_w = ld.printed_em(mark.text) * mark.text_h * scale
             self.measure_font.configure(size=-px)
             screen_w = self.measure_font.measure(mark.text)
             if screen_w > printed_w > 0:

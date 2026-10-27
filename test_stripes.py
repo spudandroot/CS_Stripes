@@ -443,6 +443,21 @@ class SingleInstanceTests(unittest.TestCase):
         self.assertEqual(got, [])
 
 
+class PreviewTextTests(unittest.TestCase):
+    def test_drawn_like_font_0(self):
+        font = zl.find_preview_font()
+        if not font:
+            self.skipTest("no preview font on this machine")
+        img = zl.text_image("H", 200, font)
+        left, top, right, bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()
+        self.assertLessEqual(top, 3)  # capitals start at the top of the field...
+        self.assertAlmostEqual(bottom, 150, delta=4)  # ...and sit on the baseline at 75%
+        self.assertEqual(img.width, round(ld.printed_em("H") * 200))  # the printer's condensed width
+        img = zl.text_image("g", 200, font)
+        bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()[3]
+        self.assertTrue(170 < bottom < img.height)  # the descender shows, not cut off
+
+
 class VersionTests(unittest.TestCase):
     def test_versions(self):
         self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2))

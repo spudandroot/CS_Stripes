@@ -176,7 +176,19 @@ class ZplTests(unittest.TestCase):
         r = ld.render(ld.Design([text("Hi")]), TWO_BY_ONE)
         zpl = ld.build_zpl(r, shift_x=10, shift_y=-5, border=(406, 203))
         self.assertIn("^FO10,0^GB406,203,3^FS", zpl)
-        self.assertIn(f"^FO{r.marks[0].x + 10},{r.marks[0].y - 5}^A0N", zpl)
+        nudge = round(ld.FB_CENTER_SHIFT * r.marks[0].text_h)  # "Hi" is centered
+        self.assertIn(f"^FO{r.marks[0].x + 10 + nudge},{r.marks[0].y - 5}^A0N", zpl)
+
+    def test_printed_widths(self):
+        self.assertAlmostEqual(ld.printed_em("Lot 7"), 0.48 + 0.48 + 0.278 + 0.296 + 0.48)
+        self.assertEqual(ld.printed_em("ñ"), ld.char_em("ñ"))  # not measured: the estimate
+
+    def test_centered_text_nudged_right(self):
+        # Zebra prints ^FB-centered text 15% of its height left of center (measured)
+        for align, share in (("left", 0), ("center", 0.15), ("right", 0)):
+            r = ld.render(ld.Design([text("g", align=align, size_pt=72)]), THREE_BY_THREE)
+            mk = r.marks[0]
+            self.assertIn(f"^FO{mk.x + round(share * mk.text_h)},{mk.y}^A0N,{mk.text_h},", ld.build_zpl(r))
 
 
 class PictureTests(unittest.TestCase):
