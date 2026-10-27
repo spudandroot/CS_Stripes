@@ -103,11 +103,15 @@ Releases are code-signed (Azure Artifact Signing, "Arrow Farms, Inc.").
 Then download its `Stripes.exe`, **Unblock** it, and put it on the share in place of the old one.
 PCs get it at their next logon, or the next Group Policy refresh while Stripes is closed.
 
+Every build carries its version: the release also has `Stripes-v1.4.0.exe` (the same file; use the
+plain `Stripes.exe` for the share, since that's the name Group Policy copies), build artifacts are
+named `Stripes-<version>`, and the exe's **Properties > Details** shows the version.
+
 ## Development
 
 ```
 python -m pip install -r requirements.txt
 python stripes.py          # run from source
 python -m unittest -v      # tests
-build.bat                  # local Stripes.exe build (needs Python from python.org)
+build.bat v1.2.0           # local build, dist\Stripes-v1.2.0.exe (needs Python from python.org)
 ```

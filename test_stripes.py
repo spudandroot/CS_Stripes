@@ -246,9 +246,9 @@ class CompanyConfigTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def folder(self, printers=None, stock=None, encoding="utf-8", beta=None):
+    def folder(self, printers=None, stock=None, encoding="utf-8"):
         d = tempfile.mkdtemp(dir=self.tmp)
-        for name, content in (("printers.json", printers), ("stock.json", stock), ("beta.json", beta)):
+        for name, content in (("printers.json", printers), ("stock.json", stock)):
             if content is not None:
                 with open(os.path.join(d, name), "w", encoding=encoding) as f:
                     f.write(content)
@@ -285,14 +285,6 @@ class CompanyConfigTests(unittest.TestCase):
         self.assertEqual(cfg.printers[1].stock, "")  # unknown stock dropped, printer kept
         self.assertEqual([s.id for s in cfg.stock], ["s1"])
         self.assertEqual(len(cfg.problems), 8)
-
-    def test_beta_list(self):
-        d = self.folder(printers='{"printers": []}', beta='{"beta": ["ARROW01", " jdoe "]}')
-        self.assertEqual(self.load(d).beta, ["ARROW01", "jdoe"])
-        self.assertEqual(self.load(self.folder(printers='{"printers": []}')).beta, [])  # no file: nobody
-        cfg = self.load(self.folder(printers='{"printers": []}', beta='{"beta": "ARROW01"}'))
-        self.assertEqual(cfg.beta, [])
-        self.assertIn("beta.json", cfg.problems[0])
 
     def test_stock_file_optional(self):
         cfg = self.load(self.folder(printers='{"printers": [{"name": "A", "host": "192.0.2.1"}]}'))
@@ -453,14 +445,10 @@ class SingleInstanceTests(unittest.TestCase):
 
 class VersionTests(unittest.TestCase):
     def test_versions(self):
-        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2, 1, 0))
+        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2))
         self.assertIsNone(zl.parse_version("dev-abc1234"))
-        # a beta sorts after the release before it and before its own release
-        self.assertLess(zl.parse_version("v1.3.0"), zl.parse_version("v1.4.0-beta.1"))
-        self.assertLess(zl.parse_version("v1.4.0-beta.2"), zl.parse_version("v1.4.0-beta.10"))
-        self.assertLess(zl.parse_version("v1.4.0-beta.10"), zl.parse_version("v1.4.0"))
+        self.assertIsNone(zl.parse_version("v1.4.0-beta.2"))  # betas are gone
         self.assertLess(zl.parse_version("v1.9.9"), zl.parse_version("v1.10.0"))  # not a text comparison
-        self.assertEqual(zl.display_version("v1.4.0-beta.2"), "v1.4.0 Beta 2")
 
     def test_old_copies_cleaned_up(self):
         d = tempfile.mkdtemp()
@@ -489,17 +477,26 @@ class DeploymentLogTests(unittest.TestCase):
         first_seen = r["first_seen"]
 
         log.started("v1.2.0", "x")  # plain restart: no new event
-        log.write("Downloaded v1.3.0; finishes when Stripes restarts", pending_update="v1.3.0")
-        log.started("v1.3.0", "x")
+        log.started("v1.3.0", "x")  # Group Policy copied a new exe
         r = log.read()
         self.assertEqual(r["first_seen"], first_seen)
-        self.assertEqual((r["version"], r["pending_update"]), ("v1.3.0", None))
+        self.assertEqual(r["version"], "v1.3.0")
         self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.2.0", "v1.3.0"))
         self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v1.2.0 -> v1.3.0")
 
         self.assertTrue(zl.is_open_now(r))
         log.write(running=False, last_closed=zl._now())
         self.assertFalse(zl.is_open_now(log.read()))
+
+    def test_self_update_fields_dropped(self):
+        log = self.log()
+        with open(log.path, "w", encoding="utf-8") as f:  # written by a build that updated itself
+            f.write('{"version": "v1.4.0-beta.2", "beta": true, "pending_update": "v1.4.0",'
+                    ' "last_update_error": {"message": "offline"}}')
+        log.started("v1.5.0", "x")
+        r = log.read()
+        self.assertEqual(r["version"], "v1.5.0")
+        self.assertFalse({"beta", "pending_update", "last_update_error"} & set(r))
 
     def test_stale_heartbeat_is_not_open(self):
         from datetime import datetime, timedelta

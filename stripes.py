@@ -124,7 +124,6 @@ class CompanyConfig:
     source: str = None     # where it was read from
     problems: list = field(default_factory=list)
     cached_at: str = None  # set when the server was unreachable and the saved copy is in use
-    beta: list = None      # computers and users who get beta versions; None when unknown
 
 
 def settings_path():
@@ -206,26 +205,10 @@ def _entries(data, key):
     return data.get(key, []) if isinstance(data, dict) else []
 
 
-def parse_beta(folder, problems):
-    """The computer and user names in beta.json (optional): {"beta": ["ARROW01", "jsmith"]}."""
-    try:
-        data = _read_json(os.path.join(folder, "beta.json"))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as e:
-        problems.append(tr("Could not read beta.json: {error}", error=e))
-        return []
-    names = data.get("beta") if isinstance(data, dict) else None
-    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
-        problems.append(tr('beta.json should look like {"beta": ["COMPUTER", "username"]}'))
-        return []
-    return [n.strip() for n in names if n.strip()]
-
-
 def parse_config(folder):
-    """Read printers.json and the optional stock.json and beta.json from a folder.
+    """Read printers.json and the optional stock.json from a folder.
 
-    Returns (printers, stock, beta, problems). Raises OSError/ValueError if
+    Returns (printers, stock, problems). Raises OSError/ValueError if
     printers.json itself can't be read; bad entries are skipped and listed in problems.
     """
     problems = []
@@ -275,14 +258,14 @@ def parse_config(folder):
                 p.stock = ""
         names.add(p.name)
         printers.append(p)
-    return printers, stock, parse_beta(folder, problems), problems
+    return printers, stock, problems
 
 
 def save_cache(folder):
     """Keep a copy of the server's config so the app works when the server is down."""
     cache = cache_folder()
     os.makedirs(cache, exist_ok=True)
-    for name in ("printers.json", "stock.json", "beta.json"):
+    for name in ("printers.json", "stock.json"):
         src, dst = os.path.join(folder, name), os.path.join(cache, name)
         if os.path.exists(src):
             shutil.copyfile(src, dst + ".tmp")
@@ -295,12 +278,12 @@ def load_cached_config(folder):
     """The saved copy of the server's config, or None if there isn't one."""
     cache = cache_folder()
     try:
-        printers, stock, beta, problems = parse_config(cache)
+        printers, stock, problems = parse_config(cache)
         stamp = os.path.getmtime(os.path.join(cache, "printers.json"))
     except (OSError, ValueError):
         return None
     return CompanyConfig(printers, stock, folder, problems,
-                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"), beta=beta)
+                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"))
 
 
 def load_company_config():
@@ -311,7 +294,7 @@ def load_company_config():
     folder = configured_folder()
     if folder:
         try:
-            printers, stock, beta, problems = parse_config(folder)
+            printers, stock, problems = parse_config(folder)
         except (OSError, ValueError) as e:
             cached = load_cached_config(folder)
             if cached:
@@ -324,16 +307,16 @@ def load_company_config():
             save_cache(folder)
         except OSError:
             pass  # the app still works, just without an offline copy
-        return CompanyConfig(printers, stock, folder, problems, beta=beta)
+        return CompanyConfig(printers, stock, folder, problems)
     for local in local_folders():
         if os.path.exists(os.path.join(local, "printers.json")):
             try:
-                printers, stock, beta, problems = parse_config(local)
+                printers, stock, problems = parse_config(local)
             except (OSError, ValueError) as e:
                 path = os.path.join(local, "printers.json")
                 return CompanyConfig(source=local, problems=[tr("Could not read {path}: {error}", path=path, error=e)])
-            return CompanyConfig(printers, stock, local, problems, beta=beta)
-    return CompanyConfig(beta=[])  # no company settings at all: nobody is on beta
+            return CompanyConfig(printers, stock, local, problems)
+    return CompanyConfig()
 
 
 def merge_printers(company, personal):
@@ -793,6 +776,7 @@ class DeploymentLog:
     the installed version, updates and a heartbeat while Stripes is open."""
 
     MAX_EVENTS = 50
+    OBSOLETE = ("pending_update", "last_update_error", "beta")  # left by builds that updated themselves
 
     def __init__(self, folder, computer=None, user=None):
         self.folder = folder
@@ -816,6 +800,8 @@ class DeploymentLog:
             if not os.path.isdir(self.folder):
                 return False
             record = self.read()
+            for key in self.OBSOLETE:
+                record.pop(key, None)
             now = _now()
             record.setdefault("first_seen", now)
             record.update(computer=self.computer, user=self.user, last_seen=now, **fields)
@@ -830,7 +816,7 @@ class DeploymentLog:
 
     def started(self, version, exe):
         previous = self.read().get("version")
-        fields = dict(version=version, exe=exe, last_start=_now(), running=True, pending_update=None,
+        fields = dict(version=version, exe=exe, last_start=_now(), running=True,
                       windows=platform.platform())
         if previous is None:
             event = f"Installed ({version})"
@@ -884,23 +870,9 @@ def remove_download_mark(path):
 # --------------------------------------------------------------------------
 
 def parse_version(text):
-    """'v1.2.3' -> (1, 2, 3, 1, 0) and 'v1.2.3-beta.4' -> (1, 2, 3, 0, 4), so betas sort
-    before their release; None for anything else (e.g. development builds)."""
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?", (text or "").strip())
-    if not m:
-        return None
-    major, minor, patch, beta = m.groups()
-    return int(major), int(minor), int(patch), 0 if beta else 1, int(beta or 0)
-
-
-def is_beta_version(text):
-    v = parse_version(text)
-    return bool(v) and v[3] == 0
-
-
-def display_version(text):
-    """'v1.4.0-beta.2' -> 'v1.4.0 Beta 2'."""
-    return re.sub(r"-beta\.(\d+)$", r" Beta \1", text or "")
+    """'v1.2.3' -> (1, 2, 3); None for anything else (e.g. development builds)."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
+    return tuple(int(n) for n in m.groups()) if m else None
 
 
 def remove_old_versions(exe_path):
@@ -1050,7 +1022,7 @@ class App(tk.Tk):
         super().__init__()
         if start_hidden:
             self.withdraw()  # starting at logon: just the tray icon
-        self.title(f"{APP_NAME} {display_version(VERSION)}")
+        self.title(f"{APP_NAME} {VERSION}")
         self.minsize(900, 640)
         try:
             self.iconbitmap(default=resource_path(os.path.join("assets", "icon.ico")))
@@ -1225,8 +1197,7 @@ class App(tk.Tk):
         for code, name in i18n.LANGUAGES:
             ttk.Radiobutton(switch, text=name, value=code, variable=self.v_language, style="Toolbutton",
                             command=self._language_changed).pack(side="left")
-        self.update_label = ttk.Label(corner, text=tr("Version {version}", version=display_version(VERSION)),
-                                      style="Warn.TLabel" if is_beta_version(VERSION) else "Muted.TLabel")
+        self.update_label = ttk.Label(corner, text=tr("Version {version}", version=VERSION), style="Muted.TLabel")
         self.update_label.pack(anchor="e", pady=(4, 0))
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
@@ -1583,7 +1554,7 @@ class App(tk.Tk):
         self.save()
         self._retranslate(self)
         # Text the app works out as it goes
-        self.update_label.configure(text=tr("Version {version}", version=display_version(VERSION)))
+        self.update_label.configure(text=tr("Version {version}", version=VERSION))
         current = self.stock_box.current()
         self.stock_box["values"] = self._stock_labels()
         if current >= 0:
@@ -2705,7 +2676,6 @@ class DeploymentWindow(tk.Toplevel):
     """Every PC/user running Stripes, from the shared status folder."""
 
     COLUMNS = (("computer", N_("Computer"), 110), ("user", N_("User"), 100), ("version", N_("Version"), 110),
-               ("channel", N_("Channel"), 60),
                ("status", N_("Status"), 85), ("last_seen", N_("Last seen"), 125),
                ("last_update", N_("Last update"), 230),
                ("first_seen", N_("Installed"), 125), ("notes", N_("Notes"), 280))
@@ -2733,7 +2703,6 @@ class DeploymentWindow(tk.Toplevel):
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.tag_configure("behind", foreground="#b45309")
-        self.tree.tag_configure("problem", foreground="#b91c1c")
         self.tree.bind("<Double-1>", lambda e: self._show_history())
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(8, 0))
@@ -2754,44 +2723,34 @@ class DeploymentWindow(tk.Toplevel):
                                            error=describe_error(error)))
             return
         self.records = records
-        # "Behind" compares with the newest release; beta PCs are ahead on purpose
-        releases = [r.get("version") for r in records if parse_version(r.get("version"))
-                    and not is_beta_version(r.get("version"))]
-        if parse_version(VERSION) and not is_beta_version(VERSION):
-            releases.append(VERSION)
-        latest = max(releases, key=parse_version, default=None)
+        # "Behind" compares with the newest version seen (normally the one on the share)
+        versions = [parse_version(r.get("version")) for r in records] + [parse_version(VERSION)]
+        newest = max(filter(None, versions), default=None)
         self.tree.delete(*self.tree.get_children())
-        behind = open_now = on_beta_now = 0
+        behind = on_newest = open_now = 0
         for i, r in enumerate(records):
             v = parse_version(r.get("version"))
             is_open = is_open_now(r)
             open_now += is_open
-            beta = bool(r.get("beta")) or is_beta_version(r.get("version"))
-            on_beta_now += beta
+            on_newest += bool(v) and v == newest
             notes, tag = [], ()
-            if v and latest and v < parse_version(latest) and not beta:
+            if v and v < newest:
                 behind += 1
                 tag = ("behind",)
-            if r.get("pending_update"):
-                notes.append(tr("{version} downloaded, waiting for restart", version=r['pending_update']))
-            error = r.get("last_update_error")
-            if isinstance(error, dict) and error.get("message"):
-                notes.append(tr("Update problem: {error}", error=error['message']))
-                tag = ("problem",)
             if r.get("config", "server") != "server":
                 notes.append(tr("Settings: {source}", source=r.get('config')))
             update = r.get("last_update") or {}
             last_update = (f"{update.get('from')} → {update.get('to')}  ({_short_time(update.get('at'))})"
                            if update else "")
             self.tree.insert("", "end", iid=str(i), tags=tag, values=(
-                r.get("computer", ""), r.get("user", ""), display_version(r.get("version", "")),
-                tr("Beta") if beta else tr("Release"), tr("Open now") if is_open else tr("Closed"),
+                r.get("computer", ""), r.get("user", ""), r.get("version", ""),
+                tr("Open now") if is_open else tr("Closed"),
                 _short_time(r.get("last_seen")), last_update,
                 _short_time(r.get("first_seen")), "; ".join(notes)))
         parts = [tr("{n} installs", n=len(records)), tr("{n} open now", n=open_now)]
-        if latest:
-            parts.append(tr("{n} on {version}", n=len(records) - behind - on_beta_now, version=latest))
-        parts += [tr("{n} behind", n=behind)] + ([tr("{n} on beta", n=on_beta_now)] if on_beta_now else [])
+        if newest:
+            parts.append(tr("{n} on {version}", n=on_newest, version="v" + ".".join(map(str, newest))))
+        parts.append(tr("{n} behind", n=behind))
         self.summary.configure(text="  ·  ".join(parts))
 
     def _show_history(self):

@@ -1,12 +1,9 @@
 name: Build
 
-# Every push is tested and built. To publish a release (which every copy of
-# Stripes then updates itself to), either push a version tag like v1.2.0, or use
-# Actions > Build > Run workflow and type the version.
-#
-# A version like v1.4.0-beta.1 is a beta: it's published as a pre-release, and the
-# "beta" release (which only holds version.txt) is pointed at it. Only PCs and users
-# listed in beta.json follow it. Betas can be run from any branch.
+# Every push is tested and built. To publish a release, either push a version tag
+# like v1.2.0, or use Actions > Build > Run workflow and type the version. Stripes
+# doesn't update itself: IT puts the release's Stripes.exe on the share and Group
+# Policy copies it to PCs (see README).
 #
 # Releases are code-signed with Azure Artifact Signing (account ArrowfarmsSigning,
 # profile Stripes-Signing). Only the sign job can sign: it runs in the "release"
@@ -20,17 +17,13 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Version to release, e.g. v1.2.0, or v1.3.0-beta.1 for beta PCs only (empty: just build)"
+        description: "Version to release, e.g. v1.2.0 (empty: just build)"
         required: false
         default: ""
       sign:
         description: "Sign only (test signing without publishing)"
         type: boolean
         default: false
-      latest:
-        description: "Make it the latest release, so every PC updates to it (untick to publish without rolling out)"
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -62,14 +55,13 @@ jobs:
           $v = if ($env:RELEASE) { $env:RELEASE }
                elseif ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
                else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
-          if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+(-beta\.\d+)?$') {
-            throw "Version must look like v1.2.0 or v1.2.0-beta.1"
-          }
-          "VERSION = `"$v`"" | Out-File -Encoding utf8 stripes_version.py
+          if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.2.0" }
+          python make_version.py $v
+          if ($LASTEXITCODE) { throw "make_version.py failed" }
           "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
       - name: Build Stripes.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --hidden-import pystray._win32 stripes.py
+        run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --hidden-import pystray._win32 --version-file version_info.txt stripes.py
 
       # The exe is windowed, so it can't print errors: have it load everything it needs
       # (Tk, Pillow, the tray) and write what it is to a file, before anything is published.
@@ -84,7 +76,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Stripes-unsigned
+          name: Stripes-${{ steps.stamp.outputs.version }}-unsigned
           path: dist/Stripes.exe
 
   sign:
@@ -101,7 +93,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: Stripes-unsigned
+          name: Stripes-${{ env.STRIPES_VERSION }}-unsigned
           path: dist
 
       - name: Azure login
@@ -129,37 +121,19 @@ jobs:
           Write-Output "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)"
           if ($sig.Status -ne "Valid") { throw "Stripes.exe is not validly signed: $($sig.StatusMessage)" }
 
-      - name: Checksum and version files
+      # Stripes.exe keeps its plain name so it can go straight onto the share that
+      # Group Policy copies from. Stripes-<version>.exe is the same file, for people.
+      - name: Versioned copy
         shell: pwsh
-        run: |
-          (Get-FileHash dist\Stripes.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii -NoNewline dist\Stripes.exe.sha256
-          $env:STRIPES_VERSION | Out-File -Encoding ascii -NoNewline dist\version.txt
+        run: Copy-Item dist\Stripes.exe "dist\Stripes-$env:STRIPES_VERSION.exe"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Stripes-signed
+          name: Stripes-${{ env.STRIPES_VERSION }}
           path: dist/*
 
       - name: Publish release
-        if: (github.ref_type == 'tag' || inputs.release != '') && !contains(env.STRIPES_VERSION, '-beta.')
+        if: github.ref_type == 'tag' || inputs.release != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes --latest=${{ inputs.latest != false }}
-
-      - name: Publish beta
-        if: (github.ref_type == 'tag' || inputs.release != '') && contains(env.STRIPES_VERSION, '-beta.')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          V: ${{ env.STRIPES_VERSION }}
-        run: |
-          gh release create $env:V dist/Stripes.exe dist/Stripes.exe.sha256 dist/version.txt --target "${{ github.sha }}" --title "Stripes $env:V" --generate-notes --prerelease
-          if ($LASTEXITCODE) { exit 1 }
-          # Point the beta channel at it: beta PCs read beta/version.txt, then download from the release above
-          gh release view beta *> $null
-          if ($LASTEXITCODE) {
-            gh release create beta dist/version.txt --target "${{ github.sha }}" --prerelease --title "Beta channel" --notes "Holds the version beta PCs should run. Don't delete."
-          } else {
-            gh release upload beta dist/version.txt --clobber
-          }
-          if ($LASTEXITCODE) { exit 1 }
+        run: gh release create "${{ env.STRIPES_VERSION }}" dist/Stripes.exe "dist/Stripes-${{ env.STRIPES_VERSION }}.exe" --target "${{ github.sha }}" --title "Stripes ${{ env.STRIPES_VERSION }}" --generate-notes
