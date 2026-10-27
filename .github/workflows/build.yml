@@ -1,7 +1,8 @@
 name: Build
 
 # Every push is tested and built. To publish a release, either push a version tag
-# like v1.2.0, or use Actions > Build > Run workflow and type the version. Stripes
+# like v1.2.0, or use Actions > Build > Run workflow and type the version. Only
+# commits on main can be released; the build refuses anything else. Stripes
 # doesn't update itself: IT puts the release's Stripes.exe on the share and Group
 # Policy copies it to PCs (see README).
 #
@@ -35,6 +36,8 @@ jobs:
       version: ${{ steps.stamp.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history, to check that a release is on main
 
       - uses: actions/setup-python@v5
         with:
@@ -56,6 +59,10 @@ jobs:
                elseif ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
                else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
           if ($env:RELEASE -and $env:RELEASE -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.2.0" }
+          if ($env:RELEASE -or $env:GITHUB_REF_TYPE -eq "tag") {
+            git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+            if ($LASTEXITCODE) { throw "Only main is released. Merge into main first, then release from main." }
+          }
           python make_version.py $v
           if ($LASTEXITCODE) { throw "make_version.py failed" }
           "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT

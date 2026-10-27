@@ -97,8 +97,9 @@ table. Without the folder, nothing is written.
 ## Releasing a new version
 
 Every push to `main` is tested and built by GitHub Actions on Windows. To make a release: on GitHub
-go to **Actions > Build > Run workflow**, type the version (e.g. `v1.4.0`) and click **Run workflow**.
-Releases are code-signed (Azure Artifact Signing, "Arrow Farms, Inc.").
+go to **Actions > Build > Run workflow**, leave the branch on `main`, type the version (e.g. `v1.4.0`)
+and click **Run workflow**. Releases are code-signed (Azure Artifact Signing, "Arrow Farms, Inc.").
+Only commits on `main` can be released; the build refuses to publish anything else.
 
 Then download its `Stripes.exe`, **Unblock** it, and put it on the share in place of the old one.
 PCs get it at their next logon, or the next Group Policy refresh while Stripes is closed.
