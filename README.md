@@ -16,7 +16,7 @@ A small Windows app for designing and printing labels on Zebra printers.
   which printer it is, with everything else behind **More info**.
 
 Download the latest `Stripes.exe` from **[Releases](../../releases/latest)**. It's a single file;
-nothing to install.
+nothing to install. Needs Windows 10 or 11.
 
 ## Company settings (printers and label stock)
 
@@ -97,11 +97,16 @@ table. Without the folder, nothing is written.
 ## Releasing a new version
 
 Every push to `main` is tested and built by GitHub Actions on Windows. To make a release: on GitHub
-go to **Actions > Build > Run workflow**, type the version (e.g. `v1.4.0`) and click **Run workflow**.
-Releases are code-signed (Azure Artifact Signing, "Arrow Farms, Inc.").
+go to **Actions > Build > Run workflow**, leave the branch on `main`, type the version (e.g. `v1.4.0`)
+and click **Run workflow**. Releases are code-signed (Azure Artifact Signing, "Arrow Farms, Inc.").
+Only commits on `main` can be released; the build refuses to publish anything else.
 
 Then download its `Stripes.exe`, **Unblock** it, and put it on the share in place of the old one.
 PCs get it at their next logon, or the next Group Policy refresh while Stripes is closed.
+
+Every build carries its version: the release also has `Stripes-v1.4.0.exe` (the same file; use the
+plain `Stripes.exe` for the share, since that's the name Group Policy copies), build artifacts are
+named `Stripes-<version>`, and the exe's **Properties > Details** shows the version.
 
 ## Development
 
@@ -109,5 +114,9 @@ PCs get it at their next logon, or the next Group Policy refresh while Stripes i
 python -m pip install -r requirements.txt
 python stripes.py          # run from source
 python -m unittest -v      # tests
-build.bat                  # local Stripes.exe build (needs Python from python.org)
+build.bat v1.2.0           # local build, dist\Stripes-v1.2.0.exe (needs Python from python.org)
 ```
+
+What goes into the exe is set in `pyinstaller.spec`, which leaves out parts of Python, Pillow and Tcl
+that Stripes doesn't use. If you add a library or a picture format, check the build's self-check
+(`Stripes.exe --self-check out.txt`) still says `ok`.
