@@ -121,6 +121,8 @@ ES = {
     "Pictures": "Imágenes",
     "All files": "Todos los archivos",
     "Couldn't open that picture:\n{error}": "No se pudo abrir esa imagen:\n{error}",
+    "That picture's format can't be read. Save it as PNG or JPG and try again.":
+        "No se puede leer el formato de esa imagen. Guárdela como PNG o JPG e inténtelo de nuevo.",
     "(unreadable)": "(ilegible)",
     "(empty)": "(vacía)",
     "That recent label couldn't be loaded.": "No se pudo cargar esa etiqueta reciente.",
@@ -368,7 +370,6 @@ ES = {
     "Computer": "Equipo",
     "User": "Usuario",
     "Version": "Versión",
-    "Channel": "Canal",
     "Last seen": "Última vez visto",
     "Last update": "Última actualización",
     "Installed": "Instalado",
@@ -378,18 +379,13 @@ ES = {
     "Refresh": "Actualizar",
     "Close": "Cerrar",
     "Couldn't read {folder}: {error}": "No se pudo leer {folder}: {error}",
-    "{version} downloaded, waiting for restart": "{version} descargada, esperando reinicio",
-    "Update problem: {error}": "Problema al actualizar: {error}",
     "Settings: {source}": "Configuración: {source}",
-    "Beta": "Beta",
-    "Release": "Estable",
     "Open now": "Abierta ahora",
     "Closed": "Cerrada",
     "{n} installs": "{n} instalaciones",
     "{n} open now": "{n} abiertas ahora",
     "{n} on {version}": "{n} en {version}",
     "{n} behind": "{n} atrasadas",
-    "{n} on beta": "{n} en beta",
     "History": "Historial",
     "No events yet.": "Todavía no hay eventos.",
 
@@ -468,10 +464,7 @@ ES = {
     "Couldn't read the company settings from {folder}: {error}":
         "No se pudo leer la configuración de la empresa en {folder}: {error}",
     "Could not read {path}: {error}": "No se pudo leer {path}: {error}",
-    "Could not read beta.json: {error}": "No se pudo leer beta.json: {error}",
     "Could not read stock.json: {error}": "No se pudo leer stock.json: {error}",
-    'beta.json should look like {"beta": ["COMPUTER", "username"]}':
-        'beta.json debe tener la forma {"beta": ["EQUIPO", "usuario"]}',
     "stock.json entry {n} skipped: {error}": "Se omitió la entrada {n} de stock.json: {error}",
     "printers.json entry {n} skipped: {error}": "Se omitió la entrada {n} de printers.json: {error}",
     "width_in and height_in must be above 0": "width_in y height_in deben ser mayores que 0",
@@ -481,6 +474,20 @@ ES = {
     "duplicate name": "nombre repetido",
     "needs a host (IP address) or windows_name": "necesita host (dirección IP) o windows_name",
     "Printer {name}: unknown stock '{stock}'": "Impresora {name}: tipo de etiqueta desconocido '{stock}'",
+    # Exact preview (Windows' own internet connection)
+    "labelary.com answered with error {status}.": "labelary.com respondió con el error {status}.",
+    "The connection timed out.": "Se agotó el tiempo de la conexión.",
+    "The server's name couldn't be found. Is this PC online?":
+        "No se encontró el nombre del servidor. ¿Esta PC tiene conexión a internet?",
+    "Couldn't connect to the server.": "No se pudo conectar con el servidor.",
+    "The secure connection failed (a certificate or proxy problem).":
+        "Falló la conexión segura (un problema de certificado o de proxy).",
+    "Windows internet error {code}.": "Error de internet de Windows {code}.",
+    # Tray
+    "Open Stripes": "Abrir Stripes",
+    "Quit Stripes": "Salir de Stripes",
+    "Stripes is still running. Click its icon to open it; right-click it to quit.":
+        "Stripes sigue abierto. Haga clic en su icono para abrirlo; haga clic derecho para salir.",
 }
 
 _ENGLISH = {spanish: english for english, spanish in ES.items()}

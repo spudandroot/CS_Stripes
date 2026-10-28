@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import socket
+import sys
 import threading
 import types
 import unittest
@@ -246,9 +247,9 @@ class CompanyConfigTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def folder(self, printers=None, stock=None, encoding="utf-8", beta=None):
+    def folder(self, printers=None, stock=None, encoding="utf-8"):
         d = tempfile.mkdtemp(dir=self.tmp)
-        for name, content in (("printers.json", printers), ("stock.json", stock), ("beta.json", beta)):
+        for name, content in (("printers.json", printers), ("stock.json", stock)):
             if content is not None:
                 with open(os.path.join(d, name), "w", encoding=encoding) as f:
                     f.write(content)
@@ -285,14 +286,6 @@ class CompanyConfigTests(unittest.TestCase):
         self.assertEqual(cfg.printers[1].stock, "")  # unknown stock dropped, printer kept
         self.assertEqual([s.id for s in cfg.stock], ["s1"])
         self.assertEqual(len(cfg.problems), 8)
-
-    def test_beta_list(self):
-        d = self.folder(printers='{"printers": []}', beta='{"beta": ["ARROW01", " jdoe "]}')
-        self.assertEqual(self.load(d).beta, ["ARROW01", "jdoe"])
-        self.assertEqual(self.load(self.folder(printers='{"printers": []}')).beta, [])  # no file: nobody
-        cfg = self.load(self.folder(printers='{"printers": []}', beta='{"beta": "ARROW01"}'))
-        self.assertEqual(cfg.beta, [])
-        self.assertIn("beta.json", cfg.problems[0])
 
     def test_stock_file_optional(self):
         cfg = self.load(self.folder(printers='{"printers": [{"name": "A", "host": "192.0.2.1"}]}'))
@@ -418,16 +411,98 @@ class CheckPrinterTests(unittest.TestCase):
                          ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
 
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_start_reaches_the_first(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        self.assertFalse(zl.SingleInstance(path).signal_running())  # nothing running yet
+        got, arrived = [], threading.Event()
+        first = zl.SingleInstance(path)
+        first.listen(lambda message: (got.append(message), arrived.set()))
+        self.addCleanup(first.close)
+        self.assertTrue(zl.SingleInstance(path).signal_running("show"))
+        self.assertTrue(arrived.wait(2))
+        self.assertEqual(got, ["show"])
+
+    def test_wrong_key_or_stale_file_is_ignored(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        got = []
+        first = zl.SingleInstance(path)
+        first.listen(got.append)
+        self.addCleanup(first.close)
+        port = open(path).read().split()[0]
+        with open(path, "w") as f:
+            f.write(f"{port} not-the-key")
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        first.close()
+        with open(path, "w") as f:
+            f.write("1 stale")  # left over after a crash: nothing listens there
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        self.assertEqual(got, [])
+
+
+class PreviewTextTests(unittest.TestCase):
+    def test_drawn_like_font_0(self):
+        font = zl.find_preview_font()
+        if not font:
+            self.skipTest("no preview font on this machine")
+        img = zl.text_image("H", 200, font)
+        left, top, right, bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()
+        self.assertLessEqual(top, 3)  # capitals start at the top of the field...
+        self.assertAlmostEqual(bottom, 150, delta=4)  # ...and sit on the baseline at 75%
+        self.assertEqual(img.width, round(ld.printed_em("H") * 200))  # the printer's condensed width
+        img = zl.text_image("g", 200, font)
+        bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()[3]
+        self.assertTrue(170 < bottom < img.height)  # the descender shows, not cut off
+
+
+class ExactPreviewTests(unittest.TestCase):
+    def test_labelary_error_is_reported(self):
+        with mock.patch.object(zl.sys, "platform", "win32"), \
+                mock.patch.object(zl, "wininet_post", return_value=(429, b"")) as post:
+            with self.assertRaisesRegex(OSError, "429"):
+                zl.labelary_png("^XA^XZ", ZT410)
+        host, path, data, headers = post.call_args.args
+        self.assertEqual((host, path, data), ("api.labelary.com", "/v1/printers/12dpmm/labels/3x3/0/", b"^XA^XZ"))
+        self.assertIn("Accept: image/png\r\n", headers)
+
+    @unittest.skipUnless(sys.platform == "win32", "WinINet is Windows only")
+    def test_wininet_post(self):
+        import http.server
+
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200 if self.path == "/echo" else 404)
+                self.end_headers()
+                self.wfile.write((self.headers.get("Accept") or "").encode() + b" " + body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Echo)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        status, body = zl.wininet_post("127.0.0.1", "/echo", b"x" * 100000, "Accept: image/png\r\n",
+                                       port=port, secure=False)
+        self.assertEqual((status, body), (200, b"image/png " + b"x" * 100000))  # read in several chunks
+        self.assertEqual(zl.wininet_post("127.0.0.1", "/nope", b"", "", port=port, secure=False)[0], 404)
+        server.shutdown()
+        server.server_close()
+        with self.assertRaises(OSError):  # nothing listening any more
+            zl.wininet_post("127.0.0.1", "/echo", b"", "", port=port, secure=False, timeout_ms=2000)
+
+
 class VersionTests(unittest.TestCase):
     def test_versions(self):
-        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2, 1, 0))
+        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2))
         self.assertIsNone(zl.parse_version("dev-abc1234"))
-        # a beta sorts after the release before it and before its own release
-        self.assertLess(zl.parse_version("v1.3.0"), zl.parse_version("v1.4.0-beta.1"))
-        self.assertLess(zl.parse_version("v1.4.0-beta.2"), zl.parse_version("v1.4.0-beta.10"))
-        self.assertLess(zl.parse_version("v1.4.0-beta.10"), zl.parse_version("v1.4.0"))
+        self.assertIsNone(zl.parse_version("v1.4.0-beta.2"))  # betas are gone
         self.assertLess(zl.parse_version("v1.9.9"), zl.parse_version("v1.10.0"))  # not a text comparison
-        self.assertEqual(zl.display_version("v1.4.0-beta.2"), "v1.4.0 Beta 2")
 
     def test_old_copies_cleaned_up(self):
         d = tempfile.mkdtemp()
@@ -456,17 +531,26 @@ class DeploymentLogTests(unittest.TestCase):
         first_seen = r["first_seen"]
 
         log.started("v1.2.0", "x")  # plain restart: no new event
-        log.write("Downloaded v1.3.0; finishes when Stripes restarts", pending_update="v1.3.0")
-        log.started("v1.3.0", "x")
+        log.started("v1.3.0", "x")  # Group Policy copied a new exe
         r = log.read()
         self.assertEqual(r["first_seen"], first_seen)
-        self.assertEqual((r["version"], r["pending_update"]), ("v1.3.0", None))
+        self.assertEqual(r["version"], "v1.3.0")
         self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.2.0", "v1.3.0"))
         self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v1.2.0 -> v1.3.0")
 
         self.assertTrue(zl.is_open_now(r))
         log.write(running=False, last_closed=zl._now())
         self.assertFalse(zl.is_open_now(log.read()))
+
+    def test_self_update_fields_dropped(self):
+        log = self.log()
+        with open(log.path, "w", encoding="utf-8") as f:  # written by a build that updated itself
+            f.write('{"version": "v1.4.0-beta.2", "beta": true, "pending_update": "v1.4.0",'
+                    ' "last_update_error": {"message": "offline"}}')
+        log.started("v1.5.0", "x")
+        r = log.read()
+        self.assertEqual(r["version"], "v1.5.0")
+        self.assertFalse({"beta", "pending_update", "last_update_error"} & set(r))
 
     def test_stale_heartbeat_is_not_open(self):
         from datetime import datetime, timedelta

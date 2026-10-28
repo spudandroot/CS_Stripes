@@ -39,6 +39,14 @@ class ZplViewTests(unittest.TestCase):
         self.assertGreater(len(view.marks), 1)
         self.assertTrue(all(m.align == "center" and m.w == 400 for m in view.marks))
 
+    def test_centered_field_block_shown_where_it_prints(self):
+        view = zv.parse("^XA^FO100,0^A0N,200,200^FB400,1,0,C^FDg^FS^XZ", THREE_BY_THREE)
+        self.assertEqual(view.marks[0].x, 70)  # 15% of 200 left: the printer's offset
+        # a label from the other tabs is nudged to make up for it, so it shows centered again
+        r = ld.render(ld.Design([ld.Element("text", "g", align="center")]), THREE_BY_THREE)
+        shown = zv.parse(ld.build_zpl(r), THREE_BY_THREE).marks[0]
+        self.assertEqual((shown.x, shown.w), (r.marks[0].x, r.marks[0].w))
+
     def test_settings_commands_are_flagged(self):
         view = zv.parse("^XA^MD10^PW406^FO0,0^FDx^FS^XZ~JUS^XA^XZ", TWO_BY_ONE)
         codes = [c for c, _ in view.settings]

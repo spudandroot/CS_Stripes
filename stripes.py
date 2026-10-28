@@ -6,13 +6,16 @@ Needs pywin32 for Windows printers; everything else is standard library.
 """
 
 import copy
+import functools
 import gc
 import getpass
 import glob
 import json
+import math
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -123,7 +126,6 @@ class CompanyConfig:
     source: str = None     # where it was read from
     problems: list = field(default_factory=list)
     cached_at: str = None  # set when the server was unreachable and the saved copy is in use
-    beta: list = None      # computers and users who get beta versions; None when unknown
 
 
 def settings_path():
@@ -155,6 +157,7 @@ def load_settings():
         "recent": data.get("recent", []),
         "show_zpl": data.get("show_zpl") is True,
         "language": data.get("language") if data.get("language") in dict(i18n.LANGUAGES) else "en",
+        "tray_hint_shown": data.get("tray_hint_shown") is True,
     }
 
 
@@ -204,26 +207,10 @@ def _entries(data, key):
     return data.get(key, []) if isinstance(data, dict) else []
 
 
-def parse_beta(folder, problems):
-    """The computer and user names in beta.json (optional): {"beta": ["ARROW01", "jsmith"]}."""
-    try:
-        data = _read_json(os.path.join(folder, "beta.json"))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as e:
-        problems.append(tr("Could not read beta.json: {error}", error=e))
-        return []
-    names = data.get("beta") if isinstance(data, dict) else None
-    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
-        problems.append(tr('beta.json should look like {"beta": ["COMPUTER", "username"]}'))
-        return []
-    return [n.strip() for n in names if n.strip()]
-
-
 def parse_config(folder):
-    """Read printers.json and the optional stock.json and beta.json from a folder.
+    """Read printers.json and the optional stock.json from a folder.
 
-    Returns (printers, stock, beta, problems). Raises OSError/ValueError if
+    Returns (printers, stock, problems). Raises OSError/ValueError if
     printers.json itself can't be read; bad entries are skipped and listed in problems.
     """
     problems = []
@@ -273,14 +260,14 @@ def parse_config(folder):
                 p.stock = ""
         names.add(p.name)
         printers.append(p)
-    return printers, stock, parse_beta(folder, problems), problems
+    return printers, stock, problems
 
 
 def save_cache(folder):
     """Keep a copy of the server's config so the app works when the server is down."""
     cache = cache_folder()
     os.makedirs(cache, exist_ok=True)
-    for name in ("printers.json", "stock.json", "beta.json"):
+    for name in ("printers.json", "stock.json"):
         src, dst = os.path.join(folder, name), os.path.join(cache, name)
         if os.path.exists(src):
             shutil.copyfile(src, dst + ".tmp")
@@ -293,12 +280,12 @@ def load_cached_config(folder):
     """The saved copy of the server's config, or None if there isn't one."""
     cache = cache_folder()
     try:
-        printers, stock, beta, problems = parse_config(cache)
+        printers, stock, problems = parse_config(cache)
         stamp = os.path.getmtime(os.path.join(cache, "printers.json"))
     except (OSError, ValueError):
         return None
     return CompanyConfig(printers, stock, folder, problems,
-                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"), beta=beta)
+                         cached_at=datetime.fromtimestamp(stamp).strftime("%b %d %Y, %I:%M %p"))
 
 
 def load_company_config():
@@ -309,7 +296,7 @@ def load_company_config():
     folder = configured_folder()
     if folder:
         try:
-            printers, stock, beta, problems = parse_config(folder)
+            printers, stock, problems = parse_config(folder)
         except (OSError, ValueError) as e:
             cached = load_cached_config(folder)
             if cached:
@@ -322,16 +309,16 @@ def load_company_config():
             save_cache(folder)
         except OSError:
             pass  # the app still works, just without an offline copy
-        return CompanyConfig(printers, stock, folder, problems, beta=beta)
+        return CompanyConfig(printers, stock, folder, problems)
     for local in local_folders():
         if os.path.exists(os.path.join(local, "printers.json")):
             try:
-                printers, stock, beta, problems = parse_config(local)
+                printers, stock, problems = parse_config(local)
             except (OSError, ValueError) as e:
                 path = os.path.join(local, "printers.json")
                 return CompanyConfig(source=local, problems=[tr("Could not read {path}: {error}", path=path, error=e)])
-            return CompanyConfig(printers, stock, local, problems, beta=beta)
-    return CompanyConfig(beta=[])  # no company settings at all: nobody is on beta
+            return CompanyConfig(printers, stock, local, problems)
+    return CompanyConfig()
 
 
 def merge_printers(company, personal):
@@ -743,17 +730,78 @@ def inspect_printer(printer):
 
 
 def labelary_png(zpl, printer):
-    url = (
-        f"https://api.labelary.com/v1/printers/{printer.dpmm}dpmm/labels/"
-        f"{printer.width_in:g}x{printer.height_in:g}/0/"
-    )
-    req = urllib.request.Request(
-        url,
-        data=zpl.encode("utf-8"),
-        headers={"Accept": "image/png", "Content-Type": "application/x-www-form-urlencoded"},
-    )
+    path = f"/v1/printers/{printer.dpmm}dpmm/labels/{printer.width_in:g}x{printer.height_in:g}/0/"
+    data = zpl.encode("utf-8")
+    headers = {"Accept": "image/png", "Content-Type": "application/x-www-form-urlencoded"}
+    if sys.platform == "win32":  # Windows' own HTTPS, so the exe doesn't carry OpenSSL
+        status, body = wininet_post("api.labelary.com", path, data,
+                                    "".join(f"{k}: {v}\r\n" for k, v in headers.items()))
+        if status != 200:
+            raise OSError(tr("labelary.com answered with error {status}.", status=status))
+        return body
+    req = urllib.request.Request("https://api.labelary.com" + path, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.read()
+
+
+# The WinINet errors people are likely to meet; others are shown by number.
+WININET_ERRORS = {
+    12002: N_("The connection timed out."),
+    12007: N_("The server's name couldn't be found. Is this PC online?"),
+    12029: N_("Couldn't connect to the server."),
+    12175: N_("The secure connection failed (a certificate or proxy problem)."),
+}
+
+
+def wininet_post(host, path, data, headers, port=443, secure=True, timeout_ms=15000):
+    """POST with Windows' own internet API (WinINet): HTTPS without a bundled OpenSSL, using
+    the PC's proxy and certificate settings like its browser does. Returns (status, body)."""
+    import ctypes
+    from ctypes import wintypes
+    net = ctypes.WinDLL("wininet", use_last_error=True)
+    handle, text, dword = ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD
+    for name, restype, argtypes in (
+            ("InternetOpenW", handle, [text, dword, text, text, dword]),
+            ("InternetConnectW", handle, [handle, text, wintypes.WORD, text, text, dword, dword, ctypes.c_size_t]),
+            ("HttpOpenRequestW", handle, [handle, text, text, text, text, ctypes.c_void_p, dword, ctypes.c_size_t]),
+            ("HttpSendRequestW", wintypes.BOOL, [handle, text, dword, ctypes.c_void_p, dword]),
+            ("HttpQueryInfoW", wintypes.BOOL, [handle, dword, ctypes.c_void_p, ctypes.POINTER(dword),
+                                               ctypes.POINTER(dword)]),
+            ("InternetReadFile", wintypes.BOOL, [handle, ctypes.c_void_p, dword, ctypes.POINTER(dword)]),
+            ("InternetSetOptionW", wintypes.BOOL, [handle, dword, ctypes.c_void_p, dword]),
+            ("InternetCloseHandle", wintypes.BOOL, [handle])):
+        getattr(net, name).restype, getattr(net, name).argtypes = restype, argtypes
+
+    def check(result):
+        if not result:
+            code = ctypes.get_last_error()
+            raise OSError(tr(WININET_ERRORS[code]) if code in WININET_ERRORS
+                          else tr("Windows internet error {code}.", code=code))
+        return result
+
+    opened = []
+    try:
+        session = check(net.InternetOpenW("Stripes", 0, None, None, 0))  # 0: the PC's proxy settings
+        opened.append(session)
+        ms = dword(timeout_ms)
+        for option in (2, 5, 6):  # connect, send and receive timeouts
+            net.InternetSetOptionW(session, option, ctypes.byref(ms), ctypes.sizeof(ms))
+        connection = check(net.InternetConnectW(session, host, port, None, None, 3, 0, 0))  # 3: HTTP
+        opened.append(connection)
+        flags = 0x80000000 | 0x04000000 | (0x00800000 if secure else 0)  # reload, don't cache, HTTPS
+        request = check(net.HttpOpenRequestW(connection, "POST", path, None, None, None, flags, 0))
+        opened.append(request)
+        payload = ctypes.create_string_buffer(data, len(data))
+        check(net.HttpSendRequestW(request, headers, len(headers), payload, len(data)))
+        status, size = dword(), dword(ctypes.sizeof(dword))
+        check(net.HttpQueryInfoW(request, 19 | 0x20000000, ctypes.byref(status), ctypes.byref(size), None))
+        body, chunk, got = [], ctypes.create_string_buffer(65536), dword()
+        while check(net.InternetReadFile(request, chunk, len(chunk), ctypes.byref(got))) and got.value:
+            body.append(chunk.raw[:got.value])
+        return status.value, b"".join(body)
+    finally:
+        for h in reversed(opened):
+            net.InternetCloseHandle(h)
 
 
 # --------------------------------------------------------------------------
@@ -791,6 +839,7 @@ class DeploymentLog:
     the installed version, updates and a heartbeat while Stripes is open."""
 
     MAX_EVENTS = 50
+    OBSOLETE = ("pending_update", "last_update_error", "beta")  # left by builds that updated themselves
 
     def __init__(self, folder, computer=None, user=None):
         self.folder = folder
@@ -814,6 +863,8 @@ class DeploymentLog:
             if not os.path.isdir(self.folder):
                 return False
             record = self.read()
+            for key in self.OBSOLETE:
+                record.pop(key, None)
             now = _now()
             record.setdefault("first_seen", now)
             record.update(computer=self.computer, user=self.user, last_seen=now, **fields)
@@ -828,7 +879,7 @@ class DeploymentLog:
 
     def started(self, version, exe):
         previous = self.read().get("version")
-        fields = dict(version=version, exe=exe, last_start=_now(), running=True, pending_update=None,
+        fields = dict(version=version, exe=exe, last_start=_now(), running=True,
                       windows=platform.platform())
         if previous is None:
             event = f"Installed ({version})"
@@ -882,23 +933,9 @@ def remove_download_mark(path):
 # --------------------------------------------------------------------------
 
 def parse_version(text):
-    """'v1.2.3' -> (1, 2, 3, 1, 0) and 'v1.2.3-beta.4' -> (1, 2, 3, 0, 4), so betas sort
-    before their release; None for anything else (e.g. development builds)."""
-    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?", (text or "").strip())
-    if not m:
-        return None
-    major, minor, patch, beta = m.groups()
-    return int(major), int(minor), int(patch), 0 if beta else 1, int(beta or 0)
-
-
-def is_beta_version(text):
-    v = parse_version(text)
-    return bool(v) and v[3] == 0
-
-
-def display_version(text):
-    """'v1.4.0-beta.2' -> 'v1.4.0 Beta 2'."""
-    return re.sub(r"-beta\.(\d+)$", r" Beta \1", text or "")
+    """'v1.2.3' -> (1, 2, 3); None for anything else (e.g. development builds)."""
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
+    return tuple(int(n) for n in m.groups()) if m else None
 
 
 def remove_old_versions(exe_path):
@@ -946,6 +983,89 @@ class Background:
         self.root.after(100, self._poll)
 
 
+TRAY_FLAG = "--tray"  # start hidden in the tray (the logon shortcut uses this)
+
+
+class SingleInstance:
+    """Only one Stripes per user. The running copy listens on a port on this PC only
+    (127.0.0.1) and notes the port, with a random key, in the user's profile; a second
+    start finds it there, asks it to show its window, and exits."""
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(os.path.dirname(cache_folder()), "instance.txt")
+        self.server = None
+
+    def signal_running(self, message="show"):
+        """Hand `message` to a copy that's already running. True if one answered."""
+        try:
+            with open(self.path, encoding="ascii") as f:
+                port, key = f.read().split()
+            with socket.create_connection(("127.0.0.1", int(port)), timeout=1) as s:
+                s.sendall(f"{key} {message}\n".encode("ascii"))
+                return s.recv(16).startswith(b"ok")
+        except (OSError, ValueError):
+            return False
+
+    def listen(self, on_message):
+        """Become the running copy: on_message(text) is called (on a worker thread) for each request."""
+        key = secrets.token_hex(16)
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "w", encoding="ascii") as f:
+            f.write(f"{self.server.getsockname()[1]} {key}")
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = self.server.accept()
+                except OSError:
+                    return  # closed
+                with conn:
+                    try:
+                        conn.settimeout(2)
+                        got, _, message = conn.recv(256).decode("ascii", "replace").strip().partition(" ")
+                        if secrets.compare_digest(got, key):
+                            conn.sendall(b"ok")
+                            on_message(message)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=serve, daemon=True).start()
+
+    def close(self):
+        if self.server:
+            self.server.close()
+
+
+class Tray:
+    """Stripes' icon in the notification area. pystray runs it on its own thread, so each
+    menu click is handed to the window's thread with app.call."""
+
+    def __init__(self, app):
+        import pystray
+        from PIL import Image
+        image = Image.open(resource_path(os.path.join("assets", "icon-48.png")))
+        menu = pystray.Menu(
+            # Labels are functions so the menu follows the English/Español switch
+            pystray.MenuItem(lambda item: tr("Open Stripes"), lambda icon, item: app.call(app.show), default=True),
+            pystray.MenuItem(lambda item: tr("Printer monitor"), lambda icon, item: app.call(app.show_monitor)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: tr("Quit Stripes"), lambda icon, item: app.call(app.quit_app)))
+        self.icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        self.icon.run_detached()
+
+    def notify(self, text):
+        try:
+            self.icon.notify(text, APP_NAME)
+        except Exception:  # notifications are a nicety
+            pass
+
+    def stop(self):
+        self.icon.stop()
+
+
 def resource_path(name):
     """Files bundled into the .exe are unpacked to sys._MEIPASS."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -960,10 +1080,54 @@ def pick_font_family(root):
     return "TkDefaultFont"
 
 
+# Preview text is drawn from a font file, so it can be squeezed to the printer's
+# condensed width (Tk can't stretch text). The first one found is used.
+PREVIEW_FONT_FILES = ("ARIALNB.TTF", "arialbd.ttf", "LiberationSansNarrow-Bold.ttf", "LiberationSans-Bold.ttf",
+                      "DejaVuSans-Bold.ttf")
+
+
+def find_preview_font():
+    """Path of a bold font file for the preview, or None (then Tk draws the text)."""
+    folders = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")]
+    if os.environ.get("LOCALAPPDATA"):  # fonts installed for one user
+        folders.append(os.path.join(os.environ["LOCALAPPDATA"], "Microsoft", "Windows", "Fonts"))
+    folders += glob.glob("/usr/share/fonts/**/", recursive=True)
+    for name in PREVIEW_FONT_FILES:
+        for folder in folders:
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+@functools.lru_cache(maxsize=64)
+def _preview_font(path, size):
+    from PIL import ImageFont
+    return ImageFont.truetype(path, size)
+
+
+def text_image(text, height, font_file):
+    """`text` drawn the way the printer's font 0 is, at font height `height` pixels:
+    capitals from the top of the image down to the baseline at CAP_HEIGHT, squeezed
+    to the printer's condensed width. Black on transparent."""
+    from PIL import Image, ImageDraw
+    cap = -_preview_font(font_file, 200).getbbox("H", anchor="ls")[1]  # cap height at size 200
+    font = _preview_font(font_file, max(1, round(200 * ld.CAP_HEIGHT * height / cap)))
+    advance = max(1, font.getlength(text))
+    ink = Image.new("L", (math.ceil(advance) + 2, max(1, round(height * 1.1))), 0)  # room for descenders
+    ImageDraw.Draw(ink).text((1, round(ld.CAP_HEIGHT * height)), text, font=font, fill=255, anchor="ls")
+    ink = ink.resize((max(1, round(ld.printed_em(text) * height)), ink.height), Image.LANCZOS)
+    img = Image.new("RGBA", ink.size, (0, 0, 0, 255))
+    img.putalpha(ink)
+    return img
+
+
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, start_hidden=False):
         super().__init__()
-        self.title(f"{APP_NAME} {display_version(VERSION)}")
+        if start_hidden:
+            self.withdraw()  # starting at logon: just the tray icon
+        self.title(f"{APP_NAME} {VERSION}")
         self.minsize(900, 640)
         try:
             self.iconbitmap(default=resource_path(os.path.join("assets", "icon.ico")))
@@ -982,6 +1146,7 @@ class App(tk.Tk):
         self.bg = Background(self)
         self.preview_family = pick_font_family(self)
         self.measure_font = tkinter.font.Font(self, family=self.preview_family, weight="bold")
+        self.preview_font_file = find_preview_font()
         self._refresh_pending = False
         self._status_seq = 0
         self.design = ld.Design([ld.Element("text")])
@@ -1019,7 +1184,15 @@ class App(tk.Tk):
         self.deployment = DeploymentLog(folder) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Closing the window keeps Stripes running in the tray, so it opens instantly next
+        # time; Quit is on the tray icon's menu. Without a tray, closing quits as before.
+        self.tray = None
+        if sys.platform == "win32":
+            try:
+                self.tray = Tray(self)
+            except Exception:
+                self.tray = None
+        self.protocol("WM_DELETE_WINDOW", self.hide_to_tray if self.tray else self._on_close)
 
     # ----- deployment log -----
 
@@ -1031,6 +1204,36 @@ class App(tk.Tk):
     def _heartbeat(self):
         self._log(lambda log: log.write(running=True))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
+
+    # ----- tray -----
+
+    def call(self, func):
+        """Run func on the window's thread (for the tray and the single-instance listener)."""
+        self.bg.results.put((lambda result, error: func(), None, None))
+
+    def show(self):
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)  # Windows won't otherwise bring it to the front
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+
+    def show_monitor(self):
+        self.open_monitor()
+        self.monitor.lift()
+
+    def hide_to_tray(self):
+        self.withdraw()
+        if not self.settings.get("tray_hint_shown"):
+            self.tray.notify(tr("Stripes is still running. Click its icon to open it; "
+                                "right-click it to quit."))
+            self.settings["tray_hint_shown"] = True
+            self.save()
+
+    def quit_app(self):
+        if self.tray:
+            self.tray.stop()
+        self._on_close()
 
     def _on_close(self, event="Closed"):
         if self.deployment:  # don't let a slow share hold up closing
@@ -1100,8 +1303,7 @@ class App(tk.Tk):
         for code, name in i18n.LANGUAGES:
             ttk.Radiobutton(switch, text=name, value=code, variable=self.v_language, style="Toolbutton",
                             command=self._language_changed).pack(side="left")
-        self.update_label = ttk.Label(corner, text=tr("Version {version}", version=display_version(VERSION)),
-                                      style="Warn.TLabel" if is_beta_version(VERSION) else "Muted.TLabel")
+        self.update_label = ttk.Label(corner, text=tr("Version {version}", version=VERSION), style="Muted.TLabel")
         self.update_label.pack(anchor="e", pady=(4, 0))
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
@@ -1458,7 +1660,7 @@ class App(tk.Tk):
         self.save()
         self._retranslate(self)
         # Text the app works out as it goes
-        self.update_label.configure(text=tr("Version {version}", version=display_version(VERSION)))
+        self.update_label.configure(text=tr("Version {version}", version=VERSION))
         current = self.stock_box.current()
         self.stock_box["values"] = self._stock_labels()
         if current >= 0:
@@ -1710,11 +1912,17 @@ class App(tk.Tk):
     def _choose_picture(self):
         path = filedialog.askopenfilename(
             parent=self, title=tr("Choose a picture"),
-            filetypes=[(tr("Pictures"), "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff"), (tr("All files"), "*.*")])
+            filetypes=[(tr("Pictures"), "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
+                       (tr("All files"), "*.*")])
         if not path:
             return None
+        from PIL import UnidentifiedImageError
         try:
             return ld.load_picture(path)
+        except UnidentifiedImageError:  # a format Stripes doesn't read, e.g. AVIF
+            messagebox.showerror(APP_NAME, tr("That picture's format can't be read. Save it as PNG or JPG "
+                                              "and try again."), parent=self)
+            return None
         except Exception as e:  # any unreadable file
             messagebox.showerror(APP_NAME, tr("Couldn't open that picture:\n{error}", error=e), parent=self)
             return None
@@ -1942,11 +2150,18 @@ class App(tk.Tk):
         from PIL import Image, ImageTk
         c = self.canvas
         x, y = x0 + mark.x * scale, y0 + mark.y * scale
-        if mark.kind == "text":
+        if mark.kind == "text" and self.preview_font_file:
+            img = text_image(mark.text, max(1, round(mark.text_h * scale)), self.preview_font_file)
+            box_w = mark.w * scale
+            left = {"left": x, "center": x + (box_w - img.width) / 2, "right": x + box_w - img.width}[mark.align]
+            photo = ImageTk.PhotoImage(img, master=c)
+            self._preview_images.append(photo)  # Tk only keeps a weak reference
+            c.create_image(left, y, image=photo, anchor="nw")
+        elif mark.kind == "text":
             px = max(1, round(mark.text_h * scale))
             # Screen fonts are wider than the printer's condensed font, so shrink
             # to the width the printer will actually use.
-            printed_w = ld.text_em(mark.text) * mark.text_h * scale
+            printed_w = ld.printed_em(mark.text) * mark.text_h * scale
             self.measure_font.configure(size=-px)
             screen_w = self.measure_font.measure(mark.text)
             if screen_w > printed_w > 0:
@@ -2580,7 +2795,6 @@ class DeploymentWindow(tk.Toplevel):
     """Every PC/user running Stripes, from the shared status folder."""
 
     COLUMNS = (("computer", N_("Computer"), 110), ("user", N_("User"), 100), ("version", N_("Version"), 110),
-               ("channel", N_("Channel"), 60),
                ("status", N_("Status"), 85), ("last_seen", N_("Last seen"), 125),
                ("last_update", N_("Last update"), 230),
                ("first_seen", N_("Installed"), 125), ("notes", N_("Notes"), 280))
@@ -2608,7 +2822,6 @@ class DeploymentWindow(tk.Toplevel):
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
         self.tree.tag_configure("behind", foreground="#b45309")
-        self.tree.tag_configure("problem", foreground="#b91c1c")
         self.tree.bind("<Double-1>", lambda e: self._show_history())
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(8, 0))
@@ -2629,44 +2842,34 @@ class DeploymentWindow(tk.Toplevel):
                                            error=describe_error(error)))
             return
         self.records = records
-        # "Behind" compares with the newest release; beta PCs are ahead on purpose
-        releases = [r.get("version") for r in records if parse_version(r.get("version"))
-                    and not is_beta_version(r.get("version"))]
-        if parse_version(VERSION) and not is_beta_version(VERSION):
-            releases.append(VERSION)
-        latest = max(releases, key=parse_version, default=None)
+        # "Behind" compares with the newest version seen (normally the one on the share)
+        versions = [parse_version(r.get("version")) for r in records] + [parse_version(VERSION)]
+        newest = max(filter(None, versions), default=None)
         self.tree.delete(*self.tree.get_children())
-        behind = open_now = on_beta_now = 0
+        behind = on_newest = open_now = 0
         for i, r in enumerate(records):
             v = parse_version(r.get("version"))
             is_open = is_open_now(r)
             open_now += is_open
-            beta = bool(r.get("beta")) or is_beta_version(r.get("version"))
-            on_beta_now += beta
+            on_newest += bool(v) and v == newest
             notes, tag = [], ()
-            if v and latest and v < parse_version(latest) and not beta:
+            if v and v < newest:
                 behind += 1
                 tag = ("behind",)
-            if r.get("pending_update"):
-                notes.append(tr("{version} downloaded, waiting for restart", version=r['pending_update']))
-            error = r.get("last_update_error")
-            if isinstance(error, dict) and error.get("message"):
-                notes.append(tr("Update problem: {error}", error=error['message']))
-                tag = ("problem",)
             if r.get("config", "server") != "server":
                 notes.append(tr("Settings: {source}", source=r.get('config')))
             update = r.get("last_update") or {}
             last_update = (f"{update.get('from')} → {update.get('to')}  ({_short_time(update.get('at'))})"
                            if update else "")
             self.tree.insert("", "end", iid=str(i), tags=tag, values=(
-                r.get("computer", ""), r.get("user", ""), display_version(r.get("version", "")),
-                tr("Beta") if beta else tr("Release"), tr("Open now") if is_open else tr("Closed"),
+                r.get("computer", ""), r.get("user", ""), r.get("version", ""),
+                tr("Open now") if is_open else tr("Closed"),
                 _short_time(r.get("last_seen")), last_update,
                 _short_time(r.get("first_seen")), "; ".join(notes)))
         parts = [tr("{n} installs", n=len(records)), tr("{n} open now", n=open_now)]
-        if latest:
-            parts.append(tr("{n} on {version}", n=len(records) - behind - on_beta_now, version=latest))
-        parts += [tr("{n} behind", n=behind)] + ([tr("{n} on beta", n=on_beta_now)] if on_beta_now else [])
+        if newest:
+            parts.append(tr("{n} on {version}", n=on_newest, version="v" + ".".join(map(str, newest))))
+        parts.append(tr("{n} behind", n=behind))
         self.summary.configure(text="  ·  ".join(parts))
 
     def _show_history(self):
@@ -3064,14 +3267,74 @@ class PrinterDialog(tk.Toplevel):
                   (tr("Calibration started."), "Ok.TLabel"))
 
 
+def self_check(out_path):
+    """Used by the release build: prove the built exe has everything Stripes uses, including
+    what it only loads later (the build leaves unused parts out, see pyinstaller.spec), then
+    write "ok <version>" to out_path, or what's missing. Never raises: a windowed exe would
+    show the error in a dialog and the build would wait on it forever."""
+    try:
+        _self_check()
+        result = f"ok {VERSION}"
+    except Exception as e:
+        result = f"failed: {e!r}"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(result + "\n")
+
+
+def _self_check():
+    import io
+    from PIL import Image, ImageTk
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        ImageTk.PhotoImage(Image.new("1", (8, 8)), master=root)
+        Image.open(resource_path(os.path.join("assets", "icon-48.png"))).load()
+        for fmt in ("PNG", "JPEG", "BMP", "GIF", "TIFF", "WEBP"):  # pictures people add to labels
+            buf = io.BytesIO()
+            Image.new("RGB", (4, 4)).save(buf, fmt)
+            buf.seek(0)
+            ld.load_picture(buf)
+        font = find_preview_font()
+        if font:
+            text_image("Stripes", 40, font)
+        label = ld.Label(406, 203, 8)
+        zv.parse(ld.build_zpl(ld.render(ld.Design([ld.Element("qr", "Stripes")]), label)), label)
+        if sys.platform == "win32":
+            # the exact preview: Windows' own HTTPS (a closed port, so it fails fast without the network)
+            try:
+                wininet_post("127.0.0.1", "/", b"", "", port=9, secure=False, timeout_ms=2000)
+            except OSError:
+                pass
+            import winreg  # noqa: F401 (company settings location)
+            import pystray._win32  # noqa: F401 (the tray's Windows backend, loaded by name at run time)
+            if win32print is None:
+                raise RuntimeError("win32print is missing")
+    finally:
+        root.destroy()
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--self-check":
+        self_check(sys.argv[2])
+        return
+    start_hidden = TRAY_FLAG in sys.argv[1:]
+    instance = SingleInstance()
+    # Already running? Bring that window forward (or, from the logon shortcut, do nothing).
+    if instance.signal_running("tray" if start_hidden else "show"):
+        return
     if sys.platform == "win32":
         try:  # sharp text on high-DPI screens
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    App().mainloop()
+    app = App(start_hidden=start_hidden)
+    try:
+        instance.listen(lambda message: message == "show" and app.call(app.show))
+    except OSError:
+        pass  # can't listen: a second start just opens a second window
+    app.mainloop()
+    instance.close()
 
 
 if __name__ == "__main__":
