@@ -12,6 +12,8 @@ EXCLUDES = [
     # pulled in by build tooling and docs, never by Stripes
     "setuptools", "pkg_resources", "_distutils_hack", "distutils", "packaging",
     "pydoc", "pydoc_data", "multiprocessing",
+    # OpenSSL (2 MB): the exact preview uses Windows' own HTTPS (wininet_post)
+    "ssl", "_ssl", "_hashlib",
 ]
 
 # Tcl's time zones and month names (only its clock command uses them) and its East Asian
@@ -21,6 +23,13 @@ TCL_ENCODINGS_UNUSED = {
     "big5", "cns11643", "cp932", "cp936", "cp949", "cp950", "euc-cn", "euc-jp", "euc-kr", "gb12345",
     "gb2312", "gb2312-raw", "jis0208", "jis0212", "ksc5601", "macJapan", "shiftjis",
 }
+
+
+# Windows 10 and 11 include the Universal C Runtime, so the exe needn't carry its own copy
+# (ucrtbase.dll and the api-ms-win-* files). VCRUNTIME140 isn't part of Windows and stays.
+def windows_has(dest):
+    name = os.path.basename(dest).lower()
+    return name == "ucrtbase.dll" or name.startswith("api-ms-win-")
 
 
 def wanted(dest):
@@ -39,6 +48,7 @@ a = Analysis(
     excludes=EXCLUDES,
 )
 a.datas = [entry for entry in a.datas if wanted(entry[0])]
+a.binaries = [entry for entry in a.binaries if not windows_has(entry[0])]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],

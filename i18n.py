@@ -474,6 +474,15 @@ ES = {
     "duplicate name": "nombre repetido",
     "needs a host (IP address) or windows_name": "necesita host (dirección IP) o windows_name",
     "Printer {name}: unknown stock '{stock}'": "Impresora {name}: tipo de etiqueta desconocido '{stock}'",
+    # Exact preview (Windows' own internet connection)
+    "labelary.com answered with error {status}.": "labelary.com respondió con el error {status}.",
+    "The connection timed out.": "Se agotó el tiempo de la conexión.",
+    "The server's name couldn't be found. Is this PC online?":
+        "No se encontró el nombre del servidor. ¿Esta PC tiene conexión a internet?",
+    "Couldn't connect to the server.": "No se pudo conectar con el servidor.",
+    "The secure connection failed (a certificate or proxy problem).":
+        "Falló la conexión segura (un problema de certificado o de proxy).",
+    "Windows internet error {code}.": "Error de internet de Windows {code}.",
     # Tray
     "Open Stripes": "Abrir Stripes",
     "Quit Stripes": "Salir de Stripes",
