@@ -116,3 +116,7 @@ python stripes.py          # run from source
 python -m unittest -v      # tests
 build.bat v1.2.0           # local build, dist\Stripes-v1.2.0.exe (needs Python from python.org)
 ```
+
+What goes into the exe is set in `pyinstaller.spec`, which leaves out parts of Python, Pillow and Tcl
+that Stripes doesn't use. If you add a library or a picture format, check the build's self-check
+(`Stripes.exe --self-check out.txt`) still says `ok`.

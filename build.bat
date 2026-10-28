@@ -21,7 +21,7 @@ python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt pyinstaller || goto :fail
 python -m unittest || goto :fail
 python make_version.py %VERSION% || goto :fail
-pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --hidden-import pystray._win32 --version-file version_info.txt stripes.py || goto :fail
+pyinstaller --noconfirm pyinstaller.spec || goto :fail
 copy /y dist\Stripes.exe "dist\Stripes-%VERSION%.exe" >nul || goto :fail
 
 echo.
