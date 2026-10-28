@@ -16,7 +16,7 @@ A small Windows app for designing and printing labels on Zebra printers.
   which printer it is, with everything else behind **More info**.
 
 Download the latest `Stripes.exe` from **[Releases](../../releases/latest)**. It's a single file;
-nothing to install.
+nothing to install. Needs Windows 10 or 11.
 
 ## Company settings (printers and label stock)
 

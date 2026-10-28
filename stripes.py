@@ -730,17 +730,78 @@ def inspect_printer(printer):
 
 
 def labelary_png(zpl, printer):
-    url = (
-        f"https://api.labelary.com/v1/printers/{printer.dpmm}dpmm/labels/"
-        f"{printer.width_in:g}x{printer.height_in:g}/0/"
-    )
-    req = urllib.request.Request(
-        url,
-        data=zpl.encode("utf-8"),
-        headers={"Accept": "image/png", "Content-Type": "application/x-www-form-urlencoded"},
-    )
+    path = f"/v1/printers/{printer.dpmm}dpmm/labels/{printer.width_in:g}x{printer.height_in:g}/0/"
+    data = zpl.encode("utf-8")
+    headers = {"Accept": "image/png", "Content-Type": "application/x-www-form-urlencoded"}
+    if sys.platform == "win32":  # Windows' own HTTPS, so the exe doesn't carry OpenSSL
+        status, body = wininet_post("api.labelary.com", path, data,
+                                    "".join(f"{k}: {v}\r\n" for k, v in headers.items()))
+        if status != 200:
+            raise OSError(tr("labelary.com answered with error {status}.", status=status))
+        return body
+    req = urllib.request.Request("https://api.labelary.com" + path, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=15) as r:
         return r.read()
+
+
+# The WinINet errors people are likely to meet; others are shown by number.
+WININET_ERRORS = {
+    12002: N_("The connection timed out."),
+    12007: N_("The server's name couldn't be found. Is this PC online?"),
+    12029: N_("Couldn't connect to the server."),
+    12175: N_("The secure connection failed (a certificate or proxy problem)."),
+}
+
+
+def wininet_post(host, path, data, headers, port=443, secure=True, timeout_ms=15000):
+    """POST with Windows' own internet API (WinINet): HTTPS without a bundled OpenSSL, using
+    the PC's proxy and certificate settings like its browser does. Returns (status, body)."""
+    import ctypes
+    from ctypes import wintypes
+    net = ctypes.WinDLL("wininet", use_last_error=True)
+    handle, text, dword = ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD
+    for name, restype, argtypes in (
+            ("InternetOpenW", handle, [text, dword, text, text, dword]),
+            ("InternetConnectW", handle, [handle, text, wintypes.WORD, text, text, dword, dword, ctypes.c_size_t]),
+            ("HttpOpenRequestW", handle, [handle, text, text, text, text, ctypes.c_void_p, dword, ctypes.c_size_t]),
+            ("HttpSendRequestW", wintypes.BOOL, [handle, text, dword, ctypes.c_void_p, dword]),
+            ("HttpQueryInfoW", wintypes.BOOL, [handle, dword, ctypes.c_void_p, ctypes.POINTER(dword),
+                                               ctypes.POINTER(dword)]),
+            ("InternetReadFile", wintypes.BOOL, [handle, ctypes.c_void_p, dword, ctypes.POINTER(dword)]),
+            ("InternetSetOptionW", wintypes.BOOL, [handle, dword, ctypes.c_void_p, dword]),
+            ("InternetCloseHandle", wintypes.BOOL, [handle])):
+        getattr(net, name).restype, getattr(net, name).argtypes = restype, argtypes
+
+    def check(result):
+        if not result:
+            code = ctypes.get_last_error()
+            raise OSError(tr(WININET_ERRORS[code]) if code in WININET_ERRORS
+                          else tr("Windows internet error {code}.", code=code))
+        return result
+
+    opened = []
+    try:
+        session = check(net.InternetOpenW("Stripes", 0, None, None, 0))  # 0: the PC's proxy settings
+        opened.append(session)
+        ms = dword(timeout_ms)
+        for option in (2, 5, 6):  # connect, send and receive timeouts
+            net.InternetSetOptionW(session, option, ctypes.byref(ms), ctypes.sizeof(ms))
+        connection = check(net.InternetConnectW(session, host, port, None, None, 3, 0, 0))  # 3: HTTP
+        opened.append(connection)
+        flags = 0x80000000 | 0x04000000 | (0x00800000 if secure else 0)  # reload, don't cache, HTTPS
+        request = check(net.HttpOpenRequestW(connection, "POST", path, None, None, None, flags, 0))
+        opened.append(request)
+        payload = ctypes.create_string_buffer(data, len(data))
+        check(net.HttpSendRequestW(request, headers, len(headers), payload, len(data)))
+        status, size = dword(), dword(ctypes.sizeof(dword))
+        check(net.HttpQueryInfoW(request, 19 | 0x20000000, ctypes.byref(status), ctypes.byref(size), None))
+        body, chunk, got = [], ctypes.create_string_buffer(65536), dword()
+        while check(net.InternetReadFile(request, chunk, len(chunk), ctypes.byref(got))) and got.value:
+            body.append(chunk.raw[:got.value])
+        return status.value, b"".join(body)
+    finally:
+        for h in reversed(opened):
+            net.InternetCloseHandle(h)
 
 
 # --------------------------------------------------------------------------
@@ -3222,7 +3283,6 @@ def self_check(out_path):
 
 def _self_check():
     import io
-    import ssl
     from PIL import Image, ImageTk
     root = tk.Tk()
     root.withdraw()
@@ -3239,8 +3299,12 @@ def _self_check():
             text_image("Stripes", 40, font)
         label = ld.Label(406, 203, 8)
         zv.parse(ld.build_zpl(ld.render(ld.Design([ld.Element("qr", "Stripes")]), label)), label)
-        ssl.create_default_context()  # the exact preview comes from labelary.com over HTTPS
         if sys.platform == "win32":
+            # the exact preview: Windows' own HTTPS (a closed port, so it fails fast without the network)
+            try:
+                wininet_post("127.0.0.1", "/", b"", "", port=9, secure=False, timeout_ms=2000)
+            except OSError:
+                pass
             import winreg  # noqa: F401 (company settings location)
             import pystray._win32  # noqa: F401 (the tray's Windows backend, loaded by name at run time)
             if win32print is None:

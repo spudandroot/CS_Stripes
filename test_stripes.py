@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import socket
+import sys
 import threading
 import types
 import unittest
@@ -456,6 +457,44 @@ class PreviewTextTests(unittest.TestCase):
         img = zl.text_image("g", 200, font)
         bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()[3]
         self.assertTrue(170 < bottom < img.height)  # the descender shows, not cut off
+
+
+class ExactPreviewTests(unittest.TestCase):
+    def test_labelary_error_is_reported(self):
+        with mock.patch.object(zl.sys, "platform", "win32"), \
+                mock.patch.object(zl, "wininet_post", return_value=(429, b"")) as post:
+            with self.assertRaisesRegex(OSError, "429"):
+                zl.labelary_png("^XA^XZ", ZT410)
+        host, path, data, headers = post.call_args.args
+        self.assertEqual((host, path, data), ("api.labelary.com", "/v1/printers/12dpmm/labels/3x3/0/", b"^XA^XZ"))
+        self.assertIn("Accept: image/png\r\n", headers)
+
+    @unittest.skipUnless(sys.platform == "win32", "WinINet is Windows only")
+    def test_wininet_post(self):
+        import http.server
+
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200 if self.path == "/echo" else 404)
+                self.end_headers()
+                self.wfile.write(self.headers["Accept"].encode() + b" " + body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Echo)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        status, body = zl.wininet_post("127.0.0.1", "/echo", b"x" * 100000, "Accept: image/png\r\n",
+                                       port=port, secure=False)
+        self.assertEqual((status, body), (200, b"image/png " + b"x" * 100000))  # read in several chunks
+        self.assertEqual(zl.wininet_post("127.0.0.1", "/nope", b"", "", port=port, secure=False)[0], 404)
+        server.shutdown()
+        server.server_close()
+        with self.assertRaises(OSError):  # nothing listening any more
+            zl.wininet_post("127.0.0.1", "/echo", b"", "", port=port, secure=False, timeout_ms=2000)
 
 
 class VersionTests(unittest.TestCase):
