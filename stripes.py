@@ -1851,11 +1851,17 @@ class App(tk.Tk):
     def _choose_picture(self):
         path = filedialog.askopenfilename(
             parent=self, title=tr("Choose a picture"),
-            filetypes=[(tr("Pictures"), "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff"), (tr("All files"), "*.*")])
+            filetypes=[(tr("Pictures"), "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
+                       (tr("All files"), "*.*")])
         if not path:
             return None
+        from PIL import UnidentifiedImageError
         try:
             return ld.load_picture(path)
+        except UnidentifiedImageError:  # a format Stripes doesn't read, e.g. AVIF
+            messagebox.showerror(APP_NAME, tr("That picture's format can't be read. Save it as PNG or JPG "
+                                              "and try again."), parent=self)
+            return None
         except Exception as e:  # any unreadable file
             messagebox.showerror(APP_NAME, tr("Couldn't open that picture:\n{error}", error=e), parent=self)
             return None
@@ -3201,21 +3207,46 @@ class PrinterDialog(tk.Toplevel):
 
 
 def self_check(out_path):
-    """Used by the release build: prove the built exe can load what it needs (Tk, Pillow
-    for the preview, the tray, QR codes, its icon), then write its version to out_path."""
+    """Used by the release build: prove the built exe has everything Stripes uses, including
+    what it only loads later (the build leaves unused parts out, see pyinstaller.spec), then
+    write "ok <version>" to out_path, or what's missing. Never raises: a windowed exe would
+    show the error in a dialog and the build would wait on it forever."""
+    try:
+        _self_check()
+        result = f"ok {VERSION}"
+    except Exception as e:
+        result = f"failed: {e!r}"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(result + "\n")
+
+
+def _self_check():
+    import io
+    import ssl
     from PIL import Image, ImageTk
     root = tk.Tk()
     root.withdraw()
     try:
         ImageTk.PhotoImage(Image.new("1", (8, 8)), master=root)
-        ld.qr_matrix("Stripes")
         Image.open(resource_path(os.path.join("assets", "icon-48.png"))).load()
+        for fmt in ("PNG", "JPEG", "BMP", "GIF", "TIFF", "WEBP"):  # pictures people add to labels
+            buf = io.BytesIO()
+            Image.new("RGB", (4, 4)).save(buf, fmt)
+            buf.seek(0)
+            ld.load_picture(buf)
+        font = find_preview_font()
+        if font:
+            text_image("Stripes", 40, font)
+        label = ld.Label(406, 203, 8)
+        zv.parse(ld.build_zpl(ld.render(ld.Design([ld.Element("qr", "Stripes")]), label)), label)
+        ssl.create_default_context()  # the exact preview comes from labelary.com over HTTPS
         if sys.platform == "win32":
+            import winreg  # noqa: F401 (company settings location)
             import pystray._win32  # noqa: F401 (the tray's Windows backend, loaded by name at run time)
+            if win32print is None:
+                raise RuntimeError("win32print is missing")
     finally:
         root.destroy()
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"ok {VERSION}\n")
 
 
 def main():

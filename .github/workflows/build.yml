@@ -68,7 +68,7 @@ jobs:
           "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
 
       - name: Build Stripes.exe
-        run: pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" --hidden-import pystray._win32 --version-file version_info.txt stripes.py
+        run: pyinstaller --noconfirm pyinstaller.spec
 
       # The exe is windowed, so it can't print errors: have it load everything it needs
       # (Tk, Pillow, the tray) and write what it is to a file, before anything is published.

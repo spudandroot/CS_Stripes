@@ -121,6 +121,8 @@ ES = {
     "Pictures": "Imágenes",
     "All files": "Todos los archivos",
     "Couldn't open that picture:\n{error}": "No se pudo abrir esa imagen:\n{error}",
+    "That picture's format can't be read. Save it as PNG or JPG and try again.":
+        "No se puede leer el formato de esa imagen. Guárdela como PNG o JPG e inténtelo de nuevo.",
     "(unreadable)": "(ilegible)",
     "(empty)": "(vacía)",
     "That recent label couldn't be loaded.": "No se pudo cargar esa etiqueta reciente.",
