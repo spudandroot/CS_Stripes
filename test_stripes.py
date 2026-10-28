@@ -5,10 +5,10 @@ import re
 import shutil
 import tempfile
 import socket
+import sys
 import threading
 import types
 import unittest
-import urllib.error
 from unittest import mock
 
 import label_design as ld
@@ -55,9 +55,10 @@ class PrinterLabelTests(unittest.TestCase):
 class FakePrinter:
     """Listens like a Zebra on port 9100: records data, answers ~HS."""
 
-    def __init__(self, hs_reply=HS_READY, config_report=b"\x02\x03"):
+    def __init__(self, hs_reply=HS_READY, config_report=b"\x02\x03", sgd=None):
         self.hs_reply = hs_reply
         self.config_report = config_report
+        self.sgd = sgd or {}
         self.received = []
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
@@ -83,6 +84,10 @@ class FakePrinter:
                         break
                     if data == b"^XA^HH^XZ":
                         conn.sendall(self.config_report)
+                        break
+                    if data.startswith(b"! U1 getvar") and data.endswith(b"\r\n"):
+                        names = re.findall(rb'getvar "([^"]+)"', data)
+                        conn.sendall(b"".join(b'"' + self.sgd.get(n.decode(), "?").encode() + b'"' for n in names))
                         break
                 self.received.append(data)
 
@@ -242,9 +247,9 @@ class CompanyConfigTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def folder(self, printers=None, stock=None, encoding="utf-8", beta=None):
+    def folder(self, printers=None, stock=None, encoding="utf-8"):
         d = tempfile.mkdtemp(dir=self.tmp)
-        for name, content in (("printers.json", printers), ("stock.json", stock), ("beta.json", beta)):
+        for name, content in (("printers.json", printers), ("stock.json", stock)):
             if content is not None:
                 with open(os.path.join(d, name), "w", encoding=encoding) as f:
                     f.write(content)
@@ -263,7 +268,6 @@ class CompanyConfigTests(unittest.TestCase):
         # label size comes from the printer's stock
         self.assertEqual((packing.stock, zl.label_dots(packing)), ("2x1-gap", (406, 203)))
         self.assertEqual((pallets.stock, zl.label_dots(pallets)), ("3x3-mark", (610, 610)))
-        self.assertEqual(pallets.expected["media"], "mark")
         self.assertTrue(all(p.port == 9100 and not p.windows_name for p in cfg.printers))
 
     def test_notepad_bom_and_bad_entries(self):
@@ -282,14 +286,6 @@ class CompanyConfigTests(unittest.TestCase):
         self.assertEqual(cfg.printers[1].stock, "")  # unknown stock dropped, printer kept
         self.assertEqual([s.id for s in cfg.stock], ["s1"])
         self.assertEqual(len(cfg.problems), 8)
-
-    def test_beta_list(self):
-        d = self.folder(printers='{"printers": []}', beta='{"beta": ["ARROW01", " jdoe "]}')
-        self.assertEqual(self.load(d).beta, ["ARROW01", "jdoe"])
-        self.assertEqual(self.load(self.folder(printers='{"printers": []}')).beta, [])  # no file: nobody
-        cfg = self.load(self.folder(printers='{"printers": []}', beta='{"beta": "ARROW01"}'))
-        self.assertEqual(cfg.beta, [])
-        self.assertIn("beta.json", cfg.problems[0])
 
     def test_stock_file_optional(self):
         cfg = self.load(self.folder(printers='{"printers": [{"name": "A", "host": "192.0.2.1"}]}'))
@@ -346,127 +342,176 @@ FIRMWARE IN THIS PRINTER IS COPYRIGHTED
 \x03"""
 
 
-class SpecCheckTests(unittest.TestCase):
-    def test_parse_report(self):
-        self.assertEqual(zl.parse_config_report(ZD_REPORT), {
-            "darkness": 10.0, "speed": 6.0, "print_mode": "tear-off", "media": "gap", "print_width": 406})
+HS_BUSY = (b"\x02030,0,0,0217,002,0,0,0,000,0,0,0\x03\r\n"
+           b"\x02000,0,0,0,1,1,6,1,00000024,1,003\x03\r\n\x021234,0\x03\r\n")
 
-    def test_unknown_format_means_no_checks(self):
-        self.assertEqual(zl.parse_config_report("garbage\nmore garbage"), {})
 
-    def test_differences(self):
-        actual = zl.parse_config_report(ZD_REPORT)
-        same = {"print_width": 406, "media": "gap", "print_mode": "tear-off", "darkness": 10, "speed": 6,
-                "sensor": "transmissive"}
-        self.assertEqual(zl.spec_differences(same, actual), [])
-        diffs = zl.spec_differences({"darkness": 15, "print_mode": "peel-off", "print_width": 609}, actual)
-        self.assertEqual(diffs, ["Darkness is 10 (spec says 15)", "Print mode is tear-off (spec says peel-off)",
-                                 "Print width is 406 (spec says 609)"])
+class MonitorTests(unittest.TestCase):
+    def test_status_details(self):
+        d = zl.parse_host_status_details(HS_BUSY)
+        self.assertEqual((d["label_length_dots"], d["formats_waiting"], d["labels_remaining"]), (217, 2, 24))
+        self.assertEqual((d["thermal_transfer"], d["print_mode"], d["label_waiting"]), (True, "Peel-off", True))
+        self.assertEqual(zl.status_problems(d), [])
+        self.assertEqual(zl.parse_host_status(HS_PROBLEMS), ["Out of labels", "Paused", "Print head open"])
 
-    def test_check_printer_over_network(self):
-        fake = FakePrinter(config_report=ZD_REPORT.encode())
+    def test_config_lines(self):
+        lines = dict(zl.parse_config_lines(ZD_REPORT))
+        self.assertEqual(lines["DARKNESS"], "+10.0")
+        self.assertEqual(lines["LABEL LENGTH"], "0217")
+        self.assertEqual(lines["MAXIMUM LENGTH"], "39.0IN   988MM")
+        self.assertNotIn("PRINTER CONFIGURATION", lines)
+
+    def test_sgd(self):
+        fake = FakePrinter(sgd={"device.unique_id": "D2J193208123", "odometer.total_label_count": "10563"})
         self.addCleanup(fake.close)
-        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port, expected={"darkness": 12, "media": "gap"})
-        self.assertEqual(zl.check_printer(p), ([], ["Darkness is 10 (spec says 12)"]))
-        p.expected = {}
-        self.assertEqual(zl.check_printer(p), ([], None))  # no spec, no check
+        info = zl.query_sgd("127.0.0.1", fake.port, ["device.unique_id", "odometer.total_label_count", "nope"])
+        self.assertEqual(info, {"device.unique_id": "D2J193208123", "odometer.total_label_count": "10563",
+                                "nope": None})
+
+    def test_inspect_printer(self):
+        fake = FakePrinter(hs_reply=HS_BUSY, config_report=ZD_REPORT.encode(),
+                           sgd={"odometer.total_label_count": "19259"})
+        self.addCleanup(fake.close)
+        p = zl.Printer(name="Gary", host="127.0.0.1", port=fake.port, model="ZD420")
+        snap = zl.inspect_printer(p)
+        self.assertTrue(snap.reachable)
+        self.assertEqual(snap.state, ("Printing", "busy"))
+        self.assertEqual(snap.activity, "Printing: 24 labels left in this job")
+        self.assertEqual(snap.info["odometer.total_label_count"], "19259")
+        self.assertIn(("PRINT WIDTH", "406"), snap.report)
+
+    def test_label_length(self):
+        p = zl.Printer(name="Alaine", host="x", model="ZD420", dpi=203)
+        stock = zl.Stock("2x1-gap", "2 x 1 in", 2, 1, "gap")
+        self.assertIsNone(zl.check_label_length(p, stock, 217))  # 1.07 in: 1 in label plus its gap
+        self.assertIsNone(zl.check_label_length(p, stock, 196))  # 0.97 in: calibration wobble
+        self.assertEqual(zl.check_label_length(p, stock, 320), "Labels loaded are 1.57 in long, not 2 x 1 in")
+        self.assertIsNotNone(zl.check_label_length(p, stock, 180))  # 0.89 in: too short
+        self.assertIsNone(zl.check_label_length(p, None, 320))  # no stock: nothing to compare
+        self.assertIsNone(zl.check_label_length(p, stock, None))  # printer didn't say
+
+    def test_unreachable_and_non_link_os(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        snap = zl.inspect_printer(zl.Printer(name="Off", host="127.0.0.1", port=port))
+        self.assertEqual(snap.state, ("Not reachable", "off"))
+        self.assertIn("refused", snap.error)
+        self.assertFalse(zl.is_link_os(zl.Printer(name="x", model="Other")))  # never sent SGD
 
 
-class SelfUpdateTests(unittest.TestCase):
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        self.exe = os.path.join(self.dir, "Stripes.exe")
-        with open(self.exe, "wb") as f:
-            f.write(b"old version")
+class CheckPrinterTests(unittest.TestCase):
+    def test_check_printer_over_network(self):
+        fake = FakePrinter(hs_reply=HS_BUSY)
+        self.addCleanup(fake.close)
+        p = zl.Printer(name="n", host="127.0.0.1", port=fake.port)
+        self.assertEqual(zl.check_printer(p), ([], None))  # no stock: status only
+        self.assertEqual(zl.check_printer(p, zl.Stock("3x3", "3 x 3 in", 3, 3, "gap")),
+                         ([], "Labels loaded are 1.07 in long, not 3 x 3 in"))
 
-    def fake_github(self, files):
-        def fetch(url, timeout=60):
-            for suffix, data in files.items():
-                if url.endswith(suffix):
-                    return data
-            raise OSError(f"404 {url}")
-        return fetch
 
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_start_reaches_the_first(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        self.assertFalse(zl.SingleInstance(path).signal_running())  # nothing running yet
+        got, arrived = [], threading.Event()
+        first = zl.SingleInstance(path)
+        first.listen(lambda message: (got.append(message), arrived.set()))
+        self.addCleanup(first.close)
+        self.assertTrue(zl.SingleInstance(path).signal_running("show"))
+        self.assertTrue(arrived.wait(2))
+        self.assertEqual(got, ["show"])
+
+    def test_wrong_key_or_stale_file_is_ignored(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "instance.txt")
+        got = []
+        first = zl.SingleInstance(path)
+        first.listen(got.append)
+        self.addCleanup(first.close)
+        port = open(path).read().split()[0]
+        with open(path, "w") as f:
+            f.write(f"{port} not-the-key")
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        first.close()
+        with open(path, "w") as f:
+            f.write("1 stale")  # left over after a crash: nothing listens there
+        self.assertFalse(zl.SingleInstance(path).signal_running())
+        self.assertEqual(got, [])
+
+
+class PreviewTextTests(unittest.TestCase):
+    def test_drawn_like_font_0(self):
+        font = zl.find_preview_font()
+        if not font:
+            self.skipTest("no preview font on this machine")
+        img = zl.text_image("H", 200, font)
+        left, top, right, bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()
+        self.assertLessEqual(top, 3)  # capitals start at the top of the field...
+        self.assertAlmostEqual(bottom, 150, delta=4)  # ...and sit on the baseline at 75%
+        self.assertEqual(img.width, round(ld.printed_em("H") * 200))  # the printer's condensed width
+        img = zl.text_image("g", 200, font)
+        bottom = img.getchannel("A").point(lambda a: 255 if a > 128 else 0).getbbox()[3]
+        self.assertTrue(170 < bottom < img.height)  # the descender shows, not cut off
+
+
+class ExactPreviewTests(unittest.TestCase):
+    def test_labelary_error_is_reported(self):
+        with mock.patch.object(zl.sys, "platform", "win32"), \
+                mock.patch.object(zl, "wininet_post", return_value=(429, b"")) as post:
+            with self.assertRaisesRegex(OSError, "429"):
+                zl.labelary_png("^XA^XZ", ZT410)
+        host, path, data, headers = post.call_args.args
+        self.assertEqual((host, path, data), ("api.labelary.com", "/v1/printers/12dpmm/labels/3x3/0/", b"^XA^XZ"))
+        self.assertIn("Accept: image/png\r\n", headers)
+
+    @unittest.skipUnless(sys.platform == "win32", "WinINet is Windows only")
+    def test_wininet_post(self):
+        import http.server
+
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200 if self.path == "/echo" else 404)
+                self.end_headers()
+                self.wfile.write((self.headers.get("Accept") or "").encode() + b" " + body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Echo)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        status, body = zl.wininet_post("127.0.0.1", "/echo", b"x" * 100000, "Accept: image/png\r\n",
+                                       port=port, secure=False)
+        self.assertEqual((status, body), (200, b"image/png " + b"x" * 100000))  # read in several chunks
+        self.assertEqual(zl.wininet_post("127.0.0.1", "/nope", b"", "", port=port, secure=False)[0], 404)
+        server.shutdown()
+        server.server_close()
+        with self.assertRaises(OSError):  # nothing listening any more
+            zl.wininet_post("127.0.0.1", "/echo", b"", "", port=port, secure=False, timeout_ms=2000)
+
+
+class VersionTests(unittest.TestCase):
     def test_versions(self):
-        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2, 1, 0))
+        self.assertEqual(zl.parse_version("v1.10.2"), (1, 10, 2))
         self.assertIsNone(zl.parse_version("dev-abc1234"))
-        # a beta sorts after the release before it and before its own release
-        self.assertLess(zl.parse_version("v1.3.0"), zl.parse_version("v1.4.0-beta.1"))
-        self.assertLess(zl.parse_version("v1.4.0-beta.2"), zl.parse_version("v1.4.0-beta.10"))
-        self.assertLess(zl.parse_version("v1.4.0-beta.10"), zl.parse_version("v1.4.0"))
-        self.assertEqual(zl.display_version("v1.4.0-beta.2"), "v1.4.0 Beta 2")
-        fetch = self.fake_github({"/latest/download/version.txt": b"v1.10.0\n"})
-        self.assertEqual(zl.check_for_update("v1.9.9", fetch), "v1.10.0")  # not a text comparison
-        self.assertIsNone(zl.check_for_update("v1.10.0", fetch))
-        self.assertIsNone(zl.check_for_update("v2.0.0", fetch))
-        self.assertIsNone(zl.check_for_update("dev-abc1234", fetch))  # development builds never update
+        self.assertIsNone(zl.parse_version("v1.4.0-beta.2"))  # betas are gone
+        self.assertLess(zl.parse_version("v1.9.9"), zl.parse_version("v1.10.0"))  # not a text comparison
 
-    def beta_github(self, latest, beta=None):
-        files = {"/latest/download/version.txt": latest.encode()}
-        fetch = self.fake_github(files)
-        if beta is None:
-            def without_beta(url, timeout=60):
-                if url.endswith("/download/beta/version.txt"):
-                    raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
-                return fetch(url, timeout)
-            return without_beta
-        files["/download/beta/version.txt"] = beta.encode()
-        return fetch
-
-    def test_beta_channel(self):
-        fetch = self.beta_github("v1.3.0", "v1.4.0-beta.2")
-        self.assertIsNone(zl.check_for_update("v1.3.0", fetch, beta=False))  # betas never reach others
-        self.assertEqual(zl.check_for_update("v1.3.0", fetch, beta=True), "v1.4.0-beta.2")
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.1", fetch, beta=True), "v1.4.0-beta.2")
-        self.assertIsNone(zl.check_for_update("v1.4.0-beta.2", fetch, beta=True))
-        # the beta was withdrawn (pointed back at beta 1): beta PCs follow it back
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", self.beta_github("v1.3.0", "v1.4.0-beta.1"),
-                                             beta=True), "v1.4.0-beta.1")
-        # taken off the list: back to the release
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", fetch, beta=False), "v1.3.0")
-        # list unknown (server down, no saved copy): never go backwards
-        self.assertIsNone(zl.check_for_update("v1.4.0-beta.2", fetch, beta=None))
-        # the release caught up: beta PCs move to it
-        self.assertEqual(zl.check_for_update("v1.4.0-beta.2", self.beta_github("v1.4.0", "v1.4.0-beta.2"),
-                                             beta=True), "v1.4.0")
-        # nothing published to beta yet: beta PCs just get releases
-        self.assertEqual(zl.check_for_update("v1.2.0", self.beta_github("v1.3.0"), beta=True), "v1.3.0")
-        # a newer release a release PC somehow has is left alone
-        self.assertIsNone(zl.check_for_update("v2.0.0", fetch, beta=False))
-
-    def test_on_beta(self):
-        self.assertTrue(zl.on_beta(["ARROW01"], "arrow01", "jdoe"))
-        self.assertTrue(zl.on_beta(["ARROWFARMS\\JDoe"], "ARROW07", "jdoe"))
-        self.assertFalse(zl.on_beta(["ARROW01"], "ARROW07", "jdoe"))
-        self.assertFalse(zl.on_beta([], "ARROW01", "jdoe"))
-        self.assertIsNone(zl.on_beta(None, "ARROW01", "jdoe"))
-
-    def test_install_swaps_the_exe(self):
-        import hashlib
-        new = b"new version"
-        fetch = self.fake_github({"/download/v1.1.0/Stripes.exe": new,
-                                  "/download/v1.1.0/Stripes.exe.sha256": hashlib.sha256(new).hexdigest().encode()})
-        zl.install_update("v1.1.0", self.exe, fetch)
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), new)
-        olds = [n for n in os.listdir(self.dir) if n.startswith("Stripes.exe.old-")]
-        self.assertEqual(len(olds), 1)  # the running copy, moved aside
-        zl.remove_old_versions(self.exe)
-        self.assertEqual(os.listdir(self.dir), ["Stripes.exe"])
-
-    def test_damaged_download_leaves_current_copy(self):
-        fetch = self.fake_github({"/download/v1.1.0/Stripes.exe": b"truncated",
-                                  "/download/v1.1.0/Stripes.exe.sha256": b"0" * 64})
-        with self.assertRaises(ValueError):
-            zl.install_update("v1.1.0", self.exe, fetch)
-        with open(self.exe, "rb") as f:
-            self.assertEqual(f.read(), b"old version")
-        self.assertEqual(os.listdir(self.dir), ["Stripes.exe"])
-
-    def test_writable_folder(self):
-        self.assertTrue(zl.folder_is_writable(self.dir))
-        self.assertFalse(zl.folder_is_writable(os.path.join(self.dir, "missing")))
+    def test_old_copies_cleaned_up(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = os.path.join(d, "Stripes.exe")
+        for name in ("Stripes.exe", "Stripes.exe.old-123", "Stripes.exe.new"):
+            open(os.path.join(d, name), "w").close()
+        zl.remove_old_versions(exe)
+        self.assertEqual(os.listdir(d), ["Stripes.exe"])
 
 
 class DeploymentLogTests(unittest.TestCase):
@@ -486,11 +531,10 @@ class DeploymentLogTests(unittest.TestCase):
         first_seen = r["first_seen"]
 
         log.started("v1.2.0", "x")  # plain restart: no new event
-        log.write("Downloaded v1.3.0; finishes when Stripes restarts", pending_update="v1.3.0")
-        log.started("v1.3.0", "x")
+        log.started("v1.3.0", "x")  # Group Policy copied a new exe
         r = log.read()
         self.assertEqual(r["first_seen"], first_seen)
-        self.assertEqual((r["version"], r["pending_update"]), ("v1.3.0", None))
+        self.assertEqual(r["version"], "v1.3.0")
         self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.2.0", "v1.3.0"))
         self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v1.2.0 -> v1.3.0")
 
@@ -498,17 +542,20 @@ class DeploymentLogTests(unittest.TestCase):
         log.write(running=False, last_closed=zl._now())
         self.assertFalse(zl.is_open_now(log.read()))
 
+    def test_self_update_fields_dropped(self):
+        log = self.log()
+        with open(log.path, "w", encoding="utf-8") as f:  # written by a build that updated itself
+            f.write('{"version": "v1.4.0-beta.2", "beta": true, "pending_update": "v1.4.0",'
+                    ' "last_update_error": {"message": "offline"}}')
+        log.started("v1.5.0", "x")
+        r = log.read()
+        self.assertEqual(r["version"], "v1.5.0")
+        self.assertFalse({"beta", "pending_update", "last_update_error"} & set(r))
+
     def test_stale_heartbeat_is_not_open(self):
         from datetime import datetime, timedelta
         old = (datetime.now() - timedelta(hours=2)).isoformat(sep=" ", timespec="seconds")
         self.assertFalse(zl.is_open_now({"running": True, "last_seen": old}))
-
-    def test_repeated_update_errors_logged_once(self):
-        log = self.log()
-        log.update_failed("No answer")
-        log.update_failed("No answer")
-        log.update_failed("Something else")
-        self.assertEqual(len(log.read()["events"]), 2)
 
     def test_events_are_capped(self):
         log = self.log()
