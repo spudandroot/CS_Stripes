@@ -478,7 +478,7 @@ class ExactPreviewTests(unittest.TestCase):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 self.send_response(200 if self.path == "/echo" else 404)
                 self.end_headers()
-                self.wfile.write(self.headers["Accept"].encode() + b" " + body)
+                self.wfile.write((self.headers.get("Accept") or "").encode() + b" " + body)
 
             def log_message(self, *args):
                 pass
