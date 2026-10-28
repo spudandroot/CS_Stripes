@@ -14,6 +14,8 @@ import io
 from dataclasses import dataclass, field, asdict, fields
 from math import inf
 
+from i18n import tr
+
 MARGIN_IN = 0.06      # blank border around the label
 ITEM_GAP_IN = 0.03    # space between stacked items
 WIDTH_SAFETY = 1.08   # fudge factor on the character width estimate
@@ -27,6 +29,29 @@ SYMBOLOGIES = {"code128": "Code 128", "code39": "Code 39", "ean13": "EAN-13", "u
 _WEIGHTS = {"text": 1.0, "barcode": 1.4, "qr": 2.2, "image": 2.2}
 _MIN_IN = {"barcode": 0.25, "qr": 0.3, "image": 0.2}
 _MAX_IN = {"barcode": 1.0}
+
+# Zebra font 0, as measured on labelary.com and a real printer, in fractions of the
+# font height: capitals run from the top of the field to the baseline at CAP_HEIGHT.
+CAP_HEIGHT = 0.75
+# Advance width of each character in Zebra font 0, as a fraction of its height, measured
+# from labelary.com renders (which match the printers). Used to draw the preview.
+FONT0_WIDTHS = {
+    ' ': 0.296, '!': 0.294, '"': 0.48, '#': 0.48, '$': 0.48, '%': 0.904, '&': 0.608, "'": 0.294,
+    '(': 0.294, ')': 0.294, '*': 0.48, '+': 0.904, ',': 0.294, '-': 0.904, '.': 0.294, '/': 0.294,
+    '0': 0.48, '1': 0.48, '2': 0.48, '3': 0.48, '4': 0.48, '5': 0.48, '6': 0.48, '7': 0.48,
+    '8': 0.48, '9': 0.48, ':': 0.294, ';': 0.294, '<': 0.996, '=': 0.904, '>': 0.996, '?': 0.442,
+    '@': 0.904, 'A': 0.554, 'B': 0.554, 'C': 0.534, 'D': 0.59, 'E': 0.498, 'F': 0.498, 'G': 0.59,
+    'H': 0.608, 'I': 0.278, 'J': 0.442, 'K': 0.554, 'L': 0.48, 'M': 0.756, 'N': 0.608, 'O': 0.572,
+    'P': 0.554, 'Q': 0.572, 'R': 0.59, 'S': 0.534, 'T': 0.498, 'U': 0.608, 'V': 0.534, 'W': 0.812,
+    'X': 0.554, 'Y': 0.554, 'Z': 0.498, '[': 0.294, '\\': 0.48, ']': 0.294, '^': 0.498, '_': 0.498,
+    '`': 0.294, 'a': 0.462, 'b': 0.498, 'c': 0.442, 'd': 0.498, 'e': 0.48, 'f': 0.278, 'g': 0.498,
+    'h': 0.498, 'i': 0.258, 'j': 0.258, 'k': 0.442, 'l': 0.258, 'm': 0.756, 'n': 0.498, 'o': 0.48,
+    'p': 0.498, 'q': 0.498, 'r': 0.332, 's': 0.424, 't': 0.278, 'u': 0.498, 'v': 0.442, 'w': 0.664,
+    'x': 0.442, 'y': 0.442, 'z': 0.388, '{': 0.498, '|': 0.498, '}': 0.498, '~': 0.996,
+}
+# Text centered with ^FB prints this much of its height left of center (0.145-0.154
+# measured at heights 100-586), so centered fields are moved right by it.
+FB_CENTER_SHIFT = 0.15
 
 
 # --------------------------------------------------------------------------
@@ -64,12 +89,12 @@ class Element:
     def title(self):
         """Short description for lists."""
         if self.kind == "text":
-            return self.value or "(blank line)"
+            return self.value or tr("(blank line)")
         if self.kind == "barcode":
             return f"{SYMBOLOGIES[self.symbology]}: {self.value}"
         if self.kind == "qr":
             return f"QR: {self.value}"
-        return "Picture"
+        return tr("Picture")
 
 
 @dataclass
@@ -158,6 +183,11 @@ def char_em(c):
 
 def text_em(s):
     return sum(char_em(c) for c in s)
+
+
+def printed_em(s):
+    """Width of `s` in font 0 as printed, in font heights (text_em errs wide, for fitting)."""
+    return sum(FONT0_WIDTHS.get(c) or char_em(c) for c in s)
 
 
 def text_fit_height(text, width):
@@ -261,21 +291,21 @@ def _code128_values(data):
 def barcode_problem(symbology, data):
     """Why the data can't be printed as this barcode, or None if it's fine."""
     if not data:
-        return "Barcode is empty."
+        return tr("Barcode is empty.")
     if symbology == "code128":
         if any(not 32 <= ord(c) <= 126 for c in data):
-            return "Code 128 supports letters, digits and common symbols only."
+            return tr("Code 128 supports letters, digits and common symbols only.")
     elif symbology == "code39":
         if any(c not in _C39 or c == "*" for c in data.upper()):
-            return "Code 39 supports A-Z, 0-9, space and - . $ / + % only."
+            return tr("Code 39 supports A-Z, 0-9, space and - . $ / + % only.")
     elif symbology in ("ean13", "upca"):
         n = 12 if symbology == "ean13" else 11
         name = SYMBOLOGIES[symbology]
         if not data.isdigit() or len(data) not in (n, n + 1):
-            return f"{name} needs {n} digits (or {n + 1} with the check digit)."
+            return tr("{name} needs {n} digits (or {m} with the check digit).", name=name, n=n, m=n + 1)
         full = data if symbology == "ean13" else "0" + data
         if len(data) == n + 1 and ean_check_digit(full[:12]) != full[12]:
-            return f"{name} check digit is wrong; it should be {ean_check_digit(full[:12])}."
+            return tr("{name} check digit is wrong; it should be {digit}.", name=name, digit=ean_check_digit(full[:12]))
     return None
 
 
@@ -465,7 +495,7 @@ def render(design, label):
         if e.w <= 0 or e.h <= 0:
             continue
         if e.x < 0 or e.y < 0 or e.x + e.w > label.width or e.y + e.h > label.height:
-            warnings.append(f"Item {n} goes past the edge of the label.")
+            warnings.append(tr("Item {n} goes past the edge of the label.", n=n))
 
         if e.kind == "text":
             if not e.value.strip():
@@ -474,25 +504,25 @@ def render(design, label):
             if e.size_pt:
                 h = int(pt_to_dots(e.size_pt, label))
                 if h > fit + 0.5:
-                    warnings.append(f"Line {n} is probably too wide for its space.")
+                    warnings.append(tr("Line {n} is probably too wide for its space.", n=n))
                 if h > e.h + 0.5:
-                    warnings.append(f"Line {n} is taller than its space.")
+                    warnings.append(tr("Line {n} is taller than its space.", n=n))
             else:
                 h = int(min(e.h, fit))
             if h < label.dots(0.06):
-                warnings.append(f"Line {n} is very small and may be hard to read.")
+                warnings.append(tr("Line {n} is very small and may be hard to read.", n=n))
             h = max(1, h)
             marks.append(Mark("text", e.x, e.y + (e.h - h) // 2, e.w, h, e, e.value, h, e.align))
 
         elif e.kind == "barcode":
             problem = barcode_problem(e.symbology, e.value)
             if problem:
-                errors.append(f"Item {n}: {problem}")
+                errors.append(tr("Item {n}: {problem}", n=n, problem=problem))
                 continue
             modules = barcode_modules(e.symbology, e.value)
             module = min(10, e.w // len(modules))
             if module < 1:
-                errors.append(f"Item {n}: the barcode is too long to fit; shorten it or make its space wider.")
+                errors.append(tr("Item {n}: the barcode is too long to fit; shorten it or make its space wider.", n=n))
                 continue
             width = module * len(modules)
             human = barcode_human_text(e.symbology, e.value)
@@ -500,7 +530,7 @@ def render(design, label):
                 if e.show_text else 0
             bar_h = e.h - (text_h + 2 if text_h else 0)
             if bar_h < label.dots(0.15):
-                warnings.append(f"Item {n}: the barcode is very short and may not scan.")
+                warnings.append(tr("Item {n}: the barcode is very short and may not scan.", n=n))
             x = _place(e.x, e.w, width, e.align)
             marks.append(Mark("bars", x, e.y, width, max(1, bar_h), e, module=module, pattern=modules))
             if text_h:
@@ -508,12 +538,13 @@ def render(design, label):
 
         elif e.kind == "qr":
             if not e.value:
-                errors.append(f"Item {n}: QR code is empty.")
+                errors.append(tr("Item {n}: QR code is empty.", n=n))
                 continue
             matrix = qr_matrix(e.value)
             module = min(10, min(e.w, e.h) // len(matrix))
             if module < 1:
-                errors.append(f"Item {n}: the QR code holds too much to fit; shorten it or make its space bigger.")
+                errors.append(tr("Item {n}: the QR code holds too much to fit; shorten it or make its space bigger.",
+                                 n=n))
                 continue
             side = module * len(matrix)
             marks.append(Mark("qr", _place(e.x, e.w, side, e.align), e.y + (e.h - side) // 2,
@@ -579,7 +610,8 @@ def build_zpl(rendered, shift_x=0, shift_y=0, copies=1, border=None):
         e = mk.element
         if mk.kind == "text":
             just = {"left": "L", "center": "C", "right": "R"}[mk.align]
-            out.append(f"{pos(mk.x, mk.y)}^A0N,{mk.text_h},{mk.text_h}"
+            nudge = round(FB_CENTER_SHIFT * mk.text_h) if just == "C" else 0
+            out.append(f"{pos(mk.x + nudge, mk.y)}^A0N,{mk.text_h},{mk.text_h}"
                        f"^FB{mk.w},1,0,{just},0^FH^FD{zpl_escape(mk.text)}^FS")
         elif mk.kind == "bars":
             data = zpl_escape(e.value)

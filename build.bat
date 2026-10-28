@@ -1,8 +1,12 @@
 @echo off
 rem Builds dist\Stripes.exe locally. Needs Python 3.10+ from python.org.
 rem (Normally GitHub Actions builds it - see README.)
+rem   build.bat           version "dev"
+rem   build.bat v1.2.0    stamp a version
 setlocal
 cd /d "%~dp0"
+set "VERSION=%~1"
+if "%VERSION%"=="" set "VERSION=dev"
 
 where py >nul 2>nul
 if errorlevel 1 (
@@ -16,10 +20,12 @@ call .venv\Scripts\activate.bat || goto :fail
 python -m pip install --quiet --upgrade pip
 python -m pip install --quiet -r requirements.txt pyinstaller || goto :fail
 python -m unittest || goto :fail
-pyinstaller --noconfirm --onefile --windowed --name Stripes --icon assets\icon.ico --add-data "assets;assets" stripes.py || goto :fail
+python make_version.py %VERSION% || goto :fail
+pyinstaller --noconfirm pyinstaller.spec || goto :fail
+copy /y dist\Stripes.exe "dist\Stripes-%VERSION%.exe" >nul || goto :fail
 
 echo.
-echo Done: %cd%\dist\Stripes.exe
+echo Done: %cd%\dist\Stripes-%VERSION%.exe (and dist\Stripes.exe)
 pause
 exit /b 0
 
