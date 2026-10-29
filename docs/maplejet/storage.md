@@ -617,8 +617,13 @@ float|null · `printing` bool|null · `message_name` str|null · `bag_count` int
 int|null · `ink_name` str|null · `ink_level` int|null · `head_temp_c` int|null · `clock_offset_s`
 float|null · `running` RunningMessage|null (`slot` int, `name` str, `fingerprint` str, `origin_line`
 str, `read_at` float, `preview_sha256` str) · `daily` dict · `state` MachineSnapshot|null (`code` str,
-`colour` str, `headline` Msg, `since` float, `detail` list[Msg]) · `alerts` list of Alert ·
-`foreign_client` bool.
+`colour` str, `headline` Msg, `since` float, `detail` list[Msg]) · `alerts` list of Alert (`id` str,
+`machine_id` str, `line_id` str, `kind` str, `sound` bool, `msg` Msg, `started_at` float, `recipients`
+list[str], `active` bool, `colour` str, `ref` str, `acked_by` str, `acked_at` float|null, `ended_at`
+float|null, `waiting` list[str]) · `foreign_client` bool · `problem` str · `expected_counter` int ·
+`reread_seen` str · `unreachable_since` float|null · `running_ok_at` float|null · `running_unchecked`
+bool · `dst` dict · `standalone` bool. The fields after `foreign_client`, and the Alert fields after
+`active`, are states.md's additions (architecture.md §5.8 lists them all).
 
 Write rules, enforced by `ShareStore.write_poll`:
 
@@ -663,7 +668,15 @@ Write rules, enforced by `ShareStore.write_poll`:
  "state": {"code": "(states.md code)", "colour": "green", "headline": {"text": "Printing", "values": {}},
            "since": 1793270000.0, "detail": []},
  "alerts": [],
- "foreign_client": false
+ "foreign_client": false,
+ "problem": "",
+ "expected_counter": 42,
+ "reread_seen": "",
+ "unreachable_since": null,
+ "running_ok_at": 1793275170.4,
+ "running_unchecked": false,
+ "dst": {},
+ "standalone": false
 }
 ```
 
@@ -683,7 +696,9 @@ bool · `send_id` str · `message_name` str · `content_code` str · `fingerprin
 `origin_line` str · `previous_message_name` str · `previous_fingerprint` str · `result` str ·
 `failure` FailureInfo|null (`step` str, `msg` Msg, `after_switch` bool, `at` float) · `notes`
 list[str] · `confirmed` bool · `confirmed_by` str · `confirmed_at` float|null · `rejected` bool ·
-`resume_blocked` bool · `left_by` str · `left_at` float|null · `reread_token` str · `test` dict|null.
+`resume_blocked` bool · `left_by` str · `left_at` float|null · `reread_token` str · `test` dict|null ·
+`sender` str · `stop_reason` str · `stopped_by` str · `stopped_at` float|null. The last four are
+send.md's additions (architecture.md §5.8 lists them all).
 
 Write rules (`ShareStore.write_expected`):
 
@@ -693,6 +708,9 @@ Write rules (`ShareStore.write_expected`):
    `computer = identity.computer`.
 3. If the current file is from a newer format, `write_expected` raises `FormatTooNew` and doesn't
    write.
+4. The store remembers, in memory, the last `ExpectedState` it read or wrote for each machine (a
+   missing file is remembered as None). `cached_expected(machine_id) -> ExpectedState | None` returns
+   that copy without touching the share; send.md §10.3 uses it when the share is down.
 
 ```json
 {
@@ -724,7 +742,11 @@ Write rules (`ShareStore.write_expected`):
  "left_by": "",
  "left_at": null,
  "reread_token": "",
- "test": null
+ "test": null,
+ "sender": "EXAMPLE\\jsmith",
+ "stop_reason": "",
+ "stopped_by": "",
+ "stopped_at": null
 }
 ```
 
@@ -735,8 +757,8 @@ only: colours come from the machine files. Fields: `line_id` str · `counter` in
 `written_by` str · `send_id` str · `sent_at` float|null · `product_id` str · `film_id` str ·
 `film_revision` int · `print_text_id` str · `print_text_revision` int · `lot` str · `countries`
 list[str] · `origin_line` str · `machines` dict[str, str] · `confirmed` bool · `confirmed_by` str ·
-`stopped_needs_send` bool. `write_line_status` sets `counter` (file + 1), `written_at` and
-`written_by`, the same way as `write_expected`.
+`stopped_needs_send` bool · `sender` str (send.md's addition). `write_line_status` sets `counter` (file
++ 1), `written_at` and `written_by`, the same way as `write_expected`.
 
 ```json
 {
@@ -759,7 +781,8 @@ list[str] · `origin_line` str · `machines` dict[str, str] · `confirmed` bool 
  "machines": {"mc_5d1e2f3a4b": "amber"},
  "confirmed": false,
  "confirmed_by": "",
- "stopped_needs_send": false
+ "stopped_needs_send": false,
+ "sender": "EXAMPLE\\jsmith"
 }
 ```
 
@@ -1214,8 +1237,11 @@ Rules:
 ### 11.1 States
 
 `ShareStore.lock(printer_id, *, purpose, run_id, line_id="", machine_id="")` returns an unheld
-`PrinterLock`. Only the thread that created the lock calls its methods; its keeper thread is
-internal.
+`PrinterLock`. `acquire()` and `start_keeping()` are called on one thread (the one that creates the
+lock). `check()`, `update()` and `release()` may be called from any thread: send.md takes every lock
+of a Send on its whole-Send thread and then uses each one from that machine's thread. One internal
+`threading.Lock` guards `state`, `info`, `last_ok` and the pending note; the keeper thread takes it too.
+No share operation runs while holding it, so `check()` never blocks on the share.
 
 | `state` | Meaning |
 |---|---|
@@ -1229,8 +1255,9 @@ internal.
 `acquire() -> str`:
 
 1. If `printer_id` is already in `store.local_locks`, raise `LockHeld(Msg(N_("{user} on {computer} is
-   using this printer.")), info=<the holder's LockInfo>)`. Another Send or test in this process holds
-   it.
+   using this printer."), {"user": info.user, "computer": info.computer}), info=info)` with `info` the
+   holder's `LockInfo`. Another Send or test in this process holds it. Every `LockHeld` raised in
+   §11.2 and §11.4 carries this same `Msg`, filled from its own `info`.
 2. Register `store.local_locks[printer_id] = run_id`, together with the `LockInfo` kept privately in
    the store. This comes before any share access, so this PC's poller steps aside at once.
 3. Build a `LockInfo` with a new `token`, our `user`, `computer` and `pid`, the purpose and ids,
@@ -1265,8 +1292,17 @@ retries, the age is known.
 
 For a `local_only` lock the keeper does nothing.
 
-`check()` raises `LockLost(Msg(N_("Another PC took over this printer's lock.")))` when the state is
-`lost`, and does nothing otherwise. Holders call it before every printer request and every step. A
+`last_ok` starts at the moment `acquire()` created or took over the file, and moves on every
+successful refresh (step 3).
+
+`check(budget_s: float = 0.0)` raises `LockLost(Msg(N_("Another PC took over this printer's lock.")))`
+when the state is `lost`, or when the state is `held` and `clock.monotonic() − last_ok + budget_s >=
+lock_stale_s / 2`, whatever the keeper has set so far (the keeper runs only every `lock_refresh_s`, so
+it can notice a failing share up to 5 s late). In the second case the state also becomes `lost`. It
+does nothing for a `local_only` lock. Holders call it before every printer request with `budget_s` =
+the worst case of that call (`hx_protocol.worst_case_s`, protocol.md §8.3), so no request can still be
+running when another PC may judge the lock stale: the last request starts at least `budget_s` before
+`last_ok + lock_stale_s / 2`, and other PCs wait `lock_stale_s` after the last refresh they saw. A
 holder that gets `LockLost` stops talking to that printer at once (send.md decides what is shown).
 
 ### 11.4 Takeover of a stale lock

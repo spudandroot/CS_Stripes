@@ -961,8 +961,9 @@ class MachineResult:
     fingerprint: str = ""
     origin_line: str = ""
     readbacks: list[MessageDesign] = []   # idle slot, running 1, running 2, as far as reached
-    previous: RunningMessage | None = None   # what it was last confirmed printing
+    previous: RunningMessage | None = None   # what it was printing just before this Send
     previous_preview: bytes = b""
+    previous_confirmed: bool = False         # previous is the last Send's confirmed message (send.md §10.5)
     counts_before: int | None = None
     counts_after: int | None = None
     notes: list[str] = []        # "pc_time", "no_lock", "local_copy", "ink_mismatch", "film_stop"
@@ -1004,6 +1005,7 @@ class TestResult:
     ok: bool
     msg: Msg | None = None       # why it stopped early
     cleared: bool = False        # slots 9 and 10 were overwritten with empty messages
+    printing_off: bool = False   # the end procedure read printing off twice (send.md §15.5)
 
 # Events: posted on the EventBus. All plain data; never Tk objects.
 @dataclass(kw_only=True)
@@ -1326,11 +1328,14 @@ class PrinterClient:
         # another code -> CommandRefused; no reply -> NoReply (the write may or may not have happened)
     def check_uid(self) -> None: ...                # raises WrongPrinter
     def login(self) -> None: ...                    # web login; raises AuthFailed
-    def load_slot(self, slot: int) -> MessageDesign: ...
+    def load_slot(self, slot: int, *, deadline: float | None = None) -> MessageDesign: ...
         # slot 0..10 (0 = printing now). Logs in when needed, Load then sme_repeat until the reply
-        # carries this request's TN and XID; raises WebReadFailed after web_repeat_max or web_repeat_window_s
-    def fonts(self) -> list[str]: ...               # OPEN: source of the font list (protocol.md)
-    def firmware(self) -> str | None: ...           # OPEN: as fonts
+        # carries this request's TN and XID; raises WebReadFailed after web_repeat_max or web_repeat_window_s.
+        # deadline (clock.monotonic()): no exchange starts that couldn't end by it (protocol.md §10.6)
+    def fonts(self) -> list[str]: ...               # GET /sfl.xml (protocol.md §10.8); OPEN: the source
+    def firmware(self) -> str | None: ...           # GET /idn.xml; OPEN: as fonts
+    def probe(self) -> bool | None: ...             # bare TCP connect under the gate, nothing sent;
+                                                    # None when the gate was busy (protocol.md §9)
 
 class ClientPool:
     """One PrinterClient per printer record, rebuilt when host, port, uid or token change."""
@@ -1341,8 +1346,14 @@ class ClientPool:
 
 Transport rules fixed here: plain HTTP to port 80, one request per TCP connection, never through a
 proxy (never `urllib.request`; `http.client.HTTPConnection` or a raw socket only). The client never
-requests the web editor page (`GET /simple_msg.html`) or any other web file except the login POST,
-`/simple_msg.html?sme` and `/simple_msg.html?sme_repeat`.
+requests the web editor page (`GET /simple_msg.html`). The only web requests are the login POST,
+`POST /simple_msg.html?sme` (Load), `POST /simple_msg.html?sme_repeat`, and the two small files of
+`hx_protocol.WEB_FILES`: `GET /sfl.xml` (the font list) and `GET /idn.xml` (the firmware version),
+which `fonts()` and `firmware()` need because no Autopilot query returns either. Those two GETs are
+made only under a held printer lock (a Send's or test's machine check) or by the assigned poller after
+its lock check (the daily check). This widens the plan's "the only web request Stripes makes" and is
+listed for the owner's sign-off (§12.1). OPEN: confirm on the test unit that the files need the login
+cookies and that fetching them doesn't disturb printing.
 
 ### 6.5 hx_time (owner: send.md)
 
@@ -1365,15 +1376,21 @@ class TimeSource:
     def set_hosts(self, hosts: list[str]) -> None: ...   # from Company.time_server and _fallback
     def now(self, *, fresh: bool = False) -> TimeReading: ...
         # never raises: fresh=True asks the server(s) now; otherwise a cached offset younger than
-        # cache_s is used. No answer -> source "pc" (the caller warns and marks the result amber)
+        # cache_s is used, and a failed query is remembered for cache_s (no new query meanwhile).
+        # No answer -> source "pc" (the caller warns and marks the result amber)
+    def cached(self) -> TimeReading: ...
+        # never queries and never blocks: the cached server offset (send.md §9.2), else the PC's time
+    offset_fn: Callable[[float], float]   # the offset function given; the poller's DST rules use it
 
 class DstWatcher:
     def __init__(self, *, clock: Clock = SYSTEM_CLOCK, offset_fn=local_utc_offset) -> None: ...
     def changed(self) -> bool: ...   # True once, on the first call after this PC's UTC offset changed
 ```
 
-Thread notes: `TimeSource` is thread-safe (a lock around its cache); `now(fresh=True)` can block for
-up to `timeout_s` per host, so it's called from worker threads only.
+Thread notes: `TimeSource` is thread-safe (a lock around its cache); `now()` can block for up to
+`timeout_s` per host (plus name resolution, which has no time limit), so it's called from worker
+threads only, and never from a poller worker: the poller uses `cached()`, and its `hx-time` thread
+keeps the cache fresh (§7.1).
 
 ### 6.6 hx_share (owner: storage.md)
 
@@ -1449,6 +1466,8 @@ class ShareStore:
     def live_heartbeats(self) -> list[HeartbeatInfo]: ...   # counter moved within stale_s, same FORMAT
 
 class PrinterLock:
+    """Thread-safe: acquire() and start_keeping() on one thread; check(), update() and release() from
+    any thread (a Send takes the locks on its whole-Send thread and its machine threads use them)."""
     printer_id: str
     info: LockInfo | None
     state: str                   # "unheld" | "held" | "local_only" | "lost"
@@ -1459,6 +1478,9 @@ class PrinterLock:
         # (renamed aside first, so only one PC wins). Raises LockHeld(info) for a live holder.
     def start_keeping(self) -> None: ...   # 'hx-lock-<printer>' thread bumps the counter every lock_refresh_s
     def update(self, **note) -> None: ...  # e.g. update(step=12, of=40); written at the next refresh
+    def check(self, budget_s: float = 0.0) -> None: ...
+        # before every printer request: raises LockLost when the lock is lost, or when the next call
+        # (lasting up to budget_s) could still run when another PC may judge the lock stale (storage.md §11.3)
     def release(self) -> None: ...         # idempotent; stops the keeper, removes the file and the local entry
     def __enter__(self) -> "PrinterLock": ...
     def __exit__(self, *exc) -> None: ...
@@ -1533,15 +1555,21 @@ class SendPipeline:
         # (only where expected.send_id still equals send_id). Raises NotAllowed if not the sender.
     def leave_it(self, send_id: str, machine_ids: list[str]) -> None: ...
         # keeps them red, logs who and when, and sets a new reread_token
+    def record_offline(self, entry: dict) -> list[str]: ...
+        # after an outage: writes the expected state of a Send made without the share (send.md §14.1);
+        # returns the machine ids it wrote
 
 class PrinterActions:
     def __init__(self, *, store: ShareStore, data: DataService, clients: ClientPool, time: TimeSource,
                  identity: Identity, clock: Clock = SYSTEM_CLOCK, timings: Timings = TIMINGS) -> None: ...
     def stop(self, machine_ids: list[str], on_event: Callable[[object], None], *,
-             reason: str = "user", send_id: str = "") -> ActionResult: ...   # reason "user" | "rejected"
+             reason: str = "user", send_id: str = "", action_id: str = "") -> ActionResult: ...
+        # reason "user" | "rejected"; action_id "" means new_id("ac"); the UI passes its own (§7.1)
     def check_resume(self, machine_id: str) -> ResumeCheck: ...
-    def resume(self, machine_ids: list[str], on_event: Callable[[object], None]) -> ActionResult: ...
-    def set_clocks(self, machine_ids: list[str], on_event: Callable[[object], None]) -> ActionResult: ...
+    def resume(self, machine_ids: list[str], on_event: Callable[[object], None], *,
+               action_id: str = "") -> ActionResult: ...
+    def set_clocks(self, machine_ids: list[str], on_event: Callable[[object], None], *,
+                   action_id: str = "") -> ActionResult: ...
 
 class TestPrintRun:
     def __init__(self, *, store: ShareStore, data: DataService, clients: ClientPool, time: TimeSource,
@@ -1550,6 +1578,9 @@ class TestPrintRun:
     def run(self, on_event: Callable[[object], None], *, cancel: CancelToken | None = None) -> TestResult: ...
         # holds the printer lock for the whole run; cancel stops at the next safe point and then
         # always runs the end procedure (printing off, both slots emptied, "Stopped, needs a Send")
+    def end_again(self, on_event: Callable[[object], None]) -> TestResult: ...
+        # only the end procedure, under a new lock: the administrator's Try again when printing
+        # couldn't be confirmed off (send.md §15.5)
 ```
 
 ### 6.8 hx_poller (owner: states.md)
@@ -1560,7 +1591,8 @@ class Poller:
     'hx-poll-<printer_id>' per printer this PC currently polls (§7.1)."""
     def __init__(self, *, store: ShareStore, data: DataService, clients: ClientPool, time: TimeSource,
                  bus: EventBus, identity: Identity, version: str, clock: Clock = SYSTEM_CLOCK,
-                 timings: Timings = TIMINGS) -> None: ...
+                 timings: Timings = TIMINGS, local: LocalStore | None = None) -> None: ...
+        # local: for the reach memory (storage.md §12.3); None in tests (an in-memory one that can poll)
     def start(self) -> None: ...
     def stop(self, timeout_s: float = 2.0) -> None: ...
         # hands each polled printer to the next ranked poller (yielded_to), removes the heartbeat
@@ -1630,7 +1662,7 @@ class FakeSntp:
 
 class FakeWorld:
     """A temp share, fake printers and a fake time server, seeded with example records (Example Co,
-    Line 1 Bagger 1, ...) through the public hx_share API."""
+    Line 1 Bagger 1, ...) with hx_share.write_record plus a changes.json (protocol.md §16.2)."""
     def __init__(self, tmpdir: str, *, printers: list[dict] = (), clock: Clock = SYSTEM_CLOCK,
                  timings: Timings = TIMINGS) -> None: ...
     share_root: str
@@ -1638,7 +1670,8 @@ class FakeWorld:
     printers: list[FakePrinter]
     sntp: FakeSntp
     def identity(self, name: str, *, admin: bool = False, sender: bool = True, pid: int = 1) -> Identity: ...
-    def store(self, identity: Identity) -> ShareStore: ...   # each simulated PC gets its own store
+    def store(self, identity: Identity) -> ShareStore: ...   # each simulated PC gets its own store,
+                                                             # on its own fs.view() (per-PC caches)
     def close(self) -> None: ...
 
 # python hx_fake.py [--printers N] [--encoder] [--mixup]
@@ -1777,10 +1810,11 @@ class MapleJetTab(ttk.Frame):
 | `hx-data` | `DataService.start` | 1 | Reload HxData, local copy, flush the send-log queue | `stop()` |
 | `hx-poller` | `Poller.start` | 1 | Heartbeat every `heartbeat_s`, assignment, start/stop workers, standalone schedule, DST check | `stop()` |
 | `hx-poll-<printer>` | `Poller` | 1 per printer polled here | That printer's cycle, one request at a time | assignment change, lock, `stop()` |
+| `hx-time` | `Poller.start` | 1 | `TimeSource.now(fresh=True)` every `cache_s`, so the poller's `cached()` reading stays fresh without a worker ever waiting on the time server | `stop()` |
 | `hx-watch` | `StatusWatcher.start` | 1 | Read status every `watch_s`, post `BoardUpdate` | `stop()` |
 | `hx-send-<id>` | UI | 1 per Send | `SendPipeline.run`: locks, waits, joins machine threads, logs | when done |
 | `hx-send-<id>-<machine>` | `SendPipeline` | 1 per machine | That machine's steps | when done |
-| `hx-action-<id>` | UI | 1 per Stop/Resume/Set clocks | `PrinterActions` call | when done |
+| `hx-action-<action_id>` | UI (which makes the `action_id` with `new_id("ac")` and passes it in) | 1 per Stop/Resume/Set clocks | `PrinterActions` call | when done |
 | `hx-test-<id>` | UI | 1 | `TestPrintRun.run` | when done or cancelled |
 | `hx-lock-<printer>` | `PrinterLock.start_keeping` | 1 per held lock | Bump the lock counter every `lock_refresh_s` | `release()` |
 | `hx-io` | `ShareStore` | a small pool | File operations, each abandoned after `share_timeout_s` | a stuck one when its OS call returns |
@@ -1844,13 +1878,24 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
    `poll.json` shows `paused_for_lock` equal to its token, or its counter has been stale for `stale_s`,
    or there is no `poll.json` for that machine. The countdown usually covers the wait.
 6. **The poller's one write.** The automatic clock set after a daylight-saving change is made only by
-   the assigned poller, only while no lock is held (checked right before the request), once per change,
-   never repeated, logged to `hx-events`. It doesn't take a lock: it is already the only PC talking to
-   that printer.
+   the assigned poller, only while no lock is held (checked right before each request), once per
+   change and printer, never repeated, logged to `hx-events` (states.md §6.11). It doesn't take a
+   lock: it is already the only PC talking to that printer.
 7. **Share down.** No lock can be taken (`local_only`) and pollers can't coordinate. That PC's Send
    still checks and confirms each printer but every machine is amber (plan wording). In standalone
    mode only PCs with a MapleJet monitor or the floor board open poll, every `standalone_poll_s` at a
-   random offset, quick items only.
+   random offset, quick items only, and only once the share has been unreachable for `lock_stale_s`
+   without a break (states.md §6.12). **Residual risk (owner sign-off, §12.1):** when only some PCs
+   lose the share (a broken SMB session on one PC), that PC's standalone checks can overlap the
+   share-mode pollers and lock-holding senders on the other PCs for as long as its outage lasts, and
+   those senders get no `no_lock` warning. The overlap is limited to the quick reads every 30 s; web
+   read-backs stay safe because they carry request numbers, and a mixed-up Autopilot reply can only
+   turn a result red (a false alarm), never pass a wrong message.
+8. **Holding a lock is bounded in time.** A holder never starts a printer call that could still be
+   running when another PC may judge its lock stale: `PrinterLock.check(budget_s)` before every call,
+   with the call's worst case from `hx_protocol.worst_case_s` (storage.md §11.3, protocol.md §8.3).
+   The same applies to the poller and its own `poll.json`: it never starts a request that could still
+   be running `stale_s / 2` after its last successful `poll.json` write (states.md §6.4).
 
 Sequence of a Send's first request to a printer:
 
@@ -1905,10 +1950,11 @@ How failures become results and machine states (send.md fills in the texts):
 | `set_clock` | `TimeServerError` (inside `TimeSource`) | PC time used, warning | amber note `pc_time` | `notes` |
 | `set_clock`, `build` | `PrinterError`, `CommandRefused` | Machine stops; previous message still printing | red | `failure` |
 | `verify_idle` | `CheckFailed`, `WebReadFailed` | Machine stops before switching | red | `failure` |
+| `switch`, before PRINTMSG | the "switch pending" state can't be written with a `held` lock, or the switch entry can't be saved even on this PC | Machine stops before switching (send.md §10.9) | red | `failure` when it can be written |
 | `switch`, `confirm_1`, `confirm_2` | any | Machine stops; "may be printing the new message, the old one, or nothing" | red, `after_switch` | `failure` with `after_switch`, mode `switch_pending` kept |
 | all passed | none | Live, waiting for the sender | amber "Send not confirmed" | mode `running`, `confirmed` False |
 | `operator_confirm` | "Everything is right" | | green | `confirmed` True |
-| `operator_confirm` | "Something's wrong" | Stop dialog follows | red | `rejected`, `resume_blocked` |
+| `operator_confirm` | "Something's wrong" | Stop dialog follows | red | `rejected`, `resume_blocked` (no `failure`: states.md judges it from `rejected`) |
 | PC crash mid-Send | lock goes stale | Poller reads the running message | red "Send interrupted on PC X" (old) or amber "Send interrupted, not confirmed" (new) | written by nobody; the poller judges from `switch_pending` |
 
 Poller-side failures: `NoReply` counts towards `unreachable_after`; `BadReply` and mixed-up web replies
@@ -1930,7 +1976,7 @@ and logic tests use `FakeClock`.
 |---|---|---|
 | Fake printer | `hx_fake.FakePrinter` | A real HTTP server on 127.0.0.1 (`http.server.ThreadingHTTPServer`, its own port). Autopilot queries and writes; message design (CRTMSG, CTEXT, CTDAT, CPPARM, SAVEMSG, PRINTMSG, PRINT, TD); the web login and the cookies; Load and `sme_repeat` with **one shared reply buffer** (first reply = previous result, possibly another client's or SAVEMSG's); **mixed-up replies** when two or more requests are in flight (`mixup`), busy (7) at overlap; **first request after idle dropped** (`drop_after_idle_s`); **401** with a gzipped login page without a valid token or after `expire_web_session`; the **slow 2.3 MB editor page** that stalls every other request; **encoder and delay modes** (ENCST, DLYMM in mm vs DELAY in µs, DELAY query reporting ms); size read back one lower; defaults for unset print settings (speed 1000, delay 0, angle 30); counters that rise with `print_bags`; a clock with an offset; `violations` for anything Stripes must never do |
 | Fake SNTP | `hx_fake.FakeSntp`, and `TimeSource(query=...)` | A time server with an offset, or silent |
-| Fake share | `FakeWorld.share_root` (a temp folder) plus `hx_share.FlakyFileOps` | The real file code on a temp folder; `down`, `slow_s` and `hide_new_s` fake a dead, slow or listing-cached share |
+| Fake share | `FakeWorld.share_root` (a temp folder) plus `hx_share.FlakyFileOps` | The real file code on a temp folder; `down`, `slow_s` and `hide_new_s` fake a dead, slow or listing-cached share; `view(down=..., slow_s=...)` cuts off or slows one simulated PC alone (storage.md §16) |
 | Fake clock | `hx_core.FakeClock` | Deterministic time for single-threaded logic: lock staleness, takeover, 24-hour rule, DST |
 | Scaled timings | `TIMINGS.scaled(f)` | The real threads at 1/f of the real waits |
 | Fake identity | `FakeWorld.identity(...)` or `Identity(...)` | Senders, administrators and plain users; several PCs in one process |
@@ -1951,10 +1997,13 @@ and logic tests use `FakeClock`.
 | `test_hx_share_windows.py` | `skipUnless(sys.platform == "win32")`: a reader holding a file open during a swap; add-only folders; `open_for_read` |
 | `test_hx_send.py` | Full Send on a delay and an encoder fake: commands, three read-backs, expected states, log; failure injected at every step → the result and expected state in §8; Try again; Leave it; confirm by someone else refused; Stop, Resume (refused after a rejection or a changed message), Set clocks; test print with counted and timed steps, the 60 s no-print stop, the end procedure; calibration; `writes ⊆ ALLOWED_WRITE_TAGS`; never SAVEMSG to the printing slot while printing; never `SETPPARAM` |
 | `test_hx_poller.py` | Request budget under 1 request/s per printer; pause for a lock and resume; drift needs a second reading; unreachable after 3 failures and the backoff; standalone mode; the DST clock set fires once, only without a lock |
-| `test_hx_sim.py` | Several simulated PCs (own identity, store, pool, gates) on one share with several fakes, `mixup` on: PCs drop out and return, printers switched off, a Send from two PCs at once. Asserts: every fake's `max_in_flight == 1`, no `violations`, one writer per `poll.json` at a time, takeover within 15–20 s (scaled), NOT MONITORED when every poller is gone |
+| `test_hx_sim.py` | Several simulated PCs (own identity, store, pool, gates) on one share with several fakes, `mixup` on: PCs drop out and return, printers switched off, a Send from two PCs at once, a slow printer with a slow share and a silent time server, one PC cut off from the share alone. Asserts: every fake's `max_in_flight == 1` (in the one-PC-cut-off case, which §7.3 rule 7 accepts as a residual risk, that and the "two requests in flight" violation are replaced by: every Send's read-backs matched their own TN and XID), no `violations`, one writer per `poll.json` at a time, takeover within 15–20 s (scaled), NOT MONITORED when every poller is gone |
 | `test_hx_ui.py` | Under xvfb (skipped if Tk can't start): the MapleJet tab builds; the Send window flow against fakes (bus pumped by hand, dialogs patched); result and red windows; monitor and floor board render a `BoardView`; an admin save; Ctrl+P ignored on the MapleJet tab and in MapleJet windows; bag text unchanged after switching to Spanish and running `App._retranslate` |
-| `test_i18n.py` (changed) | `SOURCES` also lists every `hx_*.py` except `hx_fake.py`; the test imports them so their catalogues are registered |
+| `test_i18n.py` (changed) | `SOURCES` also lists every `hx_*.py` except `hx_fake.py` and the generated `hx_key.py`; the test imports them so their catalogues are registered |
 | `test_stripes.py` (changed) | The v2 paths, the one-time settings copy, the deployment-log folder, the Zebra config read from `v2\config` with the fallback |
+| `test_make_version.py` (changed) | deploy.md §6.1: `parse_key`, `stamp_key`, `key_id` equal to `hx_protocol.key_id`, `main` |
+| `test_deploy.py` (new) | deploy.md §6.2: `.gitignore`, no `hx_key.py` in the checkout, the app never imports `hx_fake`, the spec's excludes, the app imported with the exe's exclusions blocked, the self-check from source, `check_release_key`, `version_text` |
+| `test_folder_script.py` (delivered after development) | deploy.md §8.8, Windows only |
 
 ### 9.3 Keeping the GUI testable
 
@@ -1972,8 +2021,9 @@ and logic tests use `FakeClock`.
 
 ## 10. stripes.py integration and paths
 
-This is the complete list of changes to `stripes.py` and `i18n.py`. ui.md describes what appears inside
-the MapleJet tab; it doesn't add hooks.
+This is the complete list of changes to `stripes.py` and `i18n.py`, including the three key hooks
+deploy.md §1.3 specifies (§10.6 item 5). ui.md describes what appears inside the MapleJet tab; it
+doesn't add hooks.
 
 ### 10.1 Start-up order in `App.__init__`
 
@@ -1992,7 +2042,8 @@ the MapleJet tab; it doesn't add hooks.
 2. Below them: `self.top_tabs = ttk.Notebook(outer)`, packed `fill="both", expand=True`.
 3. `self.zebra_tab = ttk.Frame(self.top_tabs)` is added with the text `"  Zebra  "`; the printer row,
    stock row, `body`, `bottom` and `status` that `_build` packs into `outer` today are packed into
-   `self.zebra_tab` instead, unchanged (including `before=body`).
+   `self.zebra_tab` instead, unchanged (including `bottom` packed `side="bottom", before=body` and
+   `status` packed `side="bottom", before=bottom`, as `stripes.py` does today).
 4. `self.hx_tab = hx_ui.MapleJetTab(self.top_tabs, self.hx)` is added with the text `"  MapleJet  "`.
    Both tab texts are names, so they aren't passed through `tr()`.
 5. `self.top_tabs.bind("<<NotebookTabChanged>>", ...)` calls `self.hx_tab.on_shown()` or
@@ -2086,7 +2137,14 @@ Changes in `stripes.py`:
 
    Every `hx_` module with `N_()`/`tr()` texts defines `ES = {...}` near its top and calls
    `i18n.add_spanish(ES)` right after it, so parallel builders never edit the same catalogue. The new
-   `stripes.py` texts (e.g. "MapleJet monitor" → "Monitor MapleJet") go into `i18n.ES` directly.
+   `stripes.py` texts (e.g. "MapleJet monitor" → "Monitor MapleJet", deploy.md's "Version {version}
+   (development key)" → "Versión {version} (clave de desarrollo)") go into `i18n.ES` directly.
+5. The printer-password key (deploy.md §1.3, exactly as written there): `import hx_key` in a
+   `try`/`except ImportError` right after the `VERSION` import block, setting `HX_KEYED`;
+   `check_release_key(version, keyed)` and `version_text()` in the "Versions" section;
+   `App._build` and `App._language_changed` use `version_text()` for the version label;
+   `_self_check()` calls `check_release_key(VERSION, HX_KEYED)` first and `hx_ui.self_check(root)` last
+   (item 3).
 
 ## 11. OPEN items (confirm on the test unit)
 
@@ -2096,11 +2154,12 @@ Changes in `stripes.py`:
 | Which counter counts bags | `Company.bag_counter` = `"PMCNT"`, `"MSCNT"` or `"none"`; `PollStatus.bag_count` | `"PMCNT"`; `"none"` makes test steps timed (`Machine.seconds_per_bag × bags_per_step`, with the 60 s no-print stop replaced by the whole test time plus a margin) |
 | Speed units and range | `Machine.print_speed` sent as PRNSPD | cm/min; no default value (an administrator must enter it); accepted range 1–2500; a refused value fails the build step and the read-back check |
 | Beacon | none: `BEACON_SUPPORTED = False` | Never queried or switched; a future command would have to be added to `ALLOWED_WRITE_TAGS` deliberately |
-| Font list and firmware source | `PrinterClient.fonts()`, `firmware()` | protocol.md picks a small source; until confirmed, a missing font list fails the machine check (red), never passes it |
+| Font list and firmware source | `PrinterClient.fonts()`, `firmware()` | `GET /sfl.xml` and `GET /idn.xml` (§6.4, protocol.md §10.8); a missing font list fails the machine check (red), never passes it. Confirm the files, whether they need the cookies, and that fetching them doesn't disturb printing |
+| Item bounds and the print area (BOUND units, the 256 × 160 canvas against the 1024 × 160 preview) | `hx_message.compare` rule 6 (send.md §8.1) | an item whose BOUND runs outside 0..1024 by 0..160 fails the read-back (red); lower the x limit to 256 if the test unit shows the canvas width clips |
 | Film print length (film-stop warning) | `Film.print_length_mm` | `None`: no warning possible, shown as "print length unknown" in the Send window |
 | Item position units, gaps, escaping of `& < >` and `ñ` | `PrintTextItem.gap`, `Command.block` escaping | protocol.md and send.md choose; the read-back compare catches any mismatch as red |
 | Midnight date rollover in TD | `clock_command(local)` | send.md chooses the DTRH/DTRM values; the clock read-back flags a mismatch |
-| Reachability probe for new PCs (a PC gets printers only after reaching one) | `HeartbeatInfo.can_poll`, `last_printer_reach` | storage.md: a bare TCP connect to port 80 with no request, at most once an hour, to one printer not locked; confirm it doesn't disturb a printing printer |
+| Reachability probe for new PCs (a PC gets printers only after reaching one) | `HeartbeatInfo.can_poll`, `last_printer_reach`, `PrinterClient.probe()` | storage.md §12.3: a bare TCP connect to port 80 with no request, through `probe()` (never while this PC's gate is busy), at most every 60 s, only to a printer that has no live poller and no lock; confirm it doesn't disturb a printing printer |
 
 ## 12. Decisions made in this spec
 
@@ -2173,3 +2232,28 @@ Changes in `stripes.py`:
     screens need an administrator SID before anyone can edit anything.
 30. **Send logs go through `DataService`** (`append_send_log`, `find_send`), the one object that holds
     both the share and this PC's queue.
+31. **Every added status field is listed in §5.8**, with its owner, so the `hx_model` builder has one
+    source and `from_json` never drops a field another module relies on.
+32. **Two small web GETs** (`/sfl.xml`, `/idn.xml`) are the only additions to the web requests (§6.4),
+    because the plan requires the font list and no Autopilot query returns it. Listed in §12.1.
+33. **Time-bounded holding.** Lock holders pass each call's worst case to `PrinterLock.check`, and
+    `load_slot` takes a deadline, so no request can outlive a lock or a `poll.json` that another PC is
+    about to judge stale (§7.3 rule 8). The poller never waits on the time server (`TimeSource.cached()`
+    and the `hx-time` thread).
+34. **The UI makes the `action_id`** of a Stop, Resume or Set clocks and passes it in, so its thread
+    name, its `WorkFailed` ref and its event filter agree from the start.
+
+### 12.1 Plan deviations for the owner to sign off
+
+These are built as described (the safe default) but differ from the plan's wording. Each needs the
+owner's yes before release; the README of this spec folder lists them with the OPEN items.
+
+1. **Font list and firmware by web GET** (§6.4): the plan says the Load "is the only web request
+   Stripes makes"; Stripes also fetches `/sfl.xml` and `/idn.xml`. The plan's own font-list check needs
+   one of them.
+2. **Partial share outage** (§7.3 rule 7): one PC that loses the share while others keep it may poll
+   standalone alongside them, and their Sends then carry no `no_lock` warning. Standalone checks start
+   only after `lock_stale_s` of continuous outage, which removes the overlap for short outages.
+3. **A Send made while the share is down is recorded only by the PC that made it, in the same
+   session** (send.md §14.1). If that PC restarts before the share comes back, the machine shows red
+   `drift` until the next Send instead of amber.
