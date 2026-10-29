@@ -121,7 +121,7 @@ def check_letter(text: str) -> str                                         # §7
 def date_differences(sent: BuiltMessage, readback: MessageDesign, read_local: datetime, *,
                      slack_s: float = DATE_SLACK_S) -> list[Difference]    # §8.2
 def cleared(design: MessageDesign) -> bool                                 # §8.5
-def resume_refusal(expected: ExpectedState | None, machine: Machine) -> Msg | None   # §13.4
+def resume_refusal(expected: ExpectedState | None, machine: Machine) -> Msg | None   # §13.3
 def resume_mismatch(expected: ExpectedState, design: MessageDesign, machine: Machine) -> Msg | None
 def result_colour(confirmed: bool, notes: list[str]) -> str                # §14: GREEN, or AMBER with notes
 def test_bag_estimate(plan: TestPlan) -> int                               # §15.2
@@ -136,6 +136,8 @@ SNTP_PORT = 123
 NTP_EPOCH_OFFSET = 2_208_988_800                  # seconds from 1900 to 1970
 def parse_host(host: str) -> tuple[str, int]      # "time.example.local" -> (.., 123); "127.0.0.1:4123" -> (.., 4123)
 def to_local(utc: float, *, offset_fn=local_utc_offset) -> datetime   # naive local time of utc
+def recent_dst_change(utc: float, *, within_s: float = 86_400.0,
+                      offset_fn=local_utc_offset) -> tuple[float, float] | None   # §9.3 item 5
 
 class TimeSource:                                 # additions to architecture §6.5
     timeout_s: float = 2.0                        # per host
@@ -286,7 +288,7 @@ Where the check runs:
 | Send (`merge_plan`) | the chosen print text again, the line and machine codes, every free-text value | refused (`PlanError`) |
 
 Not checked: the origin phrase itself, `Film.preprinted_origin` (it is the origin), free-text labels
-(questions to the sender, never printed), record names and test labels (fixed formats, §15.3).
+(questions to the sender, never printed), record names and test labels (fixed formats, §15.2).
 
 ### 2.4 Pre-printed origin
 
@@ -416,7 +418,7 @@ for k, item in enumerate(present_items):
 `MachinePlan.bag_text` and `BuiltMessage.bag_text` render the message on one line, for windows and logs:
 
 1. Each present item's text: a CTEXT item's TXT; a CTDAT item's `before + render_date(...) + after`, for
-   the local date of `SendRequest.created_at` (`time.localtime`), or for a test plan the base plan's.
+   the local date of `SendRequest.created_at` (`time.localtime`). Test plans have no dates.
 2. Joined in order: the first item's text; then for each next item, `" / "` before it when it is
    placed below, else `" "` when its gap is above 0, else nothing.
 3. Example (the storage.md print text, gap 4 on the lot): `Packed on 10/29/26 / Product of USA and
@@ -980,11 +982,16 @@ relates the answer to its injected clock.
 3. `DstWatcher(clock=, offset_fn=)` records `offset_s = offset_fn(clock.time())` and `previous_s = None`.
    Each `changed()` computes the offset now; when it differs from `offset_s`, it sets `previous_s =
    offset_s`, `offset_s = <new>` and returns True; otherwise False. So it is True exactly once per
-   change, on the first call after it. A process started after a change never reports it (the clock set
-   it would make has nothing to correct that a Send or Set clocks won't).
+   change, on the first call after it. A process started after a change never reports it; for that case
+   `recent_dst_change` (item 5) exists.
 4. With an offset function that returns −14,400 (EDT) before 1 Nov 2026 06:00 UTC and −18,000 (EST)
    after, a watcher called every 5 s returns True once, on the first call at or after 06:00:00 UTC, with
    `previous_s == -14400.0` and `offset_s == -18000.0`.
+5. `recent_dst_change(utc, *, within_s=86_400.0, offset_fn=local_utc_offset) -> tuple[float, float] |
+   None` returns `(offset_fn(utc - within_s), offset_fn(utc))` when they differ, else None. It lets a
+   poller that started after a change (every PC restarted overnight) still make the one automatic clock
+   set: states.md may do it once per printer when a change happened within the last day and the
+   printer's clock is off from the time server by the change, give or take `clock_warn_s` (§9.6 item 8).
 
 ### 9.4 clock_command(local): the TD command and the midnight rollover
 
@@ -1029,9 +1036,10 @@ can't import `hx_send`) the daylight-saving clock set. `reading` is a `TimeReadi
    `CheckFailed(Msg(N_("{machine}'s clock reads {printer_time} after it was set to {expected}."),
    {...}), differences=[Difference("clock", "DATE TIME", expected.strftime("%Y-%m-%d %H:%M"),
    printer.strftime("%Y-%m-%d %H:%M:%S"))], step=STEP_SET_CLOCK)`.
-5. The step's record, kept for the log: `{"sent": t.strftime("%Y-%m-%d %H:%M"), "before": "..." or None,
-   "after": printer.strftime("%Y-%m-%d %H:%M:%S"), "difference_s": round(diff, 1), "source":
-   reading.source, "server": reading.server, "offset_s": round(reading.offset_s, 3)}`.
+5. The step's record, kept for the log: `{"sent": <the TD's rounded date and time as "%Y-%m-%d %H:%M">,
+   "before": <"%Y-%m-%d %H:%M:%S"> or None, "after": printer.strftime("%Y-%m-%d %H:%M:%S"),
+   "difference_s": round(<printer minus expected, seconds>, 1), "source": reading.source, "server":
+   reading.server, "offset_s": round(reading.offset_s, 3)}`.
 
 ### 9.6 The daylight-saving clock set (the poller's one write)
 
@@ -1053,6 +1061,10 @@ poller and the event-log entry; these are the rules it must follow:
    `machine_id`, `previous_offset_s`, `offset_s`, the §9.5 record, `ok` and `msg`.
 7. The poll status records `daily["dst_clock_set"] = {"offset_s": offset_s, "at": <time>}` so a poller
    that takes the printer over later doesn't do it again for the same change.
+8. Optional catch-up (states.md decides): a poller that starts polling a printer, finds no
+   `daily["dst_clock_set"]` for the current offset, gets a `recent_dst_change(...)`, and reads a printer
+   clock offset within `clock_warn_s` of `new − old` (for example +3,600 s after the autumn change), does
+   items 4 to 7 once. Still one write per change and printer.
 
 ## 10. The Send pipeline
 
@@ -1081,11 +1093,11 @@ nothing else; the other machines carry on (§12).
 
 ### 10.2 Step check_choice (whole Send)
 
-1. `identity.is_sender(data.current.company)` false: raise `NotAllowed` ("Only Stripes MapleJet Senders
-   can send."). Nothing is posted.
+1. `ok, msg = data.can_send()` (the settings not loaded yet, the 24-hour rule, a newer-format config):
+   not ok raises `PlanError(msg, problems=[msg])`. Then `identity.is_sender(data.current.company)` false
+   raises `NotAllowed` ("Only Stripes MapleJet Senders can send."). Nothing is posted.
 2. Post `SendEvent(send_id, "", STEP_CHECK_CHOICE, "running")`.
-3. `ok, msg = data.can_send()` (the 24-hour rule, a missing or newer-format config): not ok raises
-   `PlanError(msg, problems=[msg])`.
+3. `data.current` is read once here; the whole run uses that one `HxData`.
 4. `fresh = merge_plan(plan.request, data.current, identity)`; its `PlanError` is raised as it is.
 5. The plan the sender looked at must still be what would be sent: the same machines in the same
    order, and for each machine the same `content_code`, name and `expected_settings` from
@@ -1125,7 +1137,8 @@ The UI shows the problems and keeps the Send window open.
 6. Wait until `timings.countdown_s` has passed since `start`, in slices of at most 0.25 s with
    `clock.sleep(slice, cancel)`.
 7. **Cancelled** (the token fired at any point up to here): stop the machine threads (they have sent
-   nothing), join them, release every lock, and make every machine `MachineResult(colour=RED, ok=False,
+   nothing), join them, release every lock, and make every machine not already red
+   `MachineResult(colour=RED, ok=False,
    step=STEP_LOCK, msg="Cancelled. Nothing was sent.", notes=["cancelled"])`, with a `skipped` event
    each. No expected state, line status or log is written. Post `SendFinished` and return. `is_cancelled`
    tells the UI to close quietly instead of opening the red window.
@@ -1698,7 +1711,8 @@ Runs on `hx-test-<run_id>`; returns a `TestResult`. `counter_tag = company.bag_c
       the expected state's step and `lock.update(step=k+1, of=N)`, post `TestEvent(status="printing")`.
 7. After the last step's bags (or its time), the end procedure (§15.5).
 
-Stop test (the cancel token) stops after the current request and then always runs the end procedure.
+Stop test (the cancel token) stops after the current request and then always runs the end procedure;
+`TestResult.msg` is then "Stopped by {user}." and the `test_end` reason `cancelled`.
 Any failure (a refused or unanswered write, a failed check, a failed read) stops the test there and
 runs the end procedure, except `LockLost`, `WrongPrinter` and `AuthFailed`: then Stripes stops talking
 to that printer at once and the result says to switch printing off at the printer.
@@ -2093,4 +2107,208 @@ redefine them.
 | Stopped by {user}. | Detenida por {user}. |
 | Slot {slot} on {machine} couldn't be emptied. | No se pudo vaciar la ranura {slot} de {machine}. |
 
-<!-- continue -->
+## 20. Tests
+
+`unittest`, in the style of the existing test files (architecture §9). Pure tests build records and
+`HxData` by hand or from a `FakeWorld`'s store. Threaded tests use a `FakeWorld` with a fresh
+`GateRegistry()`, `SystemClock` and `TIMINGS.scaled(0.02)`, and identities from `world.identity(...)`
+(`jsmith` a sender, `akim` a second sender, `admin` an administrator). Every test that drives a fake ends
+with `assertEqual(fake.violations, [])` and `assertEqual(fake.max_in_flight, 1)` unless it provokes one on
+purpose. No test waits more than about 0.5 s of real time.
+
+### 20.1 test_hx_message.py
+
+| Class | Test | Asserts |
+|---|---|---|
+| OriginTests | phrase | the §2.2 table; `[]` raises `ValueError` |
+| | words | the §2.3 table, with a `Company` holding the `FakeWorld` countries; an inactive country still counts |
+| | characters | `bag_text_problems("A<B>", where)` is one Msg whose `codes` is `"U+003C, U+003E"`; `"ñ°é&"` passes; a tab and `"€"` are refused |
+| | change text | the §2.5 examples |
+| BuilderTests | date formats | `render_date` for every `DATE_FORMATS` key on 29 Oct 2026 gives the §3.2 column; 31 Jan 2027 plus 1 month is 28 Feb 2027, 31 Jan 2028 plus 1 month is 29 Feb 2028; 29 Feb 2028 plus 1 year is 28 Feb 2029; 10 Apr 2022 with years 1, months 3, days 5 and FRMT `Y/M/D` is `2023/07/15`; FRMT `j` raises `ValueError` |
+| | placement | items right, below, right, below give OBJID 10001 to 10005 and the XRID, YRID, SXAS, SYAS and MARG of §3.4 (the fourth item lines up with item 2, the fifth with item 4's line start); an optional empty free text is left out and the next item refers to the one before it |
+| | print text rules | one failing case per rule of §3.6, each giving its message; the `FakeWorld` print text has no problems; code `TST` is refused |
+| | bag text | the two §3.5 examples |
+| ValidationTests | merge | `FakeWorld` data: every field of §4.4's table; each §4.3 problem in turn gives `PlanError` with that message among `problems`; not a sender raises `NotAllowed`; a pre-printed film gives `origin_line` `USA (pre-printed)` and empty countries; merging twice gives equal plans |
+| | offers | `films_for_line` leaves out inactive films, other products and the other cartridge type; `print_texts_for_film` keeps the film's order and the origin rule |
+| | conflicts | adding the alias `LOT` to a country makes `origin_conflicts` name the print text whose lot item has `Lot ` before it, and `merge_plan` then refuses it |
+| | records | `validate_company`, `validate_line`, `validate_machine`, `validate_film`: one failing case per rule; a machine coded `US` is refused |
+| PositionTests | encoder | the §5.1 table, `wrapped` included; texts `(150 - 412 + 0) mod 610 = 348 mm` and `(150 - 412 - 3) mod 610 = 345 mm` |
+| | delay | §5.2's examples; text `480 + 20 = 500 ms = 500000 µs`; `test=True` ignores the adjustment and ends with ` (test print: adjustment ignored)` |
+| | film stop | `film_stop_warning(348, 300, 610)` has `end` `648` and `length` `610`; `(348, 200, 610)` and `(348, None, 610)` are None; `merge_plan` adds "Print length unknown" for an encoder machine whose film has none |
+| BuildTests | golden | `build_commands` for the `FakeWorld` delay and encoder machines equals §6.4 exactly; `expected_settings` has 23 keys with DELAY `480000`, DLYMM `0`, RESNAM `UltraFine`, ANG `30` and no RESO; `PRINTER_DEFAULT_SETTINGS == hx_fake.FAKE_DEFAULT_SETTINGS` |
+| | names | §7.6; `canonical_design` of the golden example is 679 bytes with the §7.1 sha256; 200 random valid part combinations each give a name of at most 20 characters that parses back to its parts; the golden name with any of the other 23 check letters, or with its slot character swapped, parses to None |
+| | empty and idle | `empty_message_commands(10)` gives `<CRTMSG></CRTMSG>` and `<SAVEMSG>10</SAVEMSG>`; `idle_slot` gives 10 for slot 9, 9 for slot 10, 9 for slot 1 and for None, printing or not |
+| | clock | the §9.4 table; a year after 2050 raises |
+| CompareTests | match | a `MessageDesign` shaped like the fake's verbose render of the golden example (SIZE one lower, defaults, BOUND, LANG, OBJTYP) gives `[]` |
+| | rules | each gives exactly one difference: SIZE read as sent instead of one lower; TXT with a trailing space; an item field `SLANT`; WCOEFF `1`; PRNSPD missing; ANG `31`; an extra setting `FOO`; `black_pixels` 0; a wrong name; a wrong slot. An empty slot gives one difference. A different RESO, BOUND or LANG gives none |
+| | dates | read at 29 Oct 2026 12:00 local, TXT `10/29/26` passes and `10/28/26` fails; read at 30 Oct 00:01:00, `10/29/26` passes; read at 30 Oct 00:03:00 it fails |
+| | fingerprint | the slot 9 fixture with CRLF and with LF gives the same fingerprint; changing a CTDAT TXT, a BOUND, a relative item's POS, the slot, `read_at` or the picture doesn't change it; changing a CTEXT TXT, a SIZE or a setting does; `origin_from_design` of the golden message is `Product of USA and Canada` |
+| | cleared | an empty-slot read-back and a design with no items and no name are cleared; the golden message isn't |
+| ResumeTests | rules | one case per row of §13.3's table; `resume_mismatch` for a changed name, slot or fingerprint |
+| TestPlanTests | steps | encoder, film position 150, range 140 to 160 step 5, bold [1, 2]: 7 steps labelled `P140 \| B1`, `P145 \| B1`, `P150 \| B1`, `P155 \| B1`, `P160 \| B1`, `P150 \| B1`, `P150 \| B2`; delay labels start with `D`; a vary/placement mismatch, a range giving 101 steps and a bold of 11 are refused; `test_bag_estimate` of 7 steps is 42 |
+| | step plan | `test_step_plan` of `P150` sends DLYMM 348 with the adjustment ignored; fonts `[(2, 3), (2, 4)]` give the label item, then `Arial 3` and `Arial 4` placed right with MARG `8,0`; the name uses `TST` and the step index |
+| | calibration | film length 610, rough 400, spacing 300: steps `SPACE A` at 365 and `SPACE B` at 55, `HEAD` at 515, each sent as is; `spacing_gap_mm(167, 467, 610) == 300`; `wheel_suggestion_mm(56, 300, 306) == 57.1`; the §16.3 head-distance examples, including `(515, 317, 610, 400) == 412.0` |
+
+### 20.2 test_hx_time.py
+
+| Class | Test | Asserts |
+|---|---|---|
+| SntpTests | fake server | `FakeSntp(offset_s=3600)`: `sntp_query("127.0.0.1", port=..., timeout_s=0.5)` is within 0.5 s of `time.time() + 3600` |
+| | silent and bad | a silent `FakeSntp` raises `TimeServerError` after about 0.2 s with `timeout_s=0.2`; a small UDP server in the test answering with mode 3, a wrong originate timestamp, stratum 0 or leap indicator 3 raises it each time |
+| TimeSourceTests | hosts | a `query` stub where the first host raises and the second answers: `source "server"`, `server` the second host, `offset_s` the answer minus `clock.time()`; the stub receives `port` and `timeout_s` keywords; `parse_host` of `time.example.local`, `192.0.2.123` and `127.0.0.1:4123` |
+| | cache | `FakeClock`: a second `now()` within `cache_s` makes no query; after `advance(600)` it queries; `fresh=True` always queries; no hosts or every host failing gives `source "pc"`, `offset_s 0.0`, and clears the cache; `now_from` keeps the offset and moves with the clock |
+| | local | `to_local(1793275200.0, offset_fn=lambda u: -14400.0)` is 29 Oct 2026 08:00 |
+| DstTests | change | §9.3 item 4 with `FakeClock`; a constant offset never fires; `previous_s` and `offset_s` after the change |
+
+### 20.3 test_hx_send.py
+
+| Class | Test | Asserts |
+|---|---|---|
+| SendTests | delay | one `FakeWorld` delay printer, countries USA and Canada, lot 4417: one AMBER, ok result; the fake's `writes` are exactly `TD, CRTMSG, CTDAT, CTEXT, CTEXT, CPPARM, SAVEMSG, PRINTMSG, PRINT`; the design's Autopilot bodies equal §6.4; three read-backs (slot 9, then slot 0 twice) after the first slot 0 Load; the fake prints slot 9; `print_bags(1)` records `delay_us` 480000; the expected state is `running`, AMBER, unconfirmed, with the fingerprint of the fake's slot 9; the line status is written; `find_send` returns the `send` entry with four pictures; a `send_switch` entry exists; the events per machine follow the step order |
+| | encoder | the encoder fake: DLYMM 348, `printed[-1]["position_mm"] == 348`, ENWHD and ENPPR read |
+| | alternation | a second Send builds in slot 10 and switches to it; a third in slot 9 |
+| | partial | two machines, one fake answering CTEXT with `3`: that machine red at build, still printing its previous message, the other live; the line status holds both colours; `failure_rows` has one row |
+| | each failure | the injection table below: the step, `after_switch`, the expected-state row, and that nothing was written after the failure |
+| | lock held | another store holds the printer's lock (purpose send, `EXAMPLE\akim`): the line's machines red at lock with "Line 1 is being sent by EXAMPLE\akim."; that fake received no request |
+| | poller | a second store keeps writing the machine's `poll.json` with a rising counter and no `paused_for_lock`: the Send waits; once it writes the lock's token, the Send carries on; if it never does, the machine is red at wait_poller after `2 × stale_s` with no request sent |
+| | share down | `fs.down = True` with the local copy loaded: AMBER with notes `no_lock` and `local_copy`, no expected state written, `log_queued` True |
+| | PC time | a silent `FakeSntp`: AMBER, note `pc_time`, the warning event, and the TD still sent from the PC's time |
+| | cancel | cancel during the countdown: no request reached the fake, no lock file is left, no log written, `is_cancelled(result)` |
+| | templates changed | the film's position changed in `data.current` after `merge_plan`: `run` raises `PlanError` with "The templates changed ..." and nothing is written |
+| | not a sender | `NotAllowed`, nothing written |
+| | ink | INKT `Example White` with a black film: red at check_machine, note `ink_mismatch`, message "Line 1 Bagger 1 is set for white ink; this film needs black." |
+| | fonts | the fake's font list with one name changed: red at check_machine |
+| | clock | a callable `override("TIME", ...)` answering a time 5 minutes ahead of the fake's clock: red at set_clock with the clock message, after one re-read |
+| | dates | a `web_reply_hook` changing the CTDAT TXT of the slot 9 Load: red at verify_idle with "The date ... differs ..." |
+| ConfirmTests | right | the sender confirms: the expected state is confirmed and GREEN; a `send_confirm` entry; the line status confirmed |
+| | someone else | `akim` confirming `jsmith`'s Send: `NotAllowed`; nothing written |
+| | wrong, then stop | `confirm(..., False)` then `stop(reason="rejected")`: PRINT 0 sent and PRIN read twice; the rows Rejected and Stopped; `stopped_needs_send`; `check_resume` refuses with the rejected message; `resume` refuses with no write to the fake |
+| | superseded | confirming an older Send after a newer one: no expected-state change; the log entry is still written |
+| | pending | `pending_confirmation` lists the live machines, and `[]` after the confirmation |
+| FailureTests | rows | `failure_rows` after a verify_idle failure holds the hooked difference; after an after-switch failure it has `after_switch_text` and the previous picture |
+| | try again | `plan.restricted([failed])` runs with a new `send_id`, only that machine, from the lock step |
+| | leave it | `leave_it`: `reread_token`, `left_by` and `left_at` set, still RED with its failure, a `send_leave` entry |
+| ActionTests | stop and resume | a confirmed Send, `stop(reason="user")`, then `resume`: PRINT 1, PRIN read twice, mode `running`, GREEN |
+| | resume refused | after `stop`, the test saves another message into the printing slot directly on the fake: `check_resume` and `resume` refuse with the mismatch message |
+| | stop fails | `override("PRINT", FakePrinter.DROP)`: red with the "Stop it at the printer" message, mode `stop_requested_at_printer` |
+| | set clocks | `clock_offset_s = 7860`: afterwards the printer clock is within 90 s; a `clock_set` entry with `before` and `after`; a `pc_time` note on the expected state is cleared |
+| TestPrintTests | counted | 3 steps with a PMCNT override rising by 5 per read: slots alternate, each step's label is on the fake's slot, three `test_step` entries, then PRINT 0, both slots cleared, `TestResult.cleared`, the row Test finished with Resume blocked, `stopped_needs_send` |
+| | no prints | the counter never rises: the end procedure after `test_no_print_s`, reason `no_prints` |
+| | timed | `bag_counter "none"`: no counter is read; each step lasts `seconds_per_bag × 5` |
+| | stop test | cancel after step 1: the end procedure still runs |
+| | needs the server | the share down: refused before any request |
+| | calibration | kind `spacing`, length 610, rough 400: DLYMM 365 then 55 |
+| SafetyTests | whitelist | across the whole file: every fake's `writes` within `ALLOWED_WRITE_TAGS`; never SETPPARAM; never "SAVEMSG to the printing slot" |
+
+Failure injections ("each failure"):
+
+| Injection | Fails at | After the switch | Expected-state row |
+|---|---|---|---|
+| `override("HXUI", "1110")` | check_machine | no | Failed before the switch |
+| `files["/sfl.xml"] = None` | check_machine | no | Failed before the switch |
+| `override("TD", "3")` | set_clock | no | Failed before the switch |
+| `override("CPPARM", "3")` | build | no | Failed before the switch |
+| `web_reply_hook` changing the CTEXT TXT of the slot 9 Load | verify_idle | no | Failed before the switch |
+| `override("PRINTMSG", FakePrinter.DROP)` | switch | yes | Failed after the switch (`switch_pending`) |
+| PRIN answering `0` after PRINT 1 (a callable override) | confirm_1 | yes | Failed after the switch |
+| `web_reply_hook` changing the CTEXT TXT of the second slot 0 Load | confirm_2 | yes | Failed after the switch |
+
+## 21. OPEN items
+
+| Item | Safe default built now | To confirm on the test unit |
+|---|---|---|
+| Encoder calibration (§16) | the spacing and head-distance runs and maths; an encoder machine without a head distance can't be sent to; Stripes never changes the wheel size | the whole method, the spacing tolerance (2 mm), whether a print lands where calculated |
+| Which counter counts bags | `Company.bag_counter` `PMCNT`; a step's count restarts at each switch, so an MSCNT reset doesn't matter; `none` makes steps timed | which counter, and whether it resets on a message change |
+| Print speed units and range | `Machine.print_speed` required, 1 to 2500, sent as PRNSPD and compared exactly | cm/min; whether 2400 is accepted and read back; whether it matters with the encoder |
+| Film print length (film-stop warning) | no warning without `Film.print_length_mm`, and "Print length unknown" shown | how it is measured; what happens when a print runs past the stop |
+| Item positions and gaps | first item at POS `0,0`, others relative, gaps in canvas units 0 to 50 | units, the need for an edge margin, how relative items read back |
+| `&`, `<`, `>` and `ñ` | `<` and `>` refused; `&` escaped when sent, compared raw | how they print and read back |
+| TD hour and rollover | HOUR 0 to 23, rollover DTRH 0, DTRM 0, always sent | the accepted values; that midnight is the rollover; what a TD without the rollover does |
+| TD seconds | rounded to the nearest minute; 90 s tolerance on the read-back | whether the printer zeroes its seconds |
+| Best-by month arithmetic | the day cut to the month's end; any difference fails the date check | the printer's rule at month ends and on 29 Feb |
+| RESNAM spellings | `UltraFine`, `Fine`, `Normal`, `Draft` | the names for 1 to 3 |
+| DELAY in the read-back | µs, compared exactly | that 480000 reads back as 480000 |
+| Empty messages | CRTMSG with no name, SAVEMSG with no items | that the printer accepts and reads them back empty |
+| Load of slot 0 with printing off | its slot is taken as the selected message | what it returns |
+| Ink name | a settings check (`INKT` against `Company.inks`) | whether it follows a cartridge swap |
+| Font names on the test print | `hx_model.STANDARD_FONTS` | the exact names as read |
+| Beacon | never used (`BEACON_SUPPORTED = False`) | architecture §11 |
+| A Send made while the share is down | no expected state is written; the queued `send` log holds each machine's fingerprint | states.md: how the poller treats the running message when the share returns (it differs from `expected.json`) |
+
+## 22. Decisions made in this spec
+
+1. **Always alternate slots.** The idle slot is the other of 9 and 10 whenever 9 or 10 is selected,
+   printing or not, so the selected slot is never rewritten during a Send. It implies the plan's rule.
+2. **Message name** `{film}-{print text}{revision % 100:02d}-{content}-{check}{slot}`: hyphens for
+   readability on the printer's screen, the last two digits of the revision (the full one is logged),
+   a 4-character Crockford code from the first 20 bits of SHA-256, a check letter from SHA-256 over the
+   rest of the name (24 letters, no I or O), and `9` or `0` for the slot. At most 20 characters with
+   `FILM_CODE_MAX` 6, so it isn't lowered.
+3. **The canonical design** is the JSON of the children sent, in order, without the name and slot, so
+   the content code changes with anything printed but not with the date.
+4. **Text before and after go inside TXT for text items**, and in PREF/POSF only for dates, so a text
+   item reads back as exactly what prints.
+5. **Relative placement**: "right" refers to the previous item; "below" lines up with the start of the
+   previous line and goes under the previous item. One font and size per print text keeps lines even.
+6. **Origin matching** uses four rules (words, punctuation removed, joined multi-word phrases, spelled-out
+   initials), counts inactive countries, and checks printed codes. Aliases match ignoring case, as the
+   plan says, so an alias such as `CAN` also refuses the word "can": administrators choose aliases
+   knowing that. Matched words and country names may appear in messages (they are Stripes' own list
+   entries); a sender's text never does.
+7. **Bag text characters** are printable Latin-1 without `<` and `>` until the test unit shows how
+   escaping prints.
+8. **Eleven date formats** built from Y, y, M, m and D; Julian and week-day codes are left out of the
+   first version because their printed form isn't known.
+9. **Every read-back checks the rendered date** against Stripes' own rendering (±120 s), which also
+   proves the clock, the rollover and the offset.
+10. **The TD** is rounded to the nearest minute, always carries the rollover (0, 0) and HOUR 0 to 23,
+    and is checked by reading DATE and TIME back (90 s tolerance, one re-read for midnight). A Send
+    skips the "before" read; Set clocks and the daylight-saving set log it.
+11. **One SNTP request per Send or Set clocks**, reused per machine with `now_from`; `host:port` is
+    accepted so the fake time server can be used from `hx_fake.py`.
+12. **The ink check also compares the cartridge type**, and an ink name not on the list fails.
+13. **Encoder settings (ENWHD, ENPPR) are checked at every Send** on encoder machines, because a change
+    moves every print.
+14. **The pipeline re-merges the plan at its start** and refuses if the templates changed after the
+    sender looked.
+15. **A lock held on any printer of a line stops the whole line**, with a message that names the holder
+    and what they are doing.
+16. **Cancel** gives red results noted `cancelled`, writes nothing and opens no red window.
+17. **The poller handshake gives up after `2 × stale_s`** (30 s), checking every 0.25 s.
+18. **A failure before the switch keeps the old expectation** (message, fingerprint, confirmation) and
+    adds the Send's id, the failure and red, so Leave it and the alerts can refer to it.
+19. **"Something's wrong" is recorded as a failure** at `operator_confirm`, after the switch, as well as
+    `rejected`.
+20. **Green needs no amber note.** A confirmed Send made with the PC's time stays amber until a later
+    Send, or Set clocks with the time server, clears the note.
+21. **The confirmation is logged first**, then the expected states; the sender is identified from the
+    Send's log entry, so reopening from another PC works.
+22. **Stop, Resume and Set clocks are logged in hx-sends** (only senders do them); the daylight-saving
+    set goes to hx-events through states.md.
+23. **Resume also refuses** after a failed Send, an unconfirmed Send, a test print, or while a Send or
+    test is in progress.
+24. **A test step is confirmed with one running read-back** and a PRIN reading, not two: the step's
+    label is proven to match what prints, and the steps keep up with about 25 bags a minute. PRINT 1 is
+    sent at every step; the next step is built ahead; each step's count starts at its own switch.
+25. **The test's ink mismatch is a warning**, not a stop: the machine runs empty film.
+26. **Test steps**: the position or delay range first with the film's bold, width and resolution, then
+    each bold, width and resolution value at the film's own position or delay; labels carry `P`/`D`
+    always and `B`, `W`, `R` when those are varied. All test names use the code `TST`.
+27. **Calibration plans** reuse the test print with the base machine's head distance set to 0, so the
+    position is sent as it is; marks are aimed at the middle of the bag from the rough measurement.
+28. **The print counts are for the log only**: a failed counter read leaves them empty and doesn't stop
+    the Send.
+29. **Internal errors** show only the exception's class name to the operator; the traceback goes to the
+    event log.
+30. **Lots and free text are stripped**; an optional empty free text leaves its whole item out; a lot is
+    ignored when the print text has no lot item.
+31. **Film codes are unique across all films**, and `TST` is reserved for test prints.
+32. **The send log holds everything needed to rebuild the result window**: the exact commands, the
+    expected items and settings, and all four pictures.
+33. **Added fields**: `ExpectedState.stop_reason`, `stopped_by`, `stopped_at`, and `LineStatus.sender`.
+34. **No item limit in practice**: `MAX_ITEMS` (99) only keeps OBJIDs inside the manual's range; the
+    canvas is the real limit, and the designer previews the longest value (ui.md).
+35. **Daylight-saving catch-up**: `recent_dst_change` lets a poller that started after the change still
+    make the one automatic clock set, once, when the printer's clock is off by the change (§9.6 item 8,
+    states.md decides whether to use it).
+36. **No packaging change**: the output stays the single-file `Stripes.exe`, as the owner decided.
