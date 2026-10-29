@@ -1450,17 +1450,21 @@ off doesn't drop good PCs.
    | Situation | Probe due when |
    |---|---|
    | some active printer has no live poller (`unpolled=True`: its `poll.json` stale or missing for `stale_s`) | no probe in this process yet, or the last probe started at least `4 × stale_s` (60 s) ago |
-   | otherwise | `last_printer_reach` is None or older than `printer_reach_window_s / 24` (1 h), and no probe in this process yet or the last one started at least 1 h ago (monotonic) |
+   | otherwise | never: a printer someone is polling is never probed |
 
 4. **The probe** (the Poller, hx_poller, does it, following these rules exactly):
-   - Target: an active printer that has no lock (`read_lock` returns None) and isn't in
-     `local_locks`. Prefer one whose `poll.json` is stale or missing; otherwise take them in turn by
-     printer id.
-   - Action: `socket.create_connection((printer.host, printer.port),
-     timeout=timings.http_timeout_s)`, sending nothing, closed at once. It runs while holding that
-     printer's in-process gate, taken without blocking: if the gate is busy, the probe is skipped this
-     time. It is a TCP connect, not an Autopilot request.
-   - Success calls `reached()`. Either way it calls `probed(ok)`.
+   - Target: an active printer whose `poll.json` is stale or missing for `stale_s` (no live poller),
+     that has no lock (`read_lock` returns None) and isn't in `local_locks`; among several, take them
+     in turn by printer id. No such printer: no probe.
+   - Action: `clients.client(printer).probe()` (protocol.md §9 item 7): a bare TCP connect and close
+     under that printer's gate, taken without blocking, sending nothing. It is a TCP connect, not an
+     Autopilot request.
+   - `True` calls `reached()` and `probed(True)`; `False` calls `probed(False)`; `None` (this PC's
+     gate for that printer was busy, so nothing was sent) calls neither, and the probe is due again
+     at the next heartbeat.
+   - A PC whose reach has expired joins the pool through this probe the moment a printer loses its
+     poller. Every PC that polls keeps its reach fresh, so takeovers between polling PCs aren't
+     delayed; a PC that polls nothing drops out of the rankings a day after its last reply.
    - OPEN: confirm on the test unit that a bare connect doesn't disturb a printing printer
      (architecture.md §11).
 
@@ -1631,16 +1635,17 @@ about 1,000 files takes 1–3 s on the `hx-data` thread.
 3. Read the current file (`read_json`). It raises `FormatTooNew` for a newer file, and stops there.
    - `expected_revision is None` (a new record): if the file exists, raise
      `RevisionConflict(Msg(N_("{user} changed this while you were editing it. Reload it and make
-     your change again.")), current=<its revision>)`.
+     your change again."), {"user": <the current file's updated_by>}), current=<its revision>)`.
    - Otherwise, if the file is missing or its `revision != expected_revision`, raise
-     `RevisionConflict` the same way.
+     `RevisionConflict` the same way (a missing file gives `{"user": "?"}` and `current=0`).
 4. Build the new content: `to_json(record)` with `revision` = the current revision + 1 (1 when new),
    `updated_by = identity.user` and `updated_at = clock.time()`. Add every top-level key of the
    current file that isn't an envelope key or a field of this class: keys a newer minor version
    added are kept.
 5. `write_json(rel, ...)` (for a new film, `makedirs("templates/films/<id>")` first). Read it back. If
    the read-back's `revision`, `updated_by` and `updated_at` aren't ours, another administrator saved
-   in the same moment: raise `RevisionConflict` with the read-back's revision. The last write wins,
+   in the same moment: raise `RevisionConflict` with the read-back's revision and `{"user": <the
+   read-back's updated_by>}`. The last write wins,
    and both saves are in the admin log.
 6. Write `changes.json` with counter + 1 and `last` = this record.
 7. `append_log("hx-admin", {"type": "record_saved", ...})` (§6.7). A printer's `token` in `record`
@@ -1697,7 +1702,7 @@ worker thread.
 3. On any `ShareError` (including `ShareUnavailable` and `ShareDenied`), or if the share isn't
    available: `local.queue_log(kind, name, stored)` and return `(name, True)`.
 4. If the queue fails too (`OSError`), raise `ShareError(Msg(N_("Stripes couldn't save the log entry
-   on this PC: {error}")))`.
+   on this PC: {error}"), {"error": f"{type(e).__name__}: {e.strerror or e}"}))`.
 
 `append_send_log(entry)` is `append_log("hx-sends", entry)`.
 
