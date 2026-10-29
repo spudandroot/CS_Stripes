@@ -2,6 +2,9 @@
 
 # Stripes
 
+> **Development freeze.** Stripes is frozen while a major update is built: support for MapleJet Hx
+> inkjet printers. Please don't change `main` until that update is merged.
+
 A small Windows app for designing and printing labels on Zebra printers.
 
 - **Text, barcodes, QR codes and pictures.** Each text line has its own size and alignment.
