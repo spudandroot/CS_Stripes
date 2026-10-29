@@ -96,6 +96,7 @@ BOOKKEEPING_FIELDS = ("BOUND", "LANG", "AMPM", "HORFLG", "OBJTYP")
 ROLLOVER = (0, 0)                                 # TD DTRH, DTRM: the date changes at midnight (OPEN)
 CLOCK_SET_TOLERANCE_S = 90.0                      # printer clock vs expected, right after a TD
 DATE_SLACK_S = 120.0                              # rendered dates accepted around the read time
+BOUND_MAX_X = 1024                                # §8.1 rule 6: an item's BOUND must end by this x (OPEN)
 MAX_TEST_STEPS = 100
 MAX_FONT_SAMPLES = 6
 TEST_SAMPLE_GAP = 8                               # canvas units between font samples (OPEN)
@@ -137,12 +138,16 @@ NTP_EPOCH_OFFSET = 2_208_988_800                  # seconds from 1900 to 1970
 def parse_host(host: str) -> tuple[str, int]      # "time.example.local" -> (.., 123); "127.0.0.1:4123" -> (.., 4123)
 def to_local(utc: float, *, offset_fn=local_utc_offset) -> datetime   # naive local time of utc
 def recent_dst_change(utc: float, *, within_s: float = 86_400.0,
-                      offset_fn=local_utc_offset) -> tuple[float, float] | None   # §9.3 item 5
+                      offset_fn=local_utc_offset) -> tuple[float, float, float] | None   # §9.3 item 5
+    # (old offset, new offset, the UTC second of the change) when the offset changed within within_s
 
 class TimeSource:                                 # additions to architecture §6.5
     timeout_s: float = 2.0                        # per host
+    cache_s: float                                # the constructor's cache_s (600 s by default)
+    offset_fn: Callable[[float], float]           # the constructor's offset_fn (architecture §6.5)
     def now_from(self, reading: TimeReading) -> TimeReading: ...
         # the same source, server and offset_s, at clock.time() now; no request
+    def cached(self) -> TimeReading: ...          # architecture §6.5; §9.2 item 8
 
 class DstWatcher:                                 # additions
     offset_s: float                               # this PC's UTC offset at the last call
@@ -169,13 +174,14 @@ class FailureRow:                                 # one machine in the red windo
     msg: Msg | None
     after_switch: bool
     after_switch_text: Msg | None                 # "This machine may be printing the new message, ..."
-    previous_name: str                            # what it was last confirmed printing ("" if unknown)
+    previous_name: str                            # what it was printing before this Send ("" if unknown)
     previous_origin: str                          # bag text
     previous_preview: bytes                       # BMP, b"" if unknown
+    previous_confirmed: bool = False              # previous is the last Send's confirmed message (§12.2)
     differences: list[Difference] = []
 
 def failure_rows(result: SendResult, plan: SendPlan) -> list[FailureRow]
-def is_cancelled(result: SendResult) -> bool      # every machine carries the note "cancelled"
+def is_cancelled(result: SendResult) -> bool      # every machine carries the note "cancelled" (§10.3 step 7)
 def design_to_log(design: MessageDesign) -> dict  # to_json without preview_bmp, plus preview_b64
 def design_from_log(d: dict) -> MessageDesign
 def result_from_log(entry: dict) -> SendResult    # the "send" entry back into a SendResult (§17.2)
@@ -184,16 +190,23 @@ def request_from_log(entry: dict) -> SendRequest  # "Fix and send again" prefill
 class SendPipeline:                               # additions to architecture §6.7
     def pending_confirmation(self, send_id: str) -> list[str]: ...
         # blocking: machine ids whose expected state still waits for this Send's confirmation (§11.3)
+    # record_offline(entry) -> list[str]: architecture §6.7; §14.1
+
+# PrinterActions.stop/resume/set_clocks take action_id="" (architecture §6.7; §13).
+# TestPrintRun.end_again(on_event) -> TestResult: architecture §6.7; §15.5.
 ```
 
 ### 1.4 Optional fields added to the dataclasses send.md owns
 
-architecture §5.8 lets send.md add optional fields to `ExpectedState` and `LineStatus`. These are the
-only ones; JSON keys are the field names (storage.md §3.1).
+architecture §5.8 lets send.md add optional fields to `ExpectedState` and `LineStatus`, and lists them
+in its blocks (so the `hx_model` builder has them). These are the only ones; JSON keys are the field
+names (storage.md §3.1).
 
 ```python
 @dataclass(kw_only=True)
 class ExpectedState:              # added fields
+    sender: str = ""              # who made the Send (or test) this state belongs to: set with send_id
+                                  # (and by a test's start); every other row keeps it (§14)
     stop_reason: str = ""         # "user" | "rejected" | "test"; "" while not stopped
     stopped_by: str = ""
     stopped_at: float | None = None
@@ -558,10 +571,19 @@ that to detect templates that changed after the sender looked (§10.2).
 
 ### 4.5 Try again: SendPlan.restricted
 
-`plan.restricted(machine_ids)` (architecture §5.6) keeps the request's choices for those machines only,
-drops lines left without machines, and takes a new `send_id` (`new_id("sd")`), also written into the
-request's `send_id`. `created_at` and everything else stay as they were. Try again runs it through
-`SendPipeline.run` like any Send (§12.3).
+`plan.restricted(machine_ids)` (architecture §5.6) returns a new `SendPlan`:
+
+1. `machines`: only the `MachinePlan`s whose `machine.id` is in `machine_ids`, in the plan's order
+   (copies; nothing in them changes).
+2. `request`: a copy of the request whose `lines[i].machine_ids` keep only those machines, in their
+   order, with every line left without machines dropped.
+3. A new `send_id = new_id("sd")`, set on both the plan and its request.
+4. `request.created_at`, `request.sender`, `request.computer`, `from_local_copy` and `data_as_of` are
+   kept as they were.
+
+So `merge_plan(new_plan.request, ...)` gives exactly `new_plan.machines` again when the templates
+haven't changed, which §10.2 step 5 checks. Try again runs it through `SendPipeline.run` like any Send
+(§12.3).
 
 ## 5. Print position and delay
 
@@ -606,8 +628,9 @@ There is no encoder and no maths: the printer waits the film's delay plus the ma
 adjustment after the trigger, sent in microseconds (DELAY). There is no wrap and no calibration.
 
 `delay_us(delay_ms, adjustment_ms=0.0) -> int`: `us = math.floor((delay_ms + adjustment_ms) * 1000 +
-0.5)`. Below 0 or above `DELAY_US_MAX` raises `PlanError(Msg(N_("The delay works out at {ms} ms, outside
-0 to 120000 ms.")), {"ms": ...})`. `(480, 20)` gives 500000; `(480, 0)` gives 480000; `(10, -20)` raises.
+0.5)`. Below 0 or above `DELAY_US_MAX` raises `PlanError(m, problems=[m])` with `m = Msg(N_("The delay
+works out at {ms} ms, outside 0 to 120000 ms."), {"ms": _num(delay_ms + adjustment_ms)})`. `(480, 20)`
+gives 500000; `(480, 0)` gives 480000; `(10, -20)` raises.
 
 ### 5.3 explain_position(machine, film, adjustment, *, override=None, test=False)
 
@@ -853,13 +876,23 @@ parser returned: no trimming and no entity decoding. It returns every difference
    `readback.settings`, except `IGNORED_SETTINGS`, is a difference with sent `"(not expected)"`.
 5. Picture: when any expected item has a non-empty TXT or PREF and `readback.black_pixels == 0`:
    `Difference("picture", "BPIX", "more than 0", "0")`. The picture itself is judged by the sender.
+6. Print area (OPEN: the BOUND units and the real print area). For each read-back item `n` with a
+   BOUND value `x1,y1,x2,y2` (four integers; a BOUND that isn't is already a difference by the item
+   rules), require `x1 >= 0`, `y1 >= 0`, `x2 <= BOUND_MAX_X` (1024, the width of the printer's own
+   preview) and `y2 <= H` (`readback.height`, else 160). Otherwise `Difference(f"item {n} ({tag})",
+   "BOUND", f"inside {BOUND_MAX_X} x {H}", <the BOUND text>)`, so an item that runs off the print area
+   fails at verify_idle, before the switch. The x limit is the preview's width rather than the canvas's
+   256 because the plan's own design (Arial 4, "Product of USA, Canada, and Mexico") is wider than 256
+   in the capture's units; if the test unit shows that the 256-wide canvas clips, `BOUND_MAX_X` becomes
+   256 and nothing else changes.
 
 Item rules. `sent` is the expected item's pairs as a dict (Stripes never repeats a child); every field
 of the read-back item is checked, and every occurrence of a repeated field must pass:
 
 | Read-back field | Must be |
 |---|---|
-| `BOUND`, `LANG`, `AMPM`, `HORFLG`, `OBJTYP` | anything (bookkeeping) |
+| `BOUND` | four integers `x1,y1,x2,y2`; checked against the print area by rule 6, never against what was sent |
+| `LANG`, `AMPM`, `HORFLG`, `OBJTYP` | anything (bookkeeping) |
 | `TXT` of a CTDAT | anything here; §8.2 checks it |
 | `SIZE` | `str(int(sent["SIZE"]) - 1)`: read back one lower |
 | `POS`, `MARG`, `OBJID` | as sent when sent; anything when not sent |
@@ -963,8 +996,11 @@ relates the answer to its injected clock.
 3. `now(fresh=False)`: if `fresh`, or there is no cached offset, or the cache is at least `cache_s` old
    (by `clock.monotonic()`), ask each host in order with `query(host, port=port,
    timeout_s=self.timeout_s)`. The first good answer `utc` gives `offset_s = utc - clock.time()`, cached
-   with the host and the monotonic time. If every host fails (or there are none), the cache is cleared
-   and the reading is the PC's: `source="pc"`, `server=""`, `offset_s=0.0`.
+   with the host and the monotonic time. If every host fails (or there are none), the cache is cleared,
+   the failure time is remembered, and the reading is the PC's: `source="pc"`, `server=""`,
+   `offset_s=0.0`. Within `cache_s` after a remembered failure, `now()` without `fresh` asks nobody and
+   returns the PC's reading at once, so a dead time server costs one wait per `cache_s`, not one per
+   call. `fresh=True` always asks.
 4. The reading: `utc = clock.time() + offset_s`, `local = to_local(utc, offset_fn=self.offset_fn)`,
    `source="server"`, `server=<host as configured>`, `offset_s`.
 5. `now_from(reading)`: the same `source`, `server` and `offset_s`, with `utc = clock.time() + offset_s`
@@ -972,6 +1008,11 @@ relates the answer to its injected clock.
    clock set and date check, so each TD carries the time of its own moment.
 6. Thread-safe: one lock around the cache. Queries run outside it.
 7. `now()` never raises. The caller warns, and marks results amber, when `source == "pc"`.
+8. `cached()`: never queries and never blocks on the network (only the cache lock). It returns the
+   cached server reading (`utc = clock.time() + offset_s`, its `local`, `source "server"`) when an answer
+   was cached within the last `2 × cache_s`, else the PC's reading. The poller uses only `cached()`; its
+   `hx-time` thread calls `now(fresh=True)` every `cache_s` to keep the cache fresh (states.md §6.2).
+9. `cache_s` and `offset_fn` are public attributes holding the constructor's values.
 
 ### 9.3 Local time and daylight saving
 
@@ -987,11 +1028,15 @@ relates the answer to its injected clock.
 4. With an offset function that returns −14,400 (EDT) before 1 Nov 2026 06:00 UTC and −18,000 (EST)
    after, a watcher called every 5 s returns True once, on the first call at or after 06:00:00 UTC, with
    `previous_s == -14400.0` and `offset_s == -18000.0`.
-5. `recent_dst_change(utc, *, within_s=86_400.0, offset_fn=local_utc_offset) -> tuple[float, float] |
-   None` returns `(offset_fn(utc - within_s), offset_fn(utc))` when they differ, else None. It lets a
-   poller that started after a change (every PC restarted overnight) still make the one automatic clock
-   set: states.md may do it once per printer when a change happened within the last day and the
-   printer's clock is off from the time server by the change, give or take `clock_warn_s` (§9.6 item 8).
+5. `recent_dst_change(utc, *, within_s=86_400.0, offset_fn=local_utc_offset) -> tuple[float, float,
+   float] | None`: with `old = offset_fn(utc - within_s)` and `new = offset_fn(utc)`, None when they are
+   equal. Otherwise it finds the change by bisection: `lo, hi = utc - within_s, utc`; while `hi - lo >
+   0.5`: `mid = (lo + hi) / 2`, `lo = mid` if `offset_fn(mid) == old` else `hi = mid`. It returns `(old,
+   new, float(math.floor(hi)))`: the first whole second with the new offset (06:00:00 UTC for the
+   autumn 2026 change), the same on every PC whatever `utc` it was called with. The poller uses it for
+   the daylight-saving clock set, so a poller that started after a change (every PC restarted
+   overnight) still makes it once (states.md §6.11). Only one change within `within_s` is assumed (they
+   are months apart).
 
 ### 9.4 clock_command(local): the TD command and the midnight rollover
 
@@ -1021,14 +1066,15 @@ mapping in `clock_command` change. If it accepts them but treats them differentl
 
 ### 9.5 The clock set
 
-The same procedure serves a Send's clock step, Set clocks and (implemented by states.md's poller, which
-can't import `hx_send`) the daylight-saving clock set. `reading` is a `TimeReading` from
-`TimeSource.now(fresh=True)`.
+The same procedure serves a Send's clock step and Set clocks; states.md §6.11 runs the same steps for
+the daylight-saving clock set inside `hx_poller` (which can't import `hx_send`), with the same
+functions and tolerance. `reading` is a `TimeReading` from `TimeSource.now(fresh=True)`.
 
 1. Set clocks and the daylight-saving set only: read DATE and TIME first (`client.read`) and keep them
    as "before" for the log. A Send skips this (the poll status already shows the clock offset).
-2. `cmd = clock_command(time.now_from(reading).local)`; `lock.check()` when a lock is held;
-   `client.command(cmd)`. Any error is the step's failure; the TD is never repeated.
+2. `cmd = clock_command(time.now_from(reading).local)`; `lock.check(budget_s=worst_case_s("command"))`
+   when a lock is held; `client.command(cmd)`. Any error is the step's failure; the TD is never
+   repeated.
 3. `d = client.read("DATE")`, `t = client.read("TIME")`, `printer = hx_protocol.clock_from(d, t)`,
    `expected = time.now_from(reading).local`.
 4. `abs((printer - expected).total_seconds()) <= CLOCK_SET_TOLERANCE_S`: done. Otherwise read DATE and
@@ -1043,28 +1089,10 @@ can't import `hx_send`) the daylight-saving clock set. `reading` is a `TimeReadi
 
 ### 9.6 The daylight-saving clock set (the poller's one write)
 
-Just after each daylight-saving change, the PC polling each printer re-sets its clock, logged as
-automatic (plan). This is the only write Stripes makes that no person started. states.md owns the
-poller and the event-log entry; these are the rules it must follow:
-
-1. The poller's coordinator calls `dst.changed()` once per heartbeat (every `heartbeat_s`, so within 5 s
-   of the change). On True it marks every printer this PC is polling at that moment as due, with the
-   change `(previous_s, offset_s)`.
-2. The printer's worker handles the due mark at its next cycle, after the usual lock read before the
-   request. While a lock is held (on the share or in `local_locks`), the mark waits; the first cycle
-   without a lock does it. A worker that stops polling the printer drops the mark.
-3. It takes no lock: it is already the only PC talking to that printer (architecture §7.3 rule 6).
-4. `reading = time.now(fresh=True)`. With no answer from the time server it uses the PC's time (the PC
-   follows the domain's time) and logs `source "pc"`.
-5. The clock set of §9.5, steps 1 to 4. One TD, never repeated, even when it fails.
-6. One hx-events entry (type and writer owned by states.md), carrying at least `printer_id`,
-   `machine_id`, `previous_offset_s`, `offset_s`, the §9.5 record, `ok` and `msg`.
-7. The poll status records `daily["dst_clock_set"] = {"offset_s": offset_s, "at": <time>}` so a poller
-   that takes the printer over later doesn't do it again for the same change.
-8. Optional catch-up (states.md decides): a poller that starts polling a printer, finds no
-   `daily["dst_clock_set"]` for the current offset, gets a `recent_dst_change(...)`, and reads a printer
-   clock offset within `clock_warn_s` of `new − old` (for example +3,600 s after the autumn change), does
-   items 4 to 7 once. Still one write per change and printer.
+states.md §6.11 is the only specification of it: when it runs, the steps (the "before" read, at most
+one TD, the read-back with `CLOCK_SET_TOLERANCE_S` and one re-read), the `P.dst` record, the
+catch-up after restarts through `recent_dst_change` (§9.3 item 5), and the `dst_clock_set` entry in
+hx-events. Nothing in `hx_send` takes part.
 
 ## 10. The Send pipeline
 
@@ -1131,17 +1159,24 @@ The UI shows the problems and keeps the Send window open.
    `{machine}` the machine whose printer is locked.
 3. For each machine still going: `store.read_expected(machine_id)`. `FormatTooNew`: that machine is red
    at `STEP_LOCK` with its message ("Update Stripes: ...") and its lock is released. `ShareUnavailable`:
-   the note `no_lock`. Otherwise the result is kept as the machine's state before the Send.
+   the note `no_lock`, and the machine's state before the Send is `store.cached_expected(machine_id)`
+   (the last one this PC read, storage.md §5.4 rule 4; None when it never read one). Otherwise the
+   result is kept as the machine's state before the Send. Either way the Send keeps `expected_before =
+   {"send_id": E.send_id, "counter": E.counter}` of that state (`{"send_id": "", "counter": 0}` for a
+   share that answered "no file"; None when the share was down and nothing was cached), for the log
+   (§17.2) and for §14.1.
 4. Start the machine threads. Each begins with step wait_poller (§10.4), which makes no printer request.
 5. On this thread, `reading = time.now(fresh=True)` (at most 2 s per host, inside the countdown).
 6. Wait until `timings.countdown_s` has passed since `start`, in slices of at most 0.25 s with
    `clock.sleep(slice, cancel)`.
 7. **Cancelled** (the token fired at any point up to here): stop the machine threads (they have sent
    nothing), join them, release every lock, and make every machine not already red
-   `MachineResult(colour=RED, ok=False,
-   step=STEP_LOCK, msg="Cancelled. Nothing was sent.", notes=["cancelled"])`, with a `skipped` event
-   each. No expected state, line status or log is written. Post `SendFinished` and return. `is_cancelled`
-   tells the UI to close quietly instead of opening the red window.
+   `MachineResult(colour=RED, ok=False, step=STEP_LOCK, msg=NOTE_TEXTS["cancelled"],
+   notes=["cancelled"])`, with a `skipped` event each. A machine that was already red (a `LockHeld` or
+   `FormatTooNew` at `STEP_LOCK`) keeps its step and msg and gets the note `cancelled` added. So every
+   machine carries `cancelled`, and `is_cancelled(result)` holds. No expected state, line status or
+   log is written. Post `SendFinished` and return. `is_cancelled` tells the UI to return quietly to
+   the choice page instead of opening the red window.
 8. **Go.** If `reading.source == "pc"`, every machine gets the note `pc_time` and a `warning` event
    `SendEvent("", STEP_SET_CLOCK, "warning", NOTE_TEXTS["pc_time"])` is posted. If
    `plan.from_local_copy`, every machine gets the note `local_copy`. Post `SendEvent("", STEP_LOCK,
@@ -1177,9 +1212,13 @@ its first Send waits up to 15 s longer. That is the safe side of the not-found c
 
 ### 10.5 Step check_machine
 
-Before every request of every step, `lock.check()`. `LockLost` makes the machine red at the current step
-with its message; nothing more is sent to that printer and its expected state isn't written (the lock
-is someone else's now).
+Before every request of every step, `lock.check(budget_s=hx_protocol.worst_case_s(<call>, timings))`
+with the call about to be made (`"read"`, `"command"`, `"check_uid"`, `"read_twice"`, `"load_slot"`,
+`"fonts"`), and every web call gets `deadline = clock.monotonic() + worst_case_s(<call>)`
+(`load_slot(slot, deadline=...)`, `fonts(deadline=...)`). So no request can still be running when
+another PC may judge the lock stale (storage.md §11.3). `LockLost` makes the machine red at the current
+step with its message; nothing more is sent to that printer and its expected state isn't written (the
+lock is someone else's now). The same rule holds in every later step and in §13 and §15.
 
 1. Post `running`. `client = clients.client(printer)`: `AuthFailed` is a failure.
 2. `client.check_uid()`: `WrongPrinter` is a failure (the message names both UIDs).
@@ -1207,14 +1246,17 @@ is someone else's now).
    `previous = RunningMessage(slot=current.slot, name=current.name, fingerprint=fingerprint(current),
    origin_line=origin_from_design(current) or <the expected state's origin_line when it names the same
    fingerprint>, read_at=current.read_at, preview_sha256=sha256(current.preview_bmp).hexdigest())` and
-   `previous_preview = current.preview_bmp`.
+   `previous_preview = current.preview_bmp`. `previous_confirmed` is True when the state before the
+   Send (§10.3 step 3) had `mode == "running"`, `confirmed` True and `fingerprint ==
+   previous.fingerprint`: only then is "what it was printing" the last confirmed Send.
 8. `counts_before = client.read(company.bag_counter)` unless it is `"none"`. A failure here leaves it
    None and doesn't stop the machine: the count is only for the log.
 9. Post `ok` with `design=current`.
 
 If the step fails before item 7, `previous` and `previous_preview` come from the poll status instead
 (`store.read_poll(machine_id).running` and `store.read_preview(machine_id)`, best effort, errors
-ignored), so the red window can still show what the machine was last seen printing.
+ignored), so the red window can still show what the machine was last seen printing;
+`previous_confirmed` follows the same rule.
 
 ### 10.6 Step set_clock
 
@@ -1248,9 +1290,14 @@ slot (the fake records any such write as a violation).
 
 1. Post `running`.
 2. Record "switch pending" in the machine's expected state (§14, row "Switch pending"): the expected
-   message name and content code, the slot, the origin line and what was printing before. Only with a
-   `held` lock; a share failure here adds the note `no_lock` and the Send carries on (the plan's
-   sending without the share).
+   message name, content code and fingerprint (`fingerprint(d)` of §10.8's idle-slot read-back), the
+   slot, the origin line, the sender and what was printing before. With a `held` lock this write must
+   succeed: if it fails (`ShareError`, `ShareUnavailable`), the machine fails here, before the switch:
+   red at `STEP_SWITCH` with `after_switch` False and "Stripes couldn't record the switch on the
+   server, so it didn't switch." (still printing its previous message). Otherwise crash recovery
+   (states.md §3.6) would read a missing record as "PRINTMSG was never sent". Only a lock that was
+   `local_only` from the start (§10.3 step 2) skips the record and carries on, with the note `no_lock`
+   (the plan's sending without the share).
 3. Record "switch attempted" in the send log: `data.append_send_log(<send_switch entry>, §17.3)`. It
    queues on this PC when the share is down, so it fails only if this PC can't save it either; that
    fails the machine before the switch.
@@ -1284,7 +1331,9 @@ After every machine thread has ended:
 1. Line statuses (§14): one `LineStatus` per line of the plan, except a line whose machines all failed
    at `STEP_LOCK` (nothing happened at its printers). Written with `store.write_line_status`; a share
    error is printed to stderr and ignored, because line statuses are informational.
-2. The send log: `log_name, log_queued = data.append_send_log(<send entry>, §17.2)`.
+2. The send log: `log_name, log_queued = data.append_send_log(<send entry>, §17.2)`. Its `unticked`
+   lists are read now: for every active machine of each line of the plan that isn't in the Send,
+   `store.read_poll(machine_id)` (best effort; any error gives None).
 3. Post `SendFinished(result)` and return the `SendResult`.
 
 Every machine's lock is released by its own thread, after its last expected-state write, whatever
@@ -1336,7 +1385,7 @@ lock is `held`.
 | set_clock | `NoReply`, `CommandRefused`, `BadReply`, `CheckFailed` | red; still printing its previous message | "Failed before the switch" |
 | build | `NoReply`, `CommandRefused`, `BadReply` | red; still printing its previous message | "Failed before the switch" |
 | verify_idle | `CheckFailed`, `WebReadFailed`, `NoReply` | red; still printing its previous message | "Failed before the switch" |
-| switch, before PRINTMSG | the switch entry can't be saved even on this PC | red; still printing its previous message | "Failed before the switch" |
+| switch, before PRINTMSG | with a `held` lock the "switch pending" state can't be written ("Stripes couldn't record the switch on the server, so it didn't switch."), or the switch entry can't be saved even on this PC | red at switch, `after_switch` False; still printing its previous message | "Failed before the switch", when it can be written |
 | switch, confirm_1, confirm_2 | anything | red, `after_switch`: "This machine may be printing the new message, the old one, or nothing. Check the bags now." | "Failed after the switch" |
 | any | `LockLost` | red | nothing (the lock isn't ours) |
 | any | an unexpected exception | red, "internal error" | as for the step |
@@ -1364,20 +1413,29 @@ printer's gate with the lock held, so the printer never sees two at once.
 2. If they close the window, they reopen it from their monitor card: `MachineView.confirm_pending_by`
    and `confirm_send_id` (states.md) name the sender and the Send; the card offers it only when
    `same_user(confirm_pending_by, identity.user)`. `ResultWindow.from_log` calls
-   `data.find_send(send_id)`, `result_from_log(entry)` and `pipeline.pending_confirmation(send_id)`.
+   `data.find_send(send_id)`, `result_from_log(entry)` and `pipeline.pending_confirmation(send_id)`,
+   which falls back to the expected states when the entry can't be found (§11.3).
 3. Until they confirm, the line shows amber "Send not confirmed" (states.md, from the expected state).
 
 ### 11.2 confirm(send_id, machine_ids, everything_right)
 
 Blocking; worker thread.
 
-1. `entry = data.find_send(send_id)`. None raises `ShareError(Msg(N_("Stripes can't find this Send yet.
-   Try again in a minute.")))`.
-2. `not same_user(identity.user, entry["sender"])` raises `NotAllowed(Msg(N_("Only {sender} can confirm
-   this Send.")), {"sender": entry["sender"]})`.
-3. Only machines of the entry that went live (`ok`) count; other ids are ignored.
+1. `entry = data.find_send(send_id)`. The `send` entry is written only after every machine thread has
+   ended (§10.11), and it may be queued on another PC, so it can be missing while the Send is live
+   (the sending PC crashed, `interrupted_new`, or its share connection is down). Then the **fallback**
+   works from the expected states: `pending = pending_confirmation(send_id)` (§11.3, which reads them
+   too) and `sender` = the `sender` of those states. With neither an entry nor any pending machine,
+   raise `ShareError(Msg(N_("Stripes can't find this Send yet. Try again in a minute.")))`.
+2. The sender is `entry["sender"]`, or in the fallback the pending states' `sender` (every pending
+   state must name the same one; states with another sender aren't pending for this call). `not
+   same_user(identity.user, sender)` raises `NotAllowed(Msg(N_("Only {sender} can confirm this
+   Send."), {"sender": sender}))`.
+3. Only machines that went live count: those of the entry with `ok`, or in the fallback the pending
+   ones. Other ids are ignored.
 4. Log first, so the answer is never lost: `data.append_send_log(<send_confirm entry>, §17.4)`, its own
-   add-only file (queued on this PC if the share is down).
+   add-only file (queued on this PC if the share is down). In the fallback its `machines` come from
+   the expected states (their `message_name` and `fingerprint`).
 5. For each machine, one at a time: `with store.lock(printer_id, purpose="send", run_id=send_id,
    line_id=..., machine_id=...)` (no poller handshake: no printer request is made), read the expected
    state, and only if `send_id` still matches, `mode == "running"`, it isn't confirmed or rejected and
@@ -1386,19 +1444,23 @@ Blocking; worker thread.
    printer now) or a `local_only` lock or a share error: the machine isn't updated.
 6. For each line whose `LineStatus.send_id == send_id`: set the machines' colours, and `confirmed =
    True`, `confirmed_by = identity.user` when the answer was "Everything is right" and every machine of
-   that line in the Send that went live is now confirmed.
+   that line in the Send that went live is now confirmed. A line without such a status (the fallback)
+   is skipped.
 7. If any machine wasn't updated because of step 5's lock or share cases, raise
    `ShareError(Msg(N_("Your answer was logged, but Stripes couldn't update the monitor for
-   {machines}.")), {"machines": <names joined with ", ">})` after doing everything else. The UI offers
+   {machines}."), {"machines": <names joined with ", ">}))` after doing everything else. The UI offers
    to try again; a second confirm writes a second log entry, which is harmless.
 
 "Something's wrong" continues with the Stop question (§13.1).
 
 ### 11.3 pending_confirmation(send_id)
 
-Blocking. `data.find_send(send_id)` (None gives `[]`), then for each machine of the entry that went live:
+Blocking. The candidates are the machines of `data.find_send(send_id)` that went live; when there is
+no entry (§11.2 step 1), every active machine of `data.current`. For each candidate:
 `store.read_expected(machine_id)`; the machine is pending when `send_id` matches, `mode == "running"`,
-it isn't confirmed or rejected and has no failure. Share errors are raised.
+it isn't confirmed or rejected and has no failure. Share errors are raised. So a Send whose PC crashed
+after its machines went live (states.md §3.6, `interrupted_new`) can still be confirmed by its sender
+from the monitor card.
 
 ## 12. When a step fails
 
@@ -1421,7 +1483,8 @@ isn't cancelled, in result order:
 | `step`, `step_text` | `r.step`, `STEP_TEXTS[r.step]` |
 | `msg` | `r.msg` |
 | `after_switch`, `after_switch_text` | `r.after_switch`; when true, "This machine may be printing the new message, the old one, or nothing. Check the bags now." |
-| `previous_name`, `previous_origin`, `previous_preview` | what it was last confirmed printing: `r.previous.name`, `.origin_line` and `r.previous_preview`, or `""`/`b""` |
+| `previous_name`, `previous_origin`, `previous_preview` | what it was printing just before this Send: `r.previous.name`, `.origin_line` and `r.previous_preview`, or `""`/`b""` |
+| `previous_confirmed` | `r.previous_confirmed` (§10.5 item 7): only then does the window call it "Last confirmed printing"; otherwise "Printing before this Send (not confirmed)" (ui.md §7.2), because that message may never have been confirmed, may be in drift or may not come from Stripes |
 | `differences` | when the failed step was a read-back: `compare(build_message(<its machine plan>, r.slot), r.readbacks[-1])` |
 
 The window shows each row's picture with its origin in large type, and waits for Try again or Leave
@@ -1434,7 +1497,9 @@ Try again is a fresh Send of the failed machines from step 2, never a resume hal
 on a new `hx-send-<id>` thread, with its own countdown, locks and checks, and a new `send_id`. Its step
 1 is the same quick check as any Send's (§10.2): it touches no printer, and it stops the retry if the
 templates changed meanwhile. A machine that failed after the switch is rebuilt in whichever slot is idle
-now, read from the printer again.
+now, read from the printer again. The plan says "from step 2"; re-running the quick check of step 1 is
+a decision of this file (§22 decision 37): it costs nothing at the printers and stops a retry of
+templates that changed. ui.md §7.4 keeps the red window until the retry is past its countdown.
 
 ### 12.4 leave_it(send_id, machine_ids)
 
@@ -1463,7 +1528,9 @@ previous message.
 `PrinterActions` runs on the UI's `hx-action-<action_id>` thread, one machine per thread
 `hx-action-<action_id>-<machine_id>`, all at the same time. Every method needs
 `identity.is_sender(company)` and otherwise raises `NotAllowed(Msg(N_("Only Stripes MapleJet Senders
-can stop, resume or set clocks.")))`. `action_id = new_id("ac")`. Each machine takes its printer's lock
+can stop, resume or set clocks.")))`. Each method takes `action_id: str = ""` (architecture §6.7): the
+UI makes it with `new_id("ac")`, names its thread `hx-action-<action_id>` and filters events by it;
+when it is `""` the method makes one. Each machine takes its printer's lock
 (purpose `stop`, `resume` or `clock`, `run_id = action_id`), handles `LockHeld` with the holder's message
 of §10.3, waits for the poller as in §10.4 (without a countdown: "go" is immediate), and calls
 `lock.check()` before every request. An `ActionEvent` is posted when each machine starts (`running`)
@@ -1484,7 +1551,8 @@ and ends (`ok`, `failed` or `warning`), then `ActionFinished`.
    filled in: `nav.open_send(prefill=request)` with the plan's request, or `request_from_log(entry)`
    when the window was reopened from the log. The Send window gives the prefill a new `send_id`.
 5. Closing instead leaves the line red as "Stopped, needs a Send", and the line's notify user is
-   alerted (states.md, from `stop_reason == "rejected"` and `LineStatus.stopped_needs_send`).
+   alerted: states.md C7b raises the `send_rejected` alert from `E.rejected` alone, in every mode, so
+   the alert that started at "Something's wrong" simply continues (states.md §15 decision 13).
 6. A machine that couldn't be stopped is red with "Stripes couldn't stop printing on {machine}. Stop it
    at the printer with its Print On/Off button now.", and the window offers Try again, which calls
    `stop` again for those machines.
@@ -1496,7 +1564,8 @@ and ends (`ok`, `failed` or `warning`), then `ActionFinished`.
 Per machine:
 
 1. Lock (purpose `stop`); a `local_only` lock carries on with the note `no_lock`. Wait for the poller.
-2. `client.check_uid()`.
+2. `client.check_uid()`. (Every request here and below follows the §10.5 rule: `lock.check(budget_s=...)`
+   first, web calls with a deadline.)
 3. `client.command(Command.set("PRINT", 0))`.
 4. `client.read_twice("PRIN")` must be 0 (two readings a second apart that agree, plan: "reads twice to
    confirm it's off").
@@ -1585,18 +1654,18 @@ or when the share fails, nothing is written. Fields not named in a row keep thei
 
 | Row | When | Fields set |
 |---|---|---|
-| Failed before the switch | Send: a failure in wait_poller, check_machine, set_clock, build, verify_idle, or in switch before PRINTMSG | `send_id` = this Send; `result` RED; `failure = FailureInfo(step, msg, after_switch=False, at)`; `notes` = this Send's notes |
-| Switch pending | Send, §10.9 step 2 | `mode "switch_pending"`; `printing_expected` True; `send_id`; `message_name`, `content_code`, `slot` and `origin_line` of the new message; `fingerprint ""`; `previous_message_name` and `previous_fingerprint` from the slot 0 read of §10.5; `result ""`; `failure` None; `notes`; `confirmed` False, `confirmed_by ""`, `confirmed_at` None; `rejected` False; `resume_blocked` False; `left_by ""`, `left_at` None; `test` None; `stop_reason ""`, `stopped_by ""`, `stopped_at` None |
+| Failed before the switch | Send: a failure in wait_poller, check_machine, set_clock, build, verify_idle, or in switch before PRINTMSG | `send_id` = this Send; `sender` = this Send's sender; `result` RED; `failure = FailureInfo(step, msg, after_switch=False, at)`; `notes` = this Send's notes |
+| Switch pending | Send, §10.9 step 2 | `mode "switch_pending"`; `printing_expected` True; `send_id`; `sender` = this Send's sender (`identity.user`); `message_name`, `content_code`, `slot` and `origin_line` of the new message; `fingerprint = hx_message.fingerprint(d)` of §10.8's idle-slot read-back (it leaves out the slot and the date text, so it equals the fingerprint of the running reads that follow); `previous_message_name` and `previous_fingerprint` from the slot 0 read of §10.5; `result ""`; `failure` None; `notes`; `confirmed` False, `confirmed_by ""`, `confirmed_at` None; `rejected` False; `resume_blocked` False; `left_by ""`, `left_at` None; `test` None; `stop_reason ""`, `stopped_by ""`, `stopped_at` None |
 | Failed after the switch | Send: a failure in switch after PRINTMSG was sent, confirm_1 or confirm_2 | `mode` stays `"switch_pending"`; `result` RED; `failure = FailureInfo(step, msg, after_switch=True, at)` |
 | Live, not yet confirmed | Send, §10.10 | `mode "running"`; `fingerprint` of the confirm_2 read-back; `result` AMBER; `failure` None; `previous_message_name ""`, `previous_fingerprint ""` |
 | Confirmed | confirm, "Everything is right" | `confirmed` True; `confirmed_by`; `confirmed_at`; `result = result_colour(True, notes)` (GREEN, or AMBER while an amber note applies) |
-| Rejected | confirm, "Something's wrong" | `rejected` True; `resume_blocked` True; `result` RED; `failure = FailureInfo(STEP_OPERATOR, "{user} said something is wrong with this Send.", after_switch=True, at)` |
+| Rejected | confirm, "Something's wrong" | `rejected` True; `resume_blocked` True; `result` RED; `failure` unchanged (None). states.md judges it from `rejected` (codes `rejected` and `stopped_needs_send`, one `send_rejected` alert); Resume stays blocked through `rejected` and `resume_blocked` (§13.3) |
 | Leave it | leave_it | `left_by`; `left_at`; `reread_token` (new) |
-| Stopped | stop, PRINT 0 confirmed | `mode "stopped_by_user"`; `printing_expected` False; `stop_reason` = the reason; `stopped_by`; `stopped_at`; `resume_blocked = resume_blocked or reason == "rejected"` |
+| Stopped | stop, PRINT 0 confirmed | `mode "stopped_by_user"`; `printing_expected` False; `stop_reason` = the reason, except that an earlier `"test"` is kept (the machine still needs a Send after its test); `stopped_by`; `stopped_at`; `resume_blocked = resume_blocked or reason == "rejected"` |
 | Stop requested at the printer | stop failed | as Stopped, but `mode "stop_requested_at_printer"` |
 | Resumed | resume done | `mode "running"`; `printing_expected` True; `stop_reason ""`, `stopped_by ""`, `stopped_at` None |
 | Clock set from the server | set_clocks done with `source "server"` | `notes` without `"pc_time"`; when `mode == "running"` and `result` is GREEN or AMBER, `result = result_colour(confirmed, notes)` |
-| Test running | test print: the start, then each step's switch | `mode "test_running"`; `printing_expected` True; `send_id ""`; `message_name`, `content_code`, `slot` of the step; `fingerprint` of its running read-back (`""` at the start); `origin_line ""`; `previous_message_name`, `previous_fingerprint` from the slot 0 read at the start (kept for the whole test); `result ""`; `failure` None; `notes []`; `confirmed` False, `confirmed_by ""`, `confirmed_at` None; `rejected` False; `resume_blocked` True; `left_by ""`, `left_at` None; `test = {"run_id", "kind", "by", "step", "of"}`; `stop_reason ""` |
+| Test running | test print: the start, then each step's switch | `mode "test_running"`; `printing_expected` True; `send_id ""`; `sender` = the tester (`identity.user`, at the start); `message_name`, `content_code`, `slot` of the step; `fingerprint` of its running read-back (`""` at the start); `origin_line ""`; `previous_message_name`, `previous_fingerprint` from the slot 0 read at the start (kept for the whole test); `result ""`; `failure` None; `notes []`; `confirmed` False, `confirmed_by ""`, `confirmed_at` None; `rejected` False; `resume_blocked` True; `left_by ""`, `left_at` None; `test = {"run_id", "kind", "by", "step", "of"}`; `stop_reason ""` |
 | Test finished | test print end, printing confirmed off | `mode "test_finished"`; `printing_expected` False; `message_name ""`, `content_code ""`, `fingerprint ""`, `slot` None; `resume_blocked` True; `stop_reason "test"`; `stopped_by` the tester; `stopped_at`; `test` with `"step"` = steps done and `"ended_at"` |
 | Test not stopped | test print end, printing not confirmed off | as Test finished, but `mode "stop_requested_at_printer"` |
 
@@ -1613,9 +1682,43 @@ partial update reads the file, changes the fields named and writes it back:
 | Stopped after a rejection | stop with reason `"rejected"`, when `send_id` matches | `stopped_needs_send` True |
 | Test finished | test print end | `stopped_needs_send` True |
 
-A Send made while the share is down writes no expected state. When the share comes back, the expected
-state still describes the message before that Send, so the poller's drift check will notice the
-difference (§21, coordination with states.md).
+Every other row leaves `sender` as it is, so a confirm, Leave it, Stop, Resume or clock set by someone
+else never changes who "the sender" is (states.md §0).
+
+### 14.1 After an outage: record_offline(entry)
+
+A Send made while the share is down writes no expected state (or, if the share fell away after the
+switch, leaves its "switch pending" row behind). When the share comes back the expected state still
+describes the message before that Send, so the poller would raise a red `drift` alert with sound for a
+Send the plan wants amber. `SendPipeline.record_offline(entry) -> list[str]` (blocking) writes what
+the Send would have written:
+
+1. `entry` is the Send's `send` log entry (§17.2), from `data.find_send(send_id)`, which finds it in
+   this PC's queue or on the share.
+2. For each machine of the entry whose `result.ok` is True and whose notes include `no_lock`: take its
+   printer lock (purpose `send`, `run_id = send_id`, no poller handshake, no printer request); a
+   `local_only` lock or `LockHeld` skips the machine for now (it is tried again next time). Then `E =
+   store.read_expected(machine_id)`.
+3. Write only when nobody changed E since the Send began. With the machine's `expected_before` (§10.3
+   step 3, kept in the entry, §17.2) not None, that is: `E` is None and `expected_before.counter ==
+   0`; or `E.counter == expected_before.counter` and `E.send_id == expected_before.send_id`; or
+   `E.send_id == send_id` with `E.mode == "switch_pending"` and no failure (this Send's own record,
+   whose final write failed). Otherwise leave E alone: a later Send, Stop or test replaced it, and if
+   the printer still runs this Send's message the drift alert is right.
+4. The row written is "Recorded after an outage": the fields of "Switch pending" for this Send (from
+   the entry's machine: `message_name`, `content_code`, `slot`, `origin_line`; `sender =
+   entry["sender"]`), then `mode "running"`, `fingerprint` = `result.fingerprint` (the confirm_2
+   read-back), `previous_message_name ""`, `previous_fingerprint ""`, `result` AMBER, `notes` = the
+   machine's notes from the entry (`no_lock`, and `local_copy` and `pc_time` when they applied). The
+   machine then shows amber "Send not confirmed", with the Confirm button for its sender.
+5. Release the lock. Return the ids written. Share errors are raised after the machines already done.
+
+ui.md §15.3 calls it: the Navigator remembers the send_ids of this session's Sends that had a `no_lock`
+machine, and on each `ShareHealth(ok=True)` runs `record_offline` for them on a worker thread until each
+has succeeded, then re-sends any answer the sender gave meanwhile with `confirm` (the second
+`send_confirm` entry is harmless, §11.2 step 7). If this PC restarts before the share comes back, the
+list is lost and the drift alert stands until the next Send (the safe side; architecture §12.1 lists
+it for the owner).
 
 ## 15. Test print
 
@@ -1696,19 +1799,23 @@ Runs on `hx-test-<run_id>`; returns a `TestResult`. `counter_tag = company.bag_c
 4. **Start.** Expected state row "Test running" (step 0). `lock.update(step=0, of=N)`. Log
    `test_start`.
 5. **Step 1.** `slot = idle_slot(printing, current.slot)`; build step 1 into `slot` (§10.7), check it
-   (`compare`, §10.8), then switch: PRINTMSG `slot`, PRINT 1; then one running check: `load_slot(0)`
-   must show `slot` and pass `compare`, and PRIN must read 1. Then the step's start count (or, when
-   timed, its start time).
+   (`compare`, §10.8), then switch: PRINTMSG `slot`, PRINT 1; then the two running checks of a Send
+   (§10.10): `load_slot(0)` must show `slot` and pass `compare`, and PRIN must read 1; after
+   `confirm_gap_s`, the same again. So every step is "a full build, check and switch, the same as a
+   Send" (plan), read back three times. Then the step's start count (or, when timed, its start time).
 6. **Each step k**, while it prints:
    1. Build ahead: build step k+1 into the other slot and check it (the idle-slot rule holds: the slot
       printing step k is never written).
-   2. Count: every `second_reading_s`, `lock.check()` and the cancel token, then read `counter_tag`.
-      Bags for the step = the reading minus the step's start count (a reading below the start count,
-      a counter reset, becomes the new start). Timed: the step lasts `machine.seconds_per_bag ×
-      bags_per_step` seconds instead, and no counter is read.
+   2. Count: every `second_reading_s`, `lock.check(budget_s=...)` and the cancel token, then read
+      `counter_tag`. Bags for the step = the reading minus the step's start count (a reading below the
+      start count, a counter reset, becomes the new start). Each time the count changes, post
+      `TestEvent(status="printing", bags=n)` (at most once per reading, so at most every
+      `second_reading_s`). Timed: the step lasts `machine.seconds_per_bag × bags_per_step` seconds
+      instead, no counter is read, and `printing` is posted once after the switch with `bags` None.
    3. The step is done at `bags_per_step` bags (or its time). Log `test_step` for it.
-   4. Switch to step k+1 as in item 5 (PRINTMSG, PRINT 1, running check), take its start count, write
-      the expected state's step and `lock.update(step=k+1, of=N)`, post `TestEvent(status="printing")`.
+   4. Switch to step k+1 as in item 5 (PRINTMSG, PRINT 1, the two running checks), take its start
+      count, write the expected state's step and `lock.update(step=k+1, of=N)`, post
+      `TestEvent(status="printing", bags=0)` (`bags` None when timed) with the running read-back.
 7. After the last step's bags (or its time), the end procedure (§15.5).
 
 Stop test (the cancel token) stops after the current request and then always runs the end procedure;
@@ -1730,9 +1837,21 @@ to that printer at once and the result says to switch printing off at the printe
 4. Log `test_end`. Post `TestEvent(status="cleared")` (or `"failed"`) and `TestFinished`.
 5. Release the lock.
 
-If printing couldn't be confirmed off, `TestResult.msg` is "Stripes couldn't stop printing on
-{machine}. Stop it at the printer with its Print On/Off button now." and the window offers the Stop
-dialog for that machine (`PrinterActions.stop`, after this run has released the lock).
+`TestResult.printing_off` is True when step 1 read printing off twice. If it is False, `TestResult.msg`
+is "Stripes couldn't stop printing on {machine}. Stop it at the printer with its Print On/Off button
+now." and the test window shows its full-screen "Stop it at the printer now" page with Try again
+(ui.md §12.5), which calls `TestPrintRun.end_again(on_event)` on a new `hx-test-<run_id>` thread:
+
+1. Administrators only (`NotAllowed` "Only Stripes Administrators can run test prints." otherwise): the
+   person who ran the test may not be a sender, so `PrinterActions.stop` (senders only) isn't the way.
+2. A new lock: purpose `test`, the same `run_id`, then the poller handshake (§10.4, no countdown). A
+   `local_only` lock or `LockHeld` ends it with that message; nothing is sent.
+3. `check_uid()`, then the end procedure's steps 1 to 4 above, unchanged (PRINT 0, `read_twice`, the
+   empty slots when off, the expected-state row and the `test_end` entry, here with reason
+   `"retried"`), then release the lock.
+4. It returns a new `TestResult` (same `run_id`, `steps_done` and `of` as the run's, `ok` False) whose
+   `printing_off` and `cleared` say what this attempt achieved. It can be called again while
+   `printing_off` is False.
 
 ### 15.6 Safety and time limits
 
@@ -1741,7 +1860,7 @@ dialog for that machine (`PrinterActions.stop`, after this run has released the 
 | No prints, counted steps | `test_no_print_s` (60 s) without the counter rising, from a step's switch or the last rise | end procedure; "No prints for {seconds} s, so the test was stopped." |
 | Timed steps | the whole test time (`N × seconds_per_bag × bags_per_step`) plus `test_no_print_s`, from step 1's switch | end procedure; "The test ran past its time limit, so it was stopped." |
 | Waiting for the poller | `2 × stale_s` | the run ends before any request |
-| Each request | protocol.md (2 s; a Load at most about 30 s) | the step fails; end procedure |
+| Each request | protocol.md (2 s; a Load at most `worst_case_s("load_slot")`, 10 s, through its deadline) | the step fails; end procedure |
 | The test PC stops | the lock goes stale after 60 s | the poller alerts the line's notify user with sound: "Test message still printing on Bagger 3" (states.md) |
 
 The monitor and floor board show "TEST by jsmith, step 12 of 40" from the expected state's `test` and
@@ -1750,8 +1869,10 @@ the lock's note (states.md).
 ### 15.7 Events
 
 `TestEvent(run_id, step_index, of, status, msg, design, bags, at)`: `building` when a step's build
-starts, `printing` after its switch (with the running read-back), `ok` when its bags are counted (with
-`bags`), `failed`, `stopping` when the end procedure starts, `cleared` when both slots were emptied.
+starts, `printing` after its switch (with the second running read-back and `bags=0`) and again each
+time the step's count changes (with `bags`), `ok` when its bags are counted (with `bags`), `failed`,
+`stopping` when the end procedure starts, `cleared` when both slots were emptied. Stop test (the cancel
+token) takes effect after the current request (architecture §7.5 rule 3), not at the end of the step.
 
 ## 16. Calibration of encoder machines
 
@@ -1842,8 +1963,8 @@ it raises.
 | `time_source`, `time_server`, `time_offset_s` | the reading (`"server"` or `"pc"`) |
 | `from_local_copy`, `data_as_of` | the plan's |
 | `request` | `to_json(SendRequest)` |
-| `lines` | per line: `line_id`, `line_name`, `line_code`, `product` {`id`, `name`, `customer`, `revision`}, `film` {`id`, `code`, `artwork_revision`, `revision`}, `print_text` {`id`, `code`, `name`, `revision`}, `lot`, `countries`, `origin_line` |
-| `machines` | per machine, in plan order: `machine_id`, `machine_name`, `machine_code`, `line_id`, `printer` {`id`, `name`, `host`, `uid`}, `placement`, `bag_text` (the exact text), `position` (`PositionWorking`: the print position and how it was worked out), `settings` (`PrintSettings`), `slot`, `message_name`, `content_code`, `commands` (each command's `xml`, in order), `expected_items` (`[[tag, [[child, value], ...]], ...]`), `expected_settings`, `clock` (the §9.5 record or None), `warnings` (Msgs), `differences` (`[[where, field, sent, read], ...]` of the failing check, or `[]`), `result` |
+| `lines` | per line: `line_id`, `line_name`, `line_code`, `product` {`id`, `name`, `customer`, `revision`}, `film` {`id`, `code`, `artwork_revision`, `revision`}, `print_text` {`id`, `code`, `name`, `revision`}, `lot`, `countries`, `origin_line`, `unticked` (`[{machine_id, origin_line, printing}]`: the line's other active machines and what their poll status said they were printing, `origin_line` `""` and `printing` None when unknown, §10.11; ui.md §5.4 makes the sender acknowledge a line that will print two origins) |
+| `machines` | per machine, in plan order: `machine_id`, `machine_name`, `machine_code`, `line_id`, `printer` {`id`, `name`, `host`, `uid`}, `placement`, `bag_text` (the exact text), `position` (`PositionWorking`: the print position and how it was worked out), `settings` (`PrintSettings`), `slot`, `message_name`, `content_code`, `commands` (each command's `xml`, in order), `expected_items` (`[[tag, [[child, value], ...]], ...]`), `expected_settings`, `clock` (the §9.5 record or None), `warnings` (Msgs), `differences` (`[[where, field, sent, read], ...]` of the failing check, or `[]`), `expected_before` (`{"send_id", "counter"}` or None, §10.3 step 3), `result` |
 | `machines[i].result` | `to_json(MachineResult)` with `readbacks` as `design_to_log` dicts (the printer's pictures) and `previous_preview` as `previous_preview_b64`; it holds the print counts before and after and the result |
 
 Who confirmed it is in its own entry (§17.4). With four pictures a machine adds about 120 KB; twelve
@@ -1888,7 +2009,7 @@ counts).
 |---|---|
 | `test_start` | `run_id`, `kind`, `machine_id`, `machine_name`, `printer_id`, `film_id`, `film_code`, `film_revision`, `ranges` (`TestRanges`), `steps` (`[TestStep]`), `bags_per_step`, `timed`, `counter_tag`, `previous` {`slot`, `name`, `fingerprint`}, `at` |
 | `test_step` | `run_id`, `kind`, `machine_id`, `film_id`, `index`, `of`, `label`, `slot`, `message_name`, `content_code`, `position` (`PositionWorking`), `settings` (`PrintSettings`), `fonts`, `counter_tag`, `count_start`, `count_end`, `bags`, `started_at`, `ended_at`, `running` (the step's running read-back, `design_to_log`) |
-| `test_end` | `run_id`, `kind`, `machine_id`, `film_id`, `steps_done`, `of`, `ok`, `reason` (`"done"`, `"cancelled"`, `"no_prints"`, `"time_limit"` or `"failed"`), `msg`, `printing_off`, `cleared`, `slots` {`"9"`: bool, `"10"`: bool}, `at` |
+| `test_end` | `run_id`, `kind`, `machine_id`, `film_id`, `steps_done`, `of`, `ok`, `reason` (`"done"`, `"cancelled"`, `"no_prints"`, `"time_limit"`, `"failed"` or `"retried"`, §15.5), `msg`, `printing_off`, `cleared`, `slots` {`"9"`: bool, `"10"`: bool}, `at` |
 
 The calibration results themselves are saved as the `Calibration` record (`record_saved`, storage.md).
 
@@ -2096,7 +2217,7 @@ redefine them.
 | Stripes can't find this Send yet. Try again in a minute. | Stripes todavía no encuentra este envío. Inténtelo de nuevo en un minuto. |
 | Only {sender} can confirm this Send. | Solo {sender} puede confirmar este envío. |
 | Your answer was logged, but Stripes couldn't update the monitor for {machines}. | Su respuesta quedó registrada, pero Stripes no pudo actualizar el monitor de {machines}. |
-| {user} said something is wrong with this Send. | {user} indicó que algo está mal en este envío. |
+| Stripes couldn't record the switch on the server, so it didn't switch. | Stripes no pudo registrar el cambio en el servidor, así que no cambió de mensaje. |
 | Only Stripes MapleJet Senders can stop, resume or set clocks. | Solo los miembros de Stripes MapleJet Senders pueden detener, reanudar o ajustar relojes. |
 | Stripes couldn't stop printing on {machine}. Stop it at the printer with its Print On/Off button now. | Stripes no pudo detener la impresión en {machine}. Deténgala ahora en la impresora con su botón Print On/Off. |
 | Stripes can't reach the server, so it can't check the last confirmed Send. | Stripes no puede conectarse con el servidor, así que no puede revisar el último envío confirmado. |
@@ -2131,6 +2252,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | ValidationTests | merge | `FakeWorld` data: every field of §4.4's table; each §4.3 problem in turn gives `PlanError` with that message among `problems`; not a sender raises `NotAllowed`; a pre-printed film gives `origin_line` `USA (pre-printed)` and empty countries; merging twice gives equal plans |
 | | offers | `films_for_line` leaves out inactive films, other products and the other cartridge type; `print_texts_for_film` keeps the film's order and the origin rule |
 | | conflicts | adding the alias `LOT` to a country makes `origin_conflicts` name the print text whose lot item has `Lot ` before it, and `merge_plan` then refuses it |
+| | restricted | a two-line, three-machine plan restricted to one machine of line 2: `machines` holds only that `MachinePlan`; the request has one line with that one machine id; both have the same new `send_id`, which differs from the old; `created_at`, `from_local_copy` and `data_as_of` are unchanged; `merge_plan(restricted.request, ...)` equals `restricted.machines` |
 | | records | `validate_company`, `validate_line`, `validate_machine`, `validate_film`: one failing case per rule; a machine coded `US` is refused |
 | PositionTests | encoder | the §5.1 table, `wrapped` included; texts `(150 - 412 + 0) mod 610 = 348 mm` and `(150 - 412 - 3) mod 610 = 345 mm` |
 | | delay | §5.2's examples; text `480 + 20 = 500 ms = 500000 µs`; `test=True` ignores the adjustment and ends with ` (test print: adjustment ignored)` |
@@ -2144,6 +2266,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | | dates | read at 29 Oct 2026 12:00 local, TXT `10/29/26` passes and `10/28/26` fails; read at 30 Oct 00:01:00, `10/29/26` passes; read at 30 Oct 00:03:00 it fails |
 | | fingerprint | the slot 9 fixture with CRLF and with LF gives the same fingerprint; changing a CTDAT TXT, a BOUND, a relative item's POS, the slot, `read_at` or the picture doesn't change it; changing a CTEXT TXT, a SIZE or a setting does; `origin_from_design` of the golden message is `Product of USA and Canada` |
 | | cleared | an empty-slot read-back and a design with no items and no name are cleared; the golden message isn't |
+| | print area | the golden read-back with item 1's BOUND changed to `0,0,1030,33` gives exactly one difference `("item 1 (CTEXT)", "BOUND", "inside 1024 x 160", "0,0,1030,33")`; `0,0,200,161` and `-1,0,200,30` one each; `0,0,1024,160` none; a compact item without BOUND none |
 | ResumeTests | rules | one case per row of §13.3's table; `resume_mismatch` for a changed name, slot or fingerprint |
 | TestPlanTests | steps | encoder, film position 150, range 140 to 160 step 5, bold [1, 2]: 7 steps labelled `P140 \| B1`, `P145 \| B1`, `P150 \| B1`, `P155 \| B1`, `P160 \| B1`, `P150 \| B1`, `P150 \| B2`; delay labels start with `D`; a vary/placement mismatch, a range giving 101 steps and a bold of 11 are refused; `test_bag_estimate` of 7 steps is 42 |
 | | step plan | `test_step_plan` of `P150` sends DLYMM 348 with the adjustment ignored; fonts `[(2, 3), (2, 4)]` give the label item, then `Arial 3` and `Arial 4` placed right with MARG `8,0`; the name uses `TST` and the step index |
@@ -2159,6 +2282,8 @@ purpose. No test waits more than about 0.5 s of real time.
 | | cache | `FakeClock`: a second `now()` within `cache_s` makes no query; after `advance(600)` it queries; `fresh=True` always queries; no hosts or every host failing gives `source "pc"`, `offset_s 0.0`, and clears the cache; `now_from` keeps the offset and moves with the clock |
 | | local | `to_local(1793275200.0, offset_fn=lambda u: -14400.0)` is 29 Oct 2026 08:00 |
 | DstTests | change | §9.3 item 4 with `FakeClock`; a constant offset never fires; `previous_s` and `offset_s` after the change |
+| | recent change | with the §9.3 item 4 offset function: `recent_dst_change` at 06:00:00 + 1 s, + 2 h and + 23 h UTC all return `(-14400.0, -18000.0, 1793512800.0)` (1 Nov 2026 06:00:00 UTC); at + 25 h and before the change, None |
+| TimeSourceTests | failure memory, cached | `FakeClock`, a `query` stub that always fails: `now()` queries once, then not again for `cache_s`; `now(fresh=True)` queries every time; `cached()` never calls the stub, gives `source "pc"` before any answer and the server reading after one, until `2 × cache_s` |
 
 ### 20.3 test_hx_send.py
 
@@ -2180,9 +2305,18 @@ purpose. No test waits more than about 0.5 s of real time.
 | | fonts | the fake's font list with one name changed: red at check_machine |
 | | clock | a callable `override("TIME", ...)` answering a time 5 minutes ahead of the fake's clock: red at set_clock with the clock message, after one re-read |
 | | dates | a `web_reply_hook` changing the CTDAT TXT of the slot 9 Load: red at verify_idle with "The date ... differs ..." |
+| | switch pending | between PRINTMSG and the first running read (a callable `override("PRINTMSG", ...)` that reads the expected state): mode `switch_pending`, `fingerprint` equal to `fingerprint` of the slot 9 read-back, `sender` the sender; after the Send the `running` row has the same fingerprint |
+| | switch record fails | `store.write_expected` patched to raise `ShareUnavailable` for the switch-pending row, with a held lock: red at `switch`, `after_switch` False, "Stripes couldn't record the switch ...", no PRINTMSG in the fake's `writes` |
+| | cancel with a held line | line 1's printer locked by another store, cancel during the countdown: line 1's machine keeps its `lock` message and also has the note `cancelled`; `is_cancelled(result)` |
+| | unticked | Line 1 with two machines, only Bagger 1 ticked: the `send` entry's line has `unticked == [{"machine_id": <Bagger 2>, "origin_line": ..., "printing": ...}]` from Bagger 2's poll status |
+| | previous confirmed | after a confirmed Send, a second Send that fails at verify_idle: its `MachineResult.previous_confirmed` is True and `failure_rows` carries it; after an unconfirmed first Send it is False |
+| | lock budget | the keeper's refreshes made to fail (`fail_replace=10**6` on the sender's view) from the start of check_machine: the machine is red with `LockLost` before 30 s minus the next call's `worst_case_s`, and the fake receives no request after that |
+| | offline, then back | share down (`fs.view(down=True)` for the sender's store after a first good Send, so `cached_expected` is known): AMBER, `no_lock`, `log_queued`; share back: `record_offline(find_send(...))` writes the "Recorded after an outage" row (mode `running`, AMBER, notes `no_lock`), and a poller then judges `unconfirmed`, not `drift`; with another Send's E written meanwhile, it writes nothing |
 | ConfirmTests | right | the sender confirms: the expected state is confirmed and GREEN; a `send_confirm` entry; the line status confirmed |
+| | no send entry | the `send` entry deleted from the share and the queue after a Send (as after a crash): `pending_confirmation` still lists the live machine from its expected state; `confirm(..., True)` by the sender confirms it and logs `send_confirm` with the machine from E; by `akim` it raises `NotAllowed` |
+| | sender kept | `akim` runs Set clocks on the machine of `jsmith`'s unconfirmed Send: `E.sender` stays `jsmith`, `written_by` is `akim`, and `jsmith` can still confirm |
 | | someone else | `akim` confirming `jsmith`'s Send: `NotAllowed`; nothing written |
-| | wrong, then stop | `confirm(..., False)` then `stop(reason="rejected")`: PRINT 0 sent and PRIN read twice; the rows Rejected and Stopped; `stopped_needs_send`; `check_resume` refuses with the rejected message; `resume` refuses with no write to the fake |
+| | wrong, then stop | `confirm(..., False)` then `stop(reason="rejected")`: PRINT 0 sent and PRIN read twice; the rows Rejected (with `failure` None) and Stopped; `stopped_needs_send`; `check_resume` refuses with the rejected message; `resume` refuses with no write to the fake |
 | | superseded | confirming an older Send after a newer one: no expected-state change; the log entry is still written |
 | | pending | `pending_confirmation` lists the live machines, and `[]` after the confirmation |
 | FailureTests | rows | `failure_rows` after a verify_idle failure holds the hooked difference; after an after-switch failure it has `after_switch_text` and the previous picture |
@@ -2192,7 +2326,8 @@ purpose. No test waits more than about 0.5 s of real time.
 | | resume refused | after `stop`, the test saves another message into the printing slot directly on the fake: `check_resume` and `resume` refuse with the mismatch message |
 | | stop fails | `override("PRINT", FakePrinter.DROP)`: red with the "Stop it at the printer" message, mode `stop_requested_at_printer` |
 | | set clocks | `clock_offset_s = 7860`: afterwards the printer clock is within 90 s; a `clock_set` entry with `before` and `after`; a `pc_time` note on the expected state is cleared |
-| TestPrintTests | counted | 3 steps with a PMCNT override rising by 5 per read: slots alternate, each step's label is on the fake's slot, three `test_step` entries, then PRINT 0, both slots cleared, `TestResult.cleared`, the row Test finished with Resume blocked, `stopped_needs_send` |
+| TestPrintTests | counted | 3 steps with a PMCNT override rising by 1 per read: slots alternate, each step's label is on the fake's slot, each step has two slot 0 Loads after its switch, `printing` events carry `bags` 0, 1, 2, ... for each step, three `test_step` entries, then PRINT 0, both slots cleared, `TestResult.cleared` and `printing_off`, the row Test finished with Resume blocked, `stopped_needs_send` |
+| | end again | `override("PRINT", FakePrinter.DROP)` at the end: `printing_off` False and the row "Test not stopped"; with the override removed, `end_again` by the administrator (not a sender) turns printing off, empties both slots, writes "Test finished" and a `test_end` entry with reason `retried`; by a sender who isn't an administrator it raises `NotAllowed` |
 | | no prints | the counter never rises: the end procedure after `test_no_print_s`, reason `no_prints` |
 | | timed | `bag_counter "none"`: no counter is read; each step lasts `seconds_per_bag × 5` |
 | | stop test | cancel after step 1: the end procedure still runs |
@@ -2209,6 +2344,7 @@ Failure injections ("each failure"):
 | `override("TD", "3")` | set_clock | no | Failed before the switch |
 | `override("CPPARM", "3")` | build | no | Failed before the switch |
 | `web_reply_hook` changing the CTEXT TXT of the slot 9 Load | verify_idle | no | Failed before the switch |
+| `store.write_expected` raising `ShareUnavailable` for §10.9 step 2's row (held lock) | switch | no | none written (the share fault); no PRINTMSG sent |
 | `override("PRINTMSG", FakePrinter.DROP)` | switch | yes | Failed after the switch (`switch_pending`) |
 | PRIN answering `0` after PRINT 1 (a callable override) | confirm_1 | yes | Failed after the switch |
 | `web_reply_hook` changing the CTEXT TXT of the second slot 0 Load | confirm_2 | yes | Failed after the switch |
@@ -2233,7 +2369,8 @@ Failure injections ("each failure"):
 | Ink name | a settings check (`INKT` against `Company.inks`) | whether it follows a cartridge swap |
 | Font names on the test print | `hx_model.STANDARD_FONTS` | the exact names as read |
 | Beacon | never used (`BEACON_SUPPORTED = False`) | architecture §11 |
-| A Send made while the share is down | no expected state is written; the queued `send` log holds each machine's fingerprint | states.md: how the poller treats the running message when the share returns (it differs from `expected.json`) |
+| A Send made while the share is down | written when the share returns by `record_offline` (§14.1), in the same session only | that a PC rarely restarts while the share is down (owner sign-off, architecture §12.1) |
+| BOUND units and clipping | `compare` rule 6 (§8.1): x within 0..1024, y within 0..H | the units of BOUND, whether the 256-wide canvas clips, and whether a long origin at size 4 fits |
 
 ## 22. Decisions made in this spec
 
@@ -2276,20 +2413,23 @@ Failure injections ("each failure"):
 16. **Cancel** gives red results noted `cancelled`, writes nothing and opens no red window.
 17. **The poller handshake gives up after `2 × stale_s`** (30 s), checking every 0.25 s.
 18. **A failure before the switch keeps the old expectation** (message, fingerprint, confirmation) and
-    adds the Send's id, the failure and red, so Leave it and the alerts can refer to it.
-19. **"Something's wrong" is recorded as a failure** at `operator_confirm`, after the switch, as well as
-    `rejected`.
+    adds the Send's id, its sender, the failure and red, so Leave it and the alerts can refer to it.
+19. (Withdrawn.) "Something's wrong" is recorded only as `rejected` and `resume_blocked`, never as a
+    failure: states.md judges it from `rejected` (`rejected`, then `stopped_needs_send`, one
+    `send_rejected` alert), and a failure would have hidden both behind `failed_after_switch`.
 20. **Green needs no amber note.** A confirmed Send made with the PC's time stays amber until a later
     Send, or Set clocks with the time server, clears the note.
 21. **The confirmation is logged first**, then the expected states; the sender is identified from the
-    Send's log entry, so reopening from another PC works.
+    Send's log entry, or from `ExpectedState.sender` when that entry can't be found (a crashed PC, an
+    entry queued elsewhere), so reopening from another PC works.
 22. **Stop, Resume and Set clocks are logged in hx-sends** (only senders do them); the daylight-saving
     set goes to hx-events through states.md.
 23. **Resume also refuses** after a failed Send, an unconfirmed Send, a test print, or while a Send or
     test is in progress.
-24. **A test step is confirmed with one running read-back** and a PRIN reading, not two: the step's
-    label is proven to match what prints, and the steps keep up with about 25 bags a minute. PRINT 1 is
-    sent at every step; the next step is built ahead; each step's count starts at its own switch.
+24. **A test step is checked like a Send**: the idle slot, then the running message twice
+    (`confirm_gap_s` apart) with PRIN each time, as the plan's "the same as a Send" says. It costs about
+    one more Load per step, which the 5 bags of a step cover. PRINT 1 is sent at every step; the next
+    step is built ahead; each step's count starts after its checks.
 25. **The test's ink mismatch is a warning**, not a stop: the machine runs empty film.
 26. **Test steps**: the position or delay range first with the film's bold, width and resolution, then
     each bold, width and resolution value at the film's own position or delay; labels carry `P`/`D`
@@ -2305,10 +2445,29 @@ Failure injections ("each failure"):
 31. **Film codes are unique across all films**, and `TST` is reserved for test prints.
 32. **The send log holds everything needed to rebuild the result window**: the exact commands, the
     expected items and settings, and all four pictures.
-33. **Added fields**: `ExpectedState.stop_reason`, `stopped_by`, `stopped_at`, and `LineStatus.sender`.
+33. **Added fields**: `ExpectedState.sender`, `stop_reason`, `stopped_by`, `stopped_at`, and
+    `LineStatus.sender` (architecture §5.8 lists them too). `sender` exists because `written_by` names
+    only the last writer: a clock set or Leave it by someone else must not move the Confirm button.
 34. **No item limit in practice**: `MAX_ITEMS` (99) only keeps OBJIDs inside the manual's range; the
     canvas is the real limit, and the designer previews the longest value (ui.md).
-35. **Daylight-saving catch-up**: `recent_dst_change` lets a poller that started after the change still
-    make the one automatic clock set, once, when the printer's clock is off by the change (§9.6 item 8,
-    states.md decides whether to use it).
+35. **Daylight-saving clock set**: states.md §6.11 is its only specification; `recent_dst_change`
+    returns the change's own second so every PC derives the same change id, which also lets a poller
+    that started after the change still make the one automatic set.
 36. **No packaging change**: the output stays the single-file `Stripes.exe`, as the owner decided.
+37. **Try again re-runs the quick check of step 1** (the plan says "from step 2"): it touches no
+    printer, and it stops a retry whose templates changed since the red window opened.
+38. **A held lock must record "switch pending" before PRINTMSG**; if it can't, the machine fails before
+    the switch, so a crash can never leave a switched printer without its record.
+39. **Every printer call is bounded by the lock**: `lock.check(budget_s=worst_case_s(call))` before it,
+    and web calls take a deadline (storage.md §11.3).
+40. **A Send made without the share is recorded afterwards** by `record_offline`, only when the
+    machine's expected state is still the one the Send started from (counter and send_id), so a
+    legitimate amber Send doesn't turn into a red drift alert when the share returns.
+41. **The red window says "Last confirmed printing"** only when the message before the Send was the last
+    confirmed Send (`previous_confirmed`); otherwise "Printing before this Send (not confirmed)".
+42. **A read-back item outside the print area fails** (`compare` rule 6), with the preview's width as
+    the safe x limit until the test unit settles the units.
+43. **Cancel marks every machine `cancelled`**, also one already red at the lock step, so a cancelled
+    Send never opens the red window.
+44. **`end_again`** lets the administrator who ran a test retry its end procedure without needing the
+    sender group.

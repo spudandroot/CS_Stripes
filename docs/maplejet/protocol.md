@@ -115,6 +115,8 @@ def parse_firmware(body: bytes) -> str | None
 
 def key_id(key: bytes) -> str             # 8 hex characters naming a scrambling key
 def is_development_key(key: bytes) -> bool   # key == DEV_KEY; deploy.md's self-check refuses it in a release
+def worst_case_s(call: str, timings: Timings = TIMINGS) -> float
+    # §8.3: the longest one PrinterClient call can take; lock holders pass it to PrinterLock.check
 
 class PrinterClient:                      # additions to architecture §6.4
     label: str          # the name used in messages; ClientPool sets Printer.name (default: host)
@@ -122,7 +124,10 @@ class PrinterClient:                      # additions to architecture §6.4
     xid: int            # the last XID used; 0 at construction
     busy_replies: int   # "6" and "7" replies so far (kept out of nonsense, §13)
     relogins: int       # web logins after the first one
-    def probe(self) -> bool: ...   # TCP connect and close under the gate, no request (§9)
+    def probe(self) -> bool | None: ...
+        # TCP connect and close under the gate, no request (§9 item 7); None when the gate was busy
+    # load_slot(slot, *, deadline=None), fonts(*, deadline=None), firmware(*, deadline=None):
+    # architecture §6.4; the deadline rule is §10.6 step 0
 ```
 
 ### 1.2 hx_fake
@@ -612,8 +617,26 @@ These are `hx_model.Timings` fields (architecture §5.1); nothing here adds or c
 | `read`, `query` | 80 ms (67–128 ms) | 2 × (2.0 + 0.5) = 5.0 s |
 | `command` | 80 ms; 160 ms with the warm-up read | 5.0 + 2.0 + 0.5 = 7.5 s |
 | `read_twice`, `check_uid` after a mismatch | 1.2 s | 11 s |
-| `load_slot` | 2.1–2.3 s: the Load 0.8–0.9 s, the 0.5 s gap, one repeat 0.8–0.9 s; about 1 s more when it logs in | about 30 s (a login, a dropped Load, the 3 s window, one re-login and a second round) |
+| `load_slot` | 2.1–2.3 s: the Load 0.8–0.9 s, the 0.5 s gap, one repeat 0.8–0.9 s; about 1 s more when it logs in | about 30 s without a deadline (a login, a dropped Load, the 3 s window, one re-login and a second round); with a deadline, the deadline (§10.6 step 0) |
 | `fonts`, `firmware` | about 0.2 s (OPEN) | about 15 s |
+
+`worst_case_s(call, timings)` returns these worst cases from the timings, so they scale with
+`Timings.scaled`. With `h = http_timeout_s`, `r = read_retry_s`:
+
+| `call` | Value | Default |
+|---|---|---|
+| `"read"`, `"query"`, `"probe"`, `"login"` | `2 × (h + r)` | 5.0 s |
+| `"command"` | `2 × (h + r) + h + r` | 7.5 s |
+| `"read_twice"`, `"check_uid"` | `4 × (h + r) + second_reading_s` | 11.0 s |
+| `"load_slot"` | `2 × web_repeat_window_s + 2 × h` | 10.0 s |
+| `"fonts"`, `"firmware"` | `6 × (h + r)` | 15.0 s |
+
+Any other name raises `ValueError`. For the three web calls (`load_slot`, `fonts`, `firmware`) the
+value is the budget a caller gives the call as a deadline: lock holders call them with `deadline =
+clock.monotonic() + worst_case_s(call)` (the poller with its own, earlier deadline, states.md §6.4),
+so a web call can never run longer. A web call cut short by its deadline raises `WebReadFailed`
+(`load_slot`) or `BadReply` (`fonts`, `firmware`, "didn't send its font list"), which is a failed read:
+the machine goes red in a Send, and the poller's message check counts a failed Load (states.md §6.5).
 
 One PC can poll 12 printers on separate threads because each printer still sees one request at a time
 (architecture decision 2).
@@ -638,10 +661,13 @@ One PC can poll 12 printers on separate threads because each printer still sees 
    further `read_retry_s` (§8.1).
 6. `PrinterClient` state (`tn`, `xid`, the cookies, the counters, `last_request_at`) changes only while
    holding the gate (architecture §7.1, rule 5).
-7. `probe()` takes the gate, calls `socket.create_connection((host, port), timeout=http_timeout_s)`,
-   closes at once and releases the gate. It returns `True` when it connected, sends no bytes and leaves
-   `last_request_at` alone. It exists so the reachability check (architecture §11) never overlaps a
-   request. OPEN: that a bare connect doesn't disturb a printing printer.
+7. `probe()` takes the gate with `acquire(blocking=False)`. When the gate is busy it returns `None` at
+   once, without connecting (the caller counts nothing, storage.md §12.3). Otherwise it calls
+   `socket.create_connection((host, port), timeout=http_timeout_s)`, closes at once and releases the
+   gate. It returns `True` when it connected and `False` when the connect failed, sends no bytes and
+   leaves `last_request_at` alone. It exists so the reachability check (architecture §11) never
+   overlaps a request from this PC; storage.md only probes printers that no PC is polling. OPEN: that
+   a bare connect doesn't disturb a printing printer.
 8. Across PCs, one request at a time comes from the printer lock and poller assignment (architecture
    §7.3, storage.md, states.md), not from this gate.
 
@@ -714,8 +740,15 @@ It returns the texts of the first `<TYPE>`, `<TN>`, `<XID>` and `<MSNO>` leaves 
 `<FCDOC>` or `<PRV>`, decoded with `decode_text`. A missing TN, XID or MSNO gives `""`; a missing TYPE
 gives `None`.
 
-### 10.6 load_slot(slot)
+### 10.6 load_slot(slot, *, deadline=None)
 
+0. `deadline` is a `clock.monotonic()` time, or None for no limit. With a deadline, before every
+   exchange of the call (the login, a Load, a re-sent Load, a repeat, a login again) and before every
+   `read_retry_s` sleep, the client checks that `clock.monotonic() + http_timeout_s (+ read_retry_s for
+   a sleep) <= deadline`; if not, it starts nothing more and raises `WebReadFailed` "{printer} didn't
+   send back the message in slot {slot} in time." (counted like any `WebReadFailed`, not as nonsense).
+   So the call returns by the deadline plus at most the gate wait. Waiting for the gate counts too:
+   a gate acquired after the deadline is released at once with the same error.
 1. `ValueError` unless 0 ≤ slot ≤ 10. Take the gate.
 2. If there are no cookies, log in (§10.1).
 3. `xid += 1`, `started = clock.monotonic()`, send the Load (`sme_request(repeat=False)`,
@@ -754,9 +787,16 @@ date rendered, OBJIDs assigned). `hx_protocol` normalises nothing; `hx_message.c
 
 The plan requires each printer's font list ("refuses to send if it differs") and its firmware version
 (the daily check). No Autopilot query returns either; discovery found the font list (FON1 CourierN to
-FON6 LinearBeam) among the web page's small files. architecture §11 leaves the source to this file, so
-these two GETs are the only additions to the list of web requests in architecture §6.4.
+FON6 LinearBeam) among the web page's small files. architecture §6.4 lists these two GETs
+(`WEB_FILES`) as the only web requests besides the login, Load and repeat, and architecture §12.1
+records them as a plan deviation for the owner's sign-off. They are made only under a held lock (a
+Send's or test's machine check) or by the assigned poller right after its lock check (the daily
+check), never by anything else. The fake's "web file requested <path>" violation exempts exactly
+`WEB_FILES` (§15.5 items 9 and 10).
 
+0. `fonts(*, deadline=None)` and `firmware(*, deadline=None)` follow `load_slot`'s deadline rule
+   (§10.6 step 0) for each exchange and sleep; past it they raise as for a 404 (`fonts`: `BadReply`;
+   `firmware`: `None`, logged as "firmware unknown").
 1. `fonts()`: take the gate, log in if needed, `GET FONT_FILE` (`max_body=MAX_FILE_REPLY`, gunzip on).
    `NoReply`: once more after `read_retry_s`. 401 or HTML: log in again once. A 404, or a body without
    font tags, raises `BadReply(tag="FONTS", reply=...)` "{printer} didn't send its font list." (not
@@ -923,7 +963,8 @@ They apply to messages Stripes built (the verbose form).
 | ROTAT, WCOEFF, GROUP, COLR, RP (item level) | `"0"`: Stripes never sends them, and another value could change the print |
 | HOUR, MIN, SEC, DWEEK (CTDAT) | `"0"` |
 | TXT (CTDAT) | not compared: it is the date of the read. send.md may check it against the expected rendering |
-| BOUND, LANG, AMPM, HORFLG, OBJTYP | not compared (bookkeeping). send.md may use BOUND to warn that text runs off the canvas |
+| BOUND | not compared with what was sent (it is worked out by the printer), but checked against the print area: send.md §8.1 rule 6 fails an item whose BOUND `x1,y1,x2,y2` runs outside 0..1024 by 0..H (OPEN: BOUND units and whether the 256-wide canvas clips) |
+| LANG, AMPM, HORFLG, OBJTYP | not compared (bookkeeping) |
 | any other field | a difference: an unknown field means the format has changed, and an unrecognised read fails (plan) |
 
 Why there is no entity decoding: if the printer stores `R&amp;D` as it was sent, it prints `R&amp;D`,
@@ -1024,6 +1065,9 @@ of them is bag text.
 
 ### 15.2 Handling one request, in order
 
+0. A connection that the client closes before sending any byte (a bare connect: the reachability
+   probe, protocol §9 item 7) ends here: it isn't appended to `requests`, isn't counted in flight or as
+   activity for the idle drop, and adds no violation.
 1. Read the request (§15.1) and append `{"t": clock.monotonic(), "kind", "tag", "body", "raw", "reply":
    None, "status": None}` to `requests`. `kind` is `autopilot`, `login`, `sme`, `sme_repeat`, `get` or
    `bad`; `tag` is the command tag, the SME TYPE or the path.
@@ -1300,13 +1344,16 @@ it provokes one on purpose.
    FlakyFileOps()`; one `FakePrinter(clock=clock, **d).start()` for each dict in `printers` (a dict may
    also hold `name`, default `"Printer <n>"`, removed before the call); an empty list means one delay
    printer; `sntp = FakeSntp().start()`.
-2. The seeded records are written with `ShareStore.write_json` at the paths storage.md defines for each
-   record kind (the company file first: the same file the folder script seeds), with revision 1 and
-   `updated_by "EXAMPLE\\admin"`:
+2. The seeded records are written with `hx_share.write_record(store, record)` (storage.md §15: the
+   record file at its §2 path, no revision bump, no log) through a store of the identity
+   `identity("admin", admin=True, sender=False)`, the company file first (the same file the folder
+   script seeds), with revision 1 and `updated_by "EXAMPLE\\admin"`. Then `config/hx/changes.json` is
+   written with counter 1 (storage.md §4.2), so the first data cycle loads fully and the next ones see
+   no change:
 
    | Record | Values |
    |---|---|
-   | Company | time_server `127.0.0.1`; countries USA (aliases US, U.S.A., United States), Canada (CAN), Mexico (MEX); inks Example Black (plastic, black), Example White (plastic, white), Example Paper Black (paper, black); admin_group_sid `S-1-5-21-1000-2000-3000-1101`; sender_group_sid `S-1-5-21-1000-2000-3000-1102`; everything else default |
+   | Company | time_server `f"127.0.0.1:{sntp.port}"` (send.md §9.2 `parse_host` reads the port); countries USA (aliases US, U.S.A., United States), Canada (CAN), Mexico (MEX); inks Example Black (plastic, black), Example White (plastic, white), Example Paper Black (paper, black); admin_group_sid `S-1-5-21-1000-2000-3000-1101`; sender_group_sid `S-1-5-21-1000-2000-3000-1102`; everything else default |
    | Line | "Line 1", code L1, plastic, notify_user `EXAMPLE\jsmith` |
    | Printer n | `fake.printer_record(name=...)` |
    | Machine n | "Line 1 Bagger n", code `B<n>`, the fake's placement, print_speed 2400; encoder machines also head_distance_mm 412.0, encoder_wheel_mm 56.0 and encoder_ppr 5000 |
@@ -1318,11 +1365,13 @@ it provokes one on purpose.
    "printer1": ..., "machine1": ..., ...}`.
 4. `identity(name, *, admin=False, sender=True, pid=1)` returns `Identity(user=f"EXAMPLE\\{name}",
    computer=f"PC-{name.upper()}", sids=<the chosen group SIDs>, pid=pid)`.
-5. `store(identity)` returns `ShareStore(share_root, identity=identity, clock=clock, fs=fs,
-   timings=timings, version="test")`. `paths(identity)` returns an `HxPaths` with roaming and local under
-   `tmpdir/pcs/<identity.key>/` and machine under `tmpdir/pcs/<computer>/machine`.
-6. `time_source()` returns `TimeSource(["127.0.0.1"], clock=clock, query=lambda host, **kw:
-   sntp_query(host, port=sntp.port, timeout_s=kw.get("timeout_s", 2.0)))`.
+5. `store(identity)` returns `ShareStore(share_root, identity=identity, clock=clock, fs=self.fs.view(),
+   timings=timings, version="test")`: each simulated PC gets its own view, so its not-found cache and
+   `calls` are its own (storage.md §16). `paths(identity)` returns an `HxPaths` with roaming and local
+   under `tmpdir/pcs/<identity.key>/` and machine under `tmpdir/pcs/<computer>/machine`.
+6. `time_source()` returns `TimeSource([f"127.0.0.1:{sntp.port}"], clock=clock)`, the same host the
+   seeded company names, so a `TimeSource` built by `make_services` from the company record reaches the
+   fake too.
 7. `close()` stops every fake. The test owns `tmpdir`.
 
 ### 16.3 The script
@@ -1331,8 +1380,8 @@ it provokes one on purpose.
 printers (encoder or delay; `mixup`, `latency_s=0.08` and `web_latency_s=0.8` like the real printer),
 prints `STRIPES_V2`, `STRIPES_V2_ROAMING`, `STRIPES_V2_LOCAL`, `STRIPES_V2_MACHINE`,
 `STRIPES_HX_USER=EXAMPLE\jsmith`, `STRIPES_HX_COMPUTER=PC-JSMITH` and `STRIPES_HX_SIDS=<sender SID>,<admin
-SID>` as `set NAME=value` lines (`export NAME=value` off Windows), and runs until Ctrl+C. The app asks
-SNTP on port 123, so a manual run shows "PC time" (amber) unless hx_time accepts a port (send.md).
+SID>` as `set NAME=value` lines (`export NAME=value` off Windows), and runs until Ctrl+C. The seeded
+company names the fake time server as `127.0.0.1:<port>`, so the app's Sends use it.
 
 ## 17. Fixtures (testdata/hx)
 
@@ -1656,9 +1705,12 @@ exactly 29,482 bytes.
 | | silent | `go_silent()` with `TIMINGS.scaled(0.05)`: `NoReply` after two attempts; `max_in_flight <= 1` |
 | GateTests | one in flight | `latency_s=0.005`; 8 threads, each doing 5 mixed reads and one `load_slot(0)`, through one `ClientPool`: every result right, `max_in_flight == 1`, `violations == []`. Again with two `PrinterClient`s sharing one `GateRegistry` |
 | | gate timeout | `Timings(gate_wait_s=0.1)`; another thread holds the gate: `PrinterBusy` |
+| | probe | `probe()` on a running fake is True, the fake's `requests` stay empty, `max_in_flight` stays 0 and there is no violation; while another thread holds the gate it returns None at once; on a stopped fake it is False |
+| | worst cases | `worst_case_s` gives 5.0, 7.5, 11.0, 10.0 and 15.0 for read, command, read_twice, load_slot and fonts at the default timings, halves with `TIMINGS.scaled(0.5)`, and raises `ValueError` for `"other"` |
 | WebTests | first load | build a two-item message in slot 9 with `command()`, then `load_slot(9)`: the requests after the writes are login, Load and one repeat (the Save leftover came first); the design is what was built; nonsense 0 |
 | | stale kinds | `leave_in_buffer(<the other-client fixture>)`: the load works and nonsense is 1. Two loads in a row: the second's first reply is our own previous result, nonsense 0 |
 | | cap | `web_result_delay_s = float("inf")` with `FakeClock`: `WebReadFailed` after exactly 1 Load and 5 repeats; with `Timings(read_retry_s=1.0)`, after 2 repeats |
+| | deadline | `FakeClock`: `load_slot(9, deadline=clock.monotonic() + 1.0)` raises `WebReadFailed` before any request; with `web_result_delay_s = float("inf")` and `deadline = clock.monotonic() + 3.5`, it stops after the Load and the repeats that fit (none starts later than `deadline - http_timeout_s`) |
 | | fresh | `web_first_reply_fresh = True`: no repeat is sent |
 | | logging in again | after `expire_web_session()` the next load gets 401, logs in and succeeds, `relogins == 1`; after `set_password("other")` it raises `AuthFailed` after one login attempt |
 | | dropped Load | after one `load_slot`, `drop_after_idle_s=3.0` and `clock.advance(5)`: the next `load_slot`'s first Load is dropped, a second Load with the next XID succeeds |
@@ -1672,7 +1724,7 @@ exactly 29,482 bytes.
 | | multi-value | raw `<CPPARM/>` with `multi_value_hang_s=0.1`: "6" after at least 0.1 s, and the violation |
 | | editor page | raw `GET /simple_msg.html` with `editor_page_bytes=200_000` and `editor_stall_s=0.2`: the violation, and a PRIN sent meanwhile is answered only after the stall |
 | | settings, DELAY, TD | a message saved with CPPARM DELAY 284176, then PRINTMSG: `<DELAY/>` answers 284; TD 29/10/2026 08:45: TIME answers "08:45:00"; TD with HOUR 25 answers "3" |
-| FakeWorldTests | seed | the store reads the seeded company, line, machine, printer, film and print text; `world.printers[0].printer_record()`'s token unscrambles with `release_key()` |
+| FakeWorldTests | seed | the store reads the seeded company, line, machine, printer, film and print text; `config/hx/changes.json` has counter 1; `company.time_server == f"127.0.0.1:{world.sntp.port}"` and `world.time_source().now(fresh=True).source == "server"`; two `world.store(...)` calls get different `fs` views; `world.printers[0].printer_record()`'s token unscrambles with `release_key()` |
 
 test_hx_time covers SNTP against `FakeSntp`, and test_hx_send covers `compare` against the fake (§12).
 
@@ -1680,7 +1732,7 @@ test_hx_time covers SNTP against `FakeSntp`, and test_hx_send covers `compare` a
 
 | Item | Built now | To confirm on the test unit |
 |---|---|---|
-| Font list source | `GET /sfl.xml`, `<FONn>` tags; any error fails the machine check | the file, the tags, whether cookies are needed, no effect on printing |
+| Font list source (a plan deviation for the owner's sign-off, architecture §12.1) | `GET /sfl.xml`, `<FONn>` tags; any error fails the machine check | the file, the tags, whether cookies are needed, no effect on printing |
 | Firmware source | `GET /idn.xml`, the first of `FIRMWARE_TAGS`, else `None` | the file and the tag |
 | Replies to PRINT, PRINTMSG, TD, CPPARM | a first token of `0` means done | the exact text |
 | FCDOC DELAY units | µs, compared exactly | that a sent 480,000 reads back 480,000 |
@@ -1730,9 +1782,10 @@ test_hx_time covers SNTP against `FakeSntp`, and test_hx_send covers `compare` a
     the 0xFF byte survives and no wrong print can pass by decoding.
 14. **FCDOC and PRV message names must agree**, and the preview must be exactly the 1-bit 1024 × 160 BMP
     seen. BPIX isn't checked against the pixels.
-15. **The font list and firmware come from two small web files** (`/sfl.xml`, `/idn.xml`), the only
-    additions to architecture §6.4's list of web requests, as architecture §11 left the choice here. Any
-    font-list failure fails the machine check; a missing firmware version only logs "unknown".
+15. **The font list and firmware come from two small web files** (`/sfl.xml`, `/idn.xml`), which
+    architecture §6.4 now lists as the only additions to the web requests; architecture §12.1 records
+    them as a plan deviation for the owner's sign-off. Any font-list failure fails the machine check; a
+    missing firmware version only logs "unknown".
 16. **Busy replies are counted apart from nonsense** (`busy_replies`), so states.md can weigh them
     separately.
 17. **Scrambling uses a SHA-256 keystream with a 16-byte HMAC-SHA-256 tag and a key id**, so a token
@@ -1759,7 +1812,13 @@ test_hx_time covers SNTP against `FakeSntp`, and test_hx_send covers `compare` a
     and BPIX values, plus golden request files that pin the wire format.
 28. **Reply size limits**: 4 KB Autopilot, 256 KB SME, 64 KB files, 1 MB login (cut short allowed), 16 KB
     of headers.
-29. **FakeWorld seeds records by writing them directly through `ShareStore.write_json`** at storage.md's
-    paths, so it doesn't depend on `DataService` being running.
+29. **FakeWorld seeds records with `hx_share.write_record`** at storage.md's paths plus a
+    `changes.json` (counter 1), so it doesn't depend on `DataService` running and data cycles don't
+    reload in full every time; each `store()` gets its own `fs.view()`; the company names the fake
+    time server with its port.
 30. **`PrinterClient.probe()`** gives the reachability check a way to touch a printer that still
-    respects the gate.
+    respects the gate: it never waits for the gate (None when busy), and the fake ignores a connection
+    that sends nothing.
+31. **`load_slot` takes a deadline** and `worst_case_s` gives every call's worst case, so lock holders
+    and the poller can prove a request ends before another PC may judge their lock or `poll.json`
+    stale (architecture §7.3 rule 8).

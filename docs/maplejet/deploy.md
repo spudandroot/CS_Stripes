@@ -515,9 +515,7 @@ This is the header protocol.md §11.4 requires (it starts `42 4D 3E 50 00 00 …
    Nothing is started (architecture §9.3).
 3. `tab = hx_ui.MapleJetTab(root, services)`; `root.update_idletasks()`; `tab.destroy()` (which
    unsubscribes from the bus, ui.md §15.7).
-4. `finally`: restore the environment and remove `tmp`. `stop_services` is **not** called: nothing
-   was started, and ui.md's `stop_services` expects the `AlertSounder` that only `start_services`
-   creates (ui.md §15.4).
+4. `finally`: restore the environment and remove `tmp`. `stop_services` is **not** called.
 
 This proves every UI module, Tk and Pillow path the tab touches is in the exe, without a share or
 a printer: the tab shows its "not set up" state.
@@ -994,11 +992,11 @@ stress, soak) are separate; this document only accepts the build on a PC.
 
 **architecture.md**
 
-- §10 (`stripes.py`): add the three hooks of §1.3, and `hx_key` to the imports `stripes.py` may
-  use (§3's table).
+- §10 (`stripes.py`): the three hooks of §1.3 and the `hx_key` import (done: architecture §3 and
+  §10.6 item 5).
 - §9.2 (`test_i18n.py`): `SOURCES` lists every `hx_*.py` except `hx_fake.py` **and `hx_key.py`**
-  (generated; it may exist during a release build). `"Version {version} (development key)"` is in
-  `i18n.ES`.
+  (generated; it may exist during a release build); `"Version {version} (development key)"` is in
+  `i18n.ES` (done: architecture §9.2 and §10.6 item 4, with this file's tests and files in §1 and §9.2).
 - §6.3 `hx_win.self_check()`: `lookup_group_sid("Administrators")` returns None on a Windows whose
   display language isn't English; treat None as acceptable there (the self-check's own lookup in
   §5.2 check 7 uses the user's account, which works in any language). `monitors()` may return `[]`

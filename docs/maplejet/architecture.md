@@ -110,8 +110,8 @@ outside the UI modules (see §5.2).
 Rules:
 
 1. A module imports only from lower layers. Same-layer imports are only those listed (`hx_state` uses
-   `hx_message.fingerprint`, `parse_message_name` and `NOTE_TEXTS`). The three layer-6 UI modules never import each
-   other; they reach each other's screens through `HxServices.nav` (§6.10).
+   `hx_message.fingerprint`, `parse_message_name` and `NOTE_TEXTS`). The three layer-6 UI modules
+   never import each other; they reach each other's screens through `HxServices.nav` (§6.10).
 2. No module below layer 5 imports `tkinter` or `PIL`. No module imports `stripes`.
 3. Application code never imports `hx_fake`. It is test-only and isn't bundled (nothing imports it).
 4. Every printer request goes through `hx_protocol.PrinterClient`. Every share or PC-folder file access
@@ -126,7 +126,7 @@ Other files:
 | `testdata/hx/` | Sanitized captures used as parser fixtures (UID 1109, host 192.0.2.10, tokens removed) | protocol.md |
 | `assets/alert.wav` | The alert sound, bundled with the existing `assets` folder | ui.md (deploy.md checks it's bundled) |
 | `i18n.py` | One new function, `add_spanish` (§10.6), and the Spanish for the few new `stripes.py` texts | architecture.md |
-| `test_hx_*.py` | Tests, one file per module plus `test_hx_sim.py` (§9) | each module's owner |
+| `test_hx_*.py` | Tests, one file per module (the five UI modules share three files, ui.md §17) plus `test_hx_sim.py` (§9) | each module's owner |
 
 ## 4. hx_core (complete specification)
 
@@ -668,7 +668,8 @@ class SendPlan:
     from_local_copy: bool = False
     data_as_of: float | None = None     # HxData.reached_at, shown as "templates as of <time>"
     def restricted(self, machine_ids: list[str]) -> "SendPlan": ...
-        # Try again: the same choices for these machines only, under a new send_id
+        # Try again: the same choices for these machines only, under a new send_id; both `machines`
+        # and `request.lines[i].machine_ids` are filtered, empty lines dropped (send.md §4.5)
 
 @dataclass(kw_only=True)
 class TestRanges:
@@ -1332,8 +1333,9 @@ class PrinterClient:
         # slot 0..10 (0 = printing now). Logs in when needed, Load then sme_repeat until the reply
         # carries this request's TN and XID; raises WebReadFailed after web_repeat_max or web_repeat_window_s.
         # deadline (clock.monotonic()): no exchange starts that couldn't end by it (protocol.md §10.6)
-    def fonts(self) -> list[str]: ...               # GET /sfl.xml (protocol.md §10.8); OPEN: the source
-    def firmware(self) -> str | None: ...           # GET /idn.xml; OPEN: as fonts
+    def fonts(self, *, deadline: float | None = None) -> list[str]: ...
+        # GET /sfl.xml (protocol.md §10.8), with load_slot's deadline rule; OPEN: the source
+    def firmware(self, *, deadline: float | None = None) -> str | None: ...   # GET /idn.xml; as fonts
     def probe(self) -> bool | None: ...             # bare TCP connect under the gate, nothing sent;
                                                     # None when the gate was busy (protocol.md §9)
 
@@ -1998,9 +2000,10 @@ and logic tests use `FakeClock`.
 | `test_hx_send.py` | Full Send on a delay and an encoder fake: commands, three read-backs, expected states, log; failure injected at every step → the result and expected state in §8; Try again; Leave it; confirm by someone else refused; Stop, Resume (refused after a rejection or a changed message), Set clocks; test print with counted and timed steps, the 60 s no-print stop, the end procedure; calibration; `writes ⊆ ALLOWED_WRITE_TAGS`; never SAVEMSG to the printing slot while printing; never `SETPPARAM` |
 | `test_hx_poller.py` | Request budget under 1 request/s per printer; pause for a lock and resume; drift needs a second reading; unreachable after 3 failures and the backoff; standalone mode; the DST clock set fires once, only without a lock |
 | `test_hx_sim.py` | Several simulated PCs (own identity, store, pool, gates) on one share with several fakes, `mixup` on: PCs drop out and return, printers switched off, a Send from two PCs at once, a slow printer with a slow share and a silent time server, one PC cut off from the share alone. Asserts: every fake's `max_in_flight == 1` (in the one-PC-cut-off case, which §7.3 rule 7 accepts as a residual risk, that and the "two requests in flight" violation are replaced by: every Send's read-backs matched their own TN and XID), no `violations`, one writer per `poll.json` at a time, takeover within 15–20 s (scaled), NOT MONITORED when every poller is gone |
-| `test_hx_ui.py` | Under xvfb (skipped if Tk can't start): the MapleJet tab builds; the Send window flow against fakes (bus pumped by hand, dialogs patched); result and red windows; monitor and floor board render a `BoardView`; an admin save; Ctrl+P ignored on the MapleJet tab and in MapleJet windows; bag text unchanged after switching to Spanish and running `App._retranslate` |
-| `test_i18n.py` (changed) | `SOURCES` also lists every `hx_*.py` except `hx_fake.py` and the generated `hx_key.py`; the test imports them so their catalogues are registered |
-| `test_stripes.py` (changed) | The v2 paths, the one-time settings copy, the deployment-log folder, the Zebra config read from `v2\config` with the fallback |
+| `test_hx_ui.py`, `test_hx_ui_send.py`, `test_hx_ui_admin.py` | Under xvfb (skipped if Tk can't start), split by module (ui.md §17): the MapleJet tab builds; the Send window flow against fakes (bus pumped by hand, dialogs patched); result and red windows; monitor and floor board render a `BoardView`; an admin save |
+| `test_hx_win.py` | the non-Windows fallbacks of every `hx_win` function, the identity overrides (unfrozen only), and `open_for_read`; the Windows calls themselves run in `test_hx_share_windows.py` and the self-check |
+| `test_i18n.py` (changed) | `SOURCES` also lists every `hx_*.py` in the repo folder except `hx_fake.py` and the generated `hx_key.py`, found by listing the folder (so the test covers each module as soon as it exists); the test imports them so their catalogues are registered; `add_spanish` refuses a conflicting pair |
+| `test_stripes.py` (changed) | The v2 paths, the one-time settings copy, the deployment-log folder, the Zebra config read from `v2\config` with the fallback; Ctrl+P ignored on the MapleJet tab and in MapleJet windows; bag text unchanged after switching to Spanish and running `App._retranslate` (ui.md §17.2) |
 | `test_make_version.py` (changed) | deploy.md §6.1: `parse_key`, `stamp_key`, `key_id` equal to `hx_protocol.key_id`, `main` |
 | `test_deploy.py` (new) | deploy.md §6.2: `.gitignore`, no `hx_key.py` in the checkout, the app never imports `hx_fake`, the spec's excludes, the app imported with the exe's exclusions blocked, the self-check from source, `check_release_key`, `version_text` |
 | `test_folder_script.py` (delivered after development) | deploy.md §8.8, Windows only |

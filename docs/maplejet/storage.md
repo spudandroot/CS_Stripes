@@ -1581,7 +1581,8 @@ A data cycle:
    its `file_type`, then `from_json`, and check the id against the path.
    - `company.json` missing: the problem is "MapleJet isn't set up on the server yet." The load is
      incomplete.
-   - A damaged or oversized file: the problem is `Msg(N_("{file} on the server is damaged."))`, and
+   - A damaged or oversized file: the problem is `Msg(N_("{file} on the server is damaged."), {"file":
+     rel})`, and
      the load is incomplete.
    - A newer-format file: its rel path is added to `too_new`, the problem is the `FormatTooNew` msg,
      and the load is incomplete.
@@ -1885,7 +1886,9 @@ class FlakyFileOps(FileOps):     # §16
     down: bool; hang: bool; slow_s: float; hide_new_s: float; not_found_cache_s: float
     fail_replace: int; break_after_create: int
     calls: list[tuple[str, str]]
-    def view(self) -> "FlakyFileOps": ...
+    def view(self, *, down: bool | None = None, hang: bool | None = None,
+             slow_s: float | None = None) -> "FlakyFileOps": ...
+        # None shares the parent's switch; a value gives this view its own (one simulated PC cut off)
 
 # CounterWatch
 class CounterWatch:
@@ -1912,12 +1915,15 @@ class ShareStore:
     def lock_age(self, printer_id: str) -> float | None: ...
     def check_poller_paused(self, machine_id: str, token: str) -> str: ...
         # "paused" | "stale" | "missing" | "polling" (§11.6)
+    def cached_expected(self, machine_id: str) -> ExpectedState | None: ...
+        # the last ExpectedState this store read or wrote for that machine; no share access (§5.4 rule 4)
 
-# PrinterLock
+# PrinterLock (thread-safe, §11.1)
 class PrinterLock:
     @property
     def token(self) -> str: ...   # "" unless held
-    def check(self) -> None: ...  # raises LockLost when state == "lost"
+    def check(self, budget_s: float = 0.0) -> None: ...   # §11.3: LockLost when lost, or when a call
+                                                          # of budget_s could outlive the lock
 
 # ReachMemory (§12.3)
 class ReachMemory:
@@ -1967,10 +1973,14 @@ at any time from the test thread.
 | `break_after_create` | 0 | The next N `create_exclusive` calls create the file, write half the data, then raise `OSError(errno.EIO)` |
 | `calls` | [] | `(operation, path)` for every call, in order, for assertions |
 
-`view()` returns a FlakyFileOps that shares `down`, `hang`, `slow_s`, `fail_replace`,
-`break_after_create` and the creation-time register with its parent, but has its own not-found cache
-and its own `calls`. Each simulated PC gets its own view, so per-client caches are modelled. The
-parent is a view too.
+`view(*, down=None, hang=None, slow_s=None)` returns a FlakyFileOps that shares `down`, `hang`,
+`slow_s`, `fail_replace`, `break_after_create` and the creation-time register with its parent, but has
+its own not-found cache and its own `calls`. Each simulated PC gets its own view, so per-client caches
+are modelled. The parent is a view too. A keyword given as a value instead of None gives that view its
+own switch for it, which it alone reads and which can be changed later through the view's attribute:
+`world.fs.view(down=True)` cuts one simulated PC off the share while the others keep it (a broken SMB
+session on one PC, architecture.md §7.3 rule 7). The parent's switch is still read for the keywords
+left as None.
 
 ## 17. Tests
 
@@ -2050,6 +2060,11 @@ sleeps more than 0.5 s in real time.
     - A second acquire in the same process: `LockHeld`.
     - A damaged lock is held, then taken over after 60 s. A format-2 lock is held.
     - Refreshes failing for 30 s: `lost`, and no write after that.
+    - Refreshes failing since t0: `check(budget_s=10)` at t0 + 21 s raises `LockLost` (and the state
+      is `lost`), while `check()` at t0 + 21 s on a second lock in the same situation doesn't raise;
+      a healthy lock's `check(budget_s=10)` never raises.
+    - Thread use: a lock acquired on one thread, then `check()`, `update(step=1)` and `release()`
+      from another thread work, and `release()` from a third thread is still idempotent.
     - `check_poller_paused` returns `"paused"` (token match, or own poller key), `"polling"` (fresh,
       other token), `"stale"` (15 s unchanged), and `"missing"` only after 15 s missing (at 14 s it
       is `"polling"`).
@@ -2063,15 +2078,20 @@ sleeps more than 0.5 s in real time.
     5-PC test gives each PC between 15 % and 25 %. `takeover_after_s` for ranks 0 to 4 gives 0, 15,
     20, 25 and 30, and scales with `Timings.scaled`.
 14. **ReachMemory (`FakeClock`):** it survives a new instance. `can_poll` is True up to 86,400 s and
-    False after. `probe_due` follows the §12.3 table for both `unpolled` values.
+    False after. `probe_due(unpolled=True)` is True at first and again 60 s after the last probe;
+    `probe_due(unpolled=False)` is always False, with or without reach.
 15. **Status files:** `write_poll`/`read_poll` round-trip at the §2 path, and `poller` is set by the
     store. A counter that doesn't go up gives `ValueError`. `write_expected` sets `counter` to the
     file's + 1, plus `written_by` and `computer`. A format-2 `poll.json` raises `FormatTooNew`, and
     `poll_age` still tracks its counter. `write_ack` twice: the first ack stays. `read_ack` caches it
-    (one `read_bytes` for two calls). `preview.bmp` round-trips.
+    (one `read_bytes` for two calls). `preview.bmp` round-trips. `cached_expected` returns the state
+    last read or written, and still returns it with `down=True`.
 16. **Not-found cache:** with `not_found_cache_s=5` on store B's view, a lock created by store A is
     invisible to B's `read_lock` for 5 s and visible after. `settle_s()` with the default timings is
     6.0, which is more than 5.
+17. **Per-view faults:** `b = fs.view(down=True)`: store B's operations raise `ShareUnavailable`
+    while store A on `fs.view()` reads and writes normally; `b.down = False` restores B; setting the
+    parent's `slow_s` slows A and B (B didn't override it).
 
 ### 17.2 `test_hx_share_windows.py` (`skipUnless(sys.platform == "win32")`)
 
@@ -2101,7 +2121,7 @@ sleeps more than 0.5 s in real time.
 - Follow §11.6 and §12.6 exactly: the lock before every request, `paused_for_lock` written at once,
   the settle rule on every start, a missing file counted only after `stale_s`, handover through
   `yielded_to`, and stopping share-mode polling after `stale_s / 2` of failed share writes.
-- Use `ReachMemory` and the probe rules of §12.3.
+- Use `ReachMemory` and the probe rules of §12.3, probing through `ClientPool.client(printer).probe()`.
 - Log through `DataService.append_log("hx-events", ...)`.
 - Use `poll_age`/`lock_age` for views.
 - Treat `FormatTooNew` from `read_poll` as a fresh, unreadable poll file ("Update Stripes" on that
@@ -2110,7 +2130,10 @@ sleeps more than 0.5 s in real time.
 
 **send.md**
 
-- Hold the lock with `with store.lock(...)`, and call `lock.check()` before each request.
+- Hold the lock with `with store.lock(...)`, and call `lock.check(budget_s=...)` before each request,
+  with that call's worst case (§11.3). The lock may be used from the machine threads (§11.1).
+- When the share is down at a Send, take the machine's state before the Send from
+  `store.cached_expected(machine_id)` (§5.4 rule 4).
 - Implement STEP_WAIT_POLLER with `check_poller_paused` as in §11.6, re-checking right before the
   first request, with a time limit.
 - Test prints and calibration should require `state == "held"` and refuse `local_only`: a test runs
@@ -2148,7 +2171,7 @@ sleeps more than 0.5 s in real time.
 |---|---|---|
 | SMB not-found cache | Whether an open by name on the real share hides a new lock file, and for how long (`FileNotFoundCacheLifetime`, 5 s by default) | Handshake, plus a missing poll file counted only after `stale_s`, plus a 6 s settle before a starting poller's first request (§11.6). If the measured delay is longer, raise `settle_s` above it |
 | Replace while another PC reads | Whether the file server lets `os.replace` through while another client holds the target open with FILE_SHARE_DELETE | Handles held for milliseconds only; about 3.2 s of replace retries; a failed status write is simply retried next cycle |
-| Reachability probe | A bare TCP connect to port 80 doesn't disturb a printing printer | At most hourly when the PC has reach, every 60 s only while some printer has no poller; never to a locked printer; skipped if this PC's gate is busy |
+| Reachability probe | A bare TCP connect to port 80 doesn't disturb a printing printer | Only to a printer with no live poller and no lock, at most every 60 s, through `PrinterClient.probe()`; skipped if this PC's gate is busy |
 | `%PROGRAMDATA%` permissions on the floor-PC image | Every user can create files in `%PROGRAMDATA%\Stripes\v2\send-queue` | Falls back to the user's own `<local>/hx/send-queue/` |
 | Add-only ACLs on the file server | The §14.2 entries (OWNER RIGHTS, create-only) behave on the server's Windows version as in the §17.2 test | The completion marker and read-only readers keep logs safe even if a writer could append |
 | Share settings | Offline caching off; v2 on a single server, not DFS-replicated | The folder script warns; README tells IT |
@@ -2194,9 +2217,11 @@ sleeps more than 0.5 s in real time.
 17. **A damaged lock is still a lock**, judged by the crc32 of its bytes, and taken over after 60 s.
 18. **Rendezvous score by computer, not process**, with ties by key. A restart keeps a PC's
     printers; two users on one PC back each other up; the load spreads across PCs.
-19. **Reachability probe frequency:** hourly while the PC has reach, every 60 s only while a printer
-    has no poller. The connect is never made to a locked printer, and is skipped if this PC's own
-    gate for that printer is busy. A printer with no live poller is preferred.
+19. **Reachability probe:** only to a printer that has no live poller and no lock, at most every 60 s,
+    through `PrinterClient.probe()` (which skips when this PC's own gate for that printer is busy). A
+    printer someone polls is never probed, so the probe never overlaps another PC's request; a PC
+    that polls nothing drops out of the rankings a day after its last reply and rejoins through the
+    probe when a printer loses its poller.
 20. **The 24-hour rule uses this PC's wall clock**, so it survives restarts, with 300 s of tolerance
     for a clock set back. `reached_at` moves on every successful change check, not only on full
     reloads.
@@ -2225,3 +2250,10 @@ sleeps more than 0.5 s in real time.
     log roots, and "Modify" that can't delete or re-permission the folder itself.
 33. **No installer:** `Stripes.exe` stays a single file, deployed as today, and creates every PC
     folder itself on first use. Nothing on the PC needs administrator rights.
+34. **`PrinterLock` is thread-safe**, so a Send takes its locks on one thread and uses them from its
+    machine threads; one internal lock, never held across a share operation.
+35. **`check(budget_s)`** refuses a call that could outlive the lock, reading `last_ok` itself
+    instead of waiting for the keeper.
+36. **`cached_expected`** keeps the last known expected state per machine in memory, so a Send made
+    while the share is down can later prove nobody changed it meanwhile (send.md §14.1).
+37. **`FlakyFileOps.view` takes per-view overrides**, so one simulated PC can be cut off alone.

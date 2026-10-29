@@ -187,8 +187,8 @@ def origin_preview(film: Film, countries: list[str]) -> str
     # the origin line the Send window shows before the plan can be merged: film.origin_preprinted ->
     # f"{film.preprinted_origin} (pre-printed)"; else hx_message.origin_phrase(countries) when countries
     # isn't empty; else "". A test asserts it equals MachinePlan.origin_line for the same choice.
-def run_send(master, services, plan: SendPlan) -> "SendWindow"
-    # a SendWindow prefilled from plan.request that starts at once (Try again)
+def run_send(master, services, plan: SendPlan) -> "SendWindow | None"
+    # Try again (§5.9): through the Navigator's one Send window; None when it couldn't start
 
 class SendWindow(HxWindow):                         # key "send"
     def __init__(self, master, services, *, prefill: SendRequest | None = None,
@@ -316,6 +316,8 @@ class Navigator:                                    # architecture methods, plus
     def window(self, key: str) -> HxWindow | None: ...   # the open window with that key
     def floor_board_open(self) -> bool: ...
     def update_monitor_flag(self) -> None: ...      # §15.3
+    def note_offline_send(self, send_id: str) -> None: ...   # §15.3 item 3
+    def note_offline_answer(self, send_id: str, machine_ids: list[str], everything_right: bool) -> None: ...
 
 class MapleJetTab(ttk.Frame):                       # architecture; §4
     hx_no_translate = True
@@ -857,6 +859,18 @@ the plan's order; a row is shown only when the one before it has a value.
    `PlanError` from the trial shows its `problems` in `problems_label` instead of the rows.
 3. The changes are recomputed on every `BoardUpdate`, because what a machine prints now can change while
    the window is open.
+4. **Unticked machines still printing.** For each machine of the line that isn't ticked, with `view` its
+   `MachineView` (None when the board has none): when (`view` is None, or `view.code != "off"` and
+   `view.printing is not False`) and (`view` is None, or `view.origin_line == ""`, or
+   `origin_change_text(view.origin_line, <the block's origin line>) != ""`), the block shows a warning
+   row in `HIGHLIGHT_BG`: a `Warn.TLabel` "{machine} isn't ticked and is still printing:", a `BagText`
+   (11, bold) with `view.origin_line` (or the "(origin unknown)" label), and "This line will print two
+   origins." Below the warning rows, `two_origins_var` (`ttk.Checkbutton`, "I know this line will print
+   two origins") must be ticked before `send_button` is enabled (§5.5); it is unticked again whenever
+   the set of warned machines changes. A line whose unticked machines are all off, or print the same
+   origin, shows no warning. The plan lets the sender untick a machine that's down; this makes sure a
+   wrong origin never keeps printing without someone saying so, and the send log records what the
+   unticked machines were printing (send.md §17.2 `unticked`).
 
 ### 5.5 Checks and the Send button
 
@@ -864,8 +878,9 @@ the plan's order; a row is shown only when the one before it has a value.
    empty, `problems_label` shows "Still needed:" and the messages, one per line (`Warn.TLabel`).
 2. `send_button` (`Hx.Big.TButton`) reads "Send to {n} machines" ("Send to 1 machine"), `n` = ticked
    machines over all blocks. It is enabled only when: at least one block exists; every block's
-   `problems()` is empty and its trial plan succeeded; `data.can_send()[0]` is True; `roles.sender`;
-   the window is on its choice page.
+   `problems()` is empty and its trial plan succeeded; every block that shows unticked-machine warnings
+   (§5.4 item 4) has `two_origins_var` ticked; `data.can_send()[0]` is True; `roles.sender`; the
+   window is on its choice page.
 3. Pressing it:
    1. `data = services.data.current`; `request = self.request()`: `SendRequest(send_id=new_id("sd"),
       sender=identity.user, computer=identity.computer, created_at=clock.time(), lines=[block.choice()
@@ -916,13 +931,15 @@ then, from the first printer request:
    and `countdown_label` shows `int(timings.countdown_s)`. From that event, a 200 ms timer shows
    `max(0, math.ceil(timings.countdown_s - (services.clock.time() - event.at)))` under "Sending in".
 5. **Cancel** (`cancel_button`): `cancel_token.cancel()`, the button is disabled and the caption reads
-   "Cancelling...". The button is removed for good when the shown count reaches 0 or when any
-   `SendEvent` arrives whose step is at or after `STEP_CHECK_MACHINE` in `STEPS`, whichever is first
-   (architecture §7.5 rule 2: the pipeline ignores the token after its first printer request).
+   "Cancelling...". The window switches to the working page (item 7) and removes the button for good
+   on `SendEvent(machine_id="", step=STEP_LOCK, status="ok")`, the pipeline's "go" (send.md §10.3 step
+   8), after which the pipeline ignores the token (architecture §7.5 rule 2). As fallbacks, it also
+   does so when the shown count reaches 0 or when any `SendEvent` arrives whose step is at or after
+   `STEP_CHECK_MACHINE` in `STEPS`, whichever comes first.
 6. `progress_heading` reads "Sending to {lines}" (`lines` = `join_names` of the plan's line names),
    and `countdown_origins[line_id]` (`BagText` 16 bold) shows each line's origin line from the plan.
-7. **Working.** At that same moment `page = "working"`: the countdown widgets are hidden and
-   `working_label` reads "Hang on, we're working on it" (plan).
+7. **Working.** At that same moment (the "go" event, or a fallback of item 5) `page = "working"`: the
+   countdown widgets are hidden and `working_label` reads "Hang on, we're working on it" (plan).
 8. **Progress rows.** One per machine of the plan: name, a mark, `text(STEP_TEXTS[event.step])`, and
    `text(event.msg)` when the event has one; a `PictureView` (width 256) appears with the last
    `event.design.preview_bmp`. Whole-send events (`machine_id == ""`) show in `send_status_label`
@@ -945,13 +962,15 @@ On `SendFinished` with `result.send_id == plan.send_id`:
 
 1. `mark_done(f"send:{send_id}")`.
 2. `hx_send.is_cancelled(result)`: back to the choice page with every choice kept, `send_status_label`
-   on the choice page reads "Cancelled. Nothing was sent." (`Ok.TLabel`); `page = "choose"`.
+   on the choice page reads `text(hx_message.NOTE_TEXTS["cancelled"])` ("Cancelled. Nothing was
+   sent.", `Ok.TLabel`); `page = "choose"`.
 3. Otherwise:
    1. If any machine has `ok`: `w = ResultWindow(root, services, result)`; `w.request = plan.request`
       (§6).
    2. If any machine isn't `ok`: `nav.open_failure(result, plan)` (§7), which comes up full screen on
       top.
-   3. `self.destroy()`.
+   3. If any machine has the note `no_lock`: `nav.note_offline_send(result.send_id)` (§15.3).
+   4. `self.destroy()`.
 
 On `WorkFailed` with `ref == plan.send_id`: `mark_done`; on the countdown page (nothing sent: the
 pipeline raised `PlanError` or `NotAllowed` before any printer request) the window returns to the
@@ -966,8 +985,15 @@ problem during the Send. Check each machine's card on the MapleJet tab." and `te
    A value that is no longer offered is left empty, so `problems()` shows what is missing. A line that
    isn't active any more is skipped and noted in `problems_label`: "{line} isn't active any more."
 2. `tick_lines(line_ids)` ticks those lines (choices empty).
-3. `run_send(master, services, plan)`: `w = SendWindow(master, services, prefill=plan.request)`, then
-   `w.start(plan)`; returns `w`. Used by Try again (§7.4).
+3. `run_send(master, services, plan)` (Try again, §7.4) goes through the Navigator's one Send window
+   (§2.5), never builds a second one:
+   - no Send window open: `w = SendWindow(master, services, prefill=plan.request)`, then `w.start(plan)`;
+     returns `w`;
+   - one open on its choice page: `ask(Msg(N_("Replace the choices in the Send window?")),
+     yes=N_("Replace them"), no=N_("Keep them"))`; yes: `w.fill(plan.request)`, then `w.start(plan)`,
+     returns `w`; no: returns None;
+   - one on its countdown or working page: `tell(Msg(N_("A Send is running. Wait for it to finish.")))`
+     and returns None.
 
 ### 5.10 Test attributes
 
@@ -981,7 +1007,7 @@ with `mark_label`, `step_label`, `msg_label`, `picture`).
 ttk.Radiobutton]`, `thumbs: dict[tuple[str, str], ttk.Label]` (film id, kind), `print_text_box`,
 `lot_entry`, `country_list`, `country_box`, `add_country_button`, `countries`, `free_entries`,
 `origin_text`, `change_texts`, `bag_texts`, `position_labels`, `warning_labels`, `problems_label`,
-`trial: SendPlan | None`.
+`unticked_warnings: dict[str, tk.Frame]` (machine id), `two_origins_var`, `trial: SendPlan | None`.
 
 ## 6. The result and confirmation window
 
@@ -1047,6 +1073,9 @@ ttk.Radiobutton]`, `thumbs: dict[tuple[str, str], ttk.Label]` (film id, kind), `
 2. `bg.run(lambda: services.pipeline().confirm(send_id, ids, True))`, `ids` = the line's pending machines.
 3. Done: `"confirmed"`; the buttons are replaced by "Confirmed by you at {time}." (`Ok.TLabel`, `when(
    clock.time())`). Error: `text(e.msg)` under the line (`Bad.TLabel`), `"pending"`, buttons enabled.
+   A `ShareError` for a Send made without the share (any machine of the result has the note `no_lock`)
+   also calls `nav.note_offline_answer(send_id, ids, True)`, so the answer reaches the expected states
+   when the share is back (§15.3 item 3); the same holds for "Something's wrong" with `False`.
 
 **Something's wrong** (`wrong_buttons[line_id]`):
 
@@ -1087,10 +1116,12 @@ their monitor card").
    Machines of the result that aren't pending show their current headline from the board instead of a
    state label, and their line gets no buttons when none of its machines is pending.
 5. Done without an entry (the PC that sent crashed before writing it, or the log can't be reached):
-   the window lists the pending machines with the latest running picture (`pictures`), the origin from
-   their `MachineView.origin_line`, the note "This PC can't find the full record of this Send. These
-   are the printers' latest pictures." and the same line buttons, which confirm with `send_id`. The
-   sender check uses `MachineView.confirm_pending_by`.
+   `pending` then comes from the expected states (send.md §11.3 falls back to them), so the window
+   lists the pending machines with the latest running picture (`pictures`), the origin from their
+   `MachineView.origin_line`, the note "This PC can't find the full record of this Send. These are the
+   printers' latest pictures." and the same line buttons, which confirm with `send_id` (send.md §11.2
+   accepts that without the entry). The sender check uses `MachineView.confirm_pending_by`
+   (`ExpectedState.sender`).
 6. `pending` empty: "Nothing in this Send is waiting for confirmation." and Close.
 7. Returns the window.
 
@@ -1142,8 +1173,10 @@ all text `RED_FG` in plain `tk.Label`s, content in a `Scroller` with background 
 3. Differences, when `row.differences` isn't empty: a `ttk.Treeview` with headings "Where", "What",
    "Sent", "Read back" and one row per `Difference` (`where`, `field`, `sent`, `read`: data and bag text
    in cells).
-4. What it was last confirmed printing (plan): "Last confirmed printing: {name}" (`row.previous_name`),
-   or "Stripes doesn't know what this machine was last confirmed printing." when it is `""`; a
+4. What it was last confirmed printing (plan): "Last confirmed printing: {name}" (`row.previous_name`)
+   when `row.previous_confirmed`, else "Printing before this Send (not confirmed): {name}", because that
+   message may never have been confirmed, may be in drift or may not come from Stripes; "Stripes
+   doesn't know what this machine was last confirmed printing." when the name is `""`; a
    `PictureView` (width 768) with `row.previous_preview`; a `BagText` (24, bold, foreground `RED_FG`,
    background `RED_BG`) with `row.previous_origin`, or "(origin unknown)".
 5. `passed_label`, when some machines passed: "{machines} went live. Confirm them in the result window."
@@ -1162,8 +1195,17 @@ calls `tell(Msg(N_("Choose Try again or Leave it.")), kind="warning")` and stays
 
 1. `ids = [row.machine_id for row in rows]`; `new_plan = plan.restricted(ids)` (a new send_id, the same
    choices, send.md §4.5).
-2. `run_send(root, services, new_plan)`: its countdown and Cancel work as in §5.7.
-3. `self.destroy()`.
+2. `w = run_send(root, services, new_plan)` (§5.9): its countdown and Cancel work as in §5.7. None (the
+   sender kept the open Send window's choices, or a Send is running): the red window stays as it is.
+3. Otherwise the red window is withdrawn (not destroyed) and subscribes to the retry's events
+   (`retry_send_id = new_plan.send_id`):
+   - `SendEvent(machine_id="", step=STEP_LOCK, status="ok")` for the retry (its "go"): `self.destroy()`.
+     From here the retry's own windows take over.
+   - `WorkFailed` with `ref == retry_send_id` (a `PlanError` or `NotAllowed` during the countdown, such
+     as "The templates changed ..."), or a `SendFinished` whose result `is_cancelled`: the red window
+     is shown again (`deiconify`, full screen, topmost) with `text(msg)` (or "Try again was
+     cancelled.") above its buttons, and waits for Try again or Leave it as before, so the line is never
+     left red without the red window.
 
 **Leave it**:
 
@@ -1177,12 +1219,14 @@ Test attributes: `rows`, `try_button`, `leave_button`, `pictures`, `origins`, `p
 
 ## 8. Something's wrong, Stop, Resume and Set clocks
 
-All three dialogs run their action on `start_thread(services, f"hx-action-<n>", ref, target)` with
-`ref = self.key` and `target` = the `PrinterActions` call with `on_event=services.bus.post`. Until the
-first `ActionEvent` of their kind for one of their machines arrives they don't know the `action_id`;
-they adopt the first one's and then filter by it. Each marks itself running (§2.1 rule 9) with "Stripes
-is stopping printing on {machines}.", "Stripes is resuming printing on {machines}." or "Stripes is
-setting the clocks on {machines}." Machine names come from `data.current.machines`.
+All three dialogs make the action's id first, `self.action_id = new_id("ac")`, and run the action on
+`start_thread(services, f"hx-action-{action_id}", action_id, target)` with `target` = the
+`PrinterActions` call with `on_event=services.bus.post` and `action_id=self.action_id` (architecture
+§6.7). The thread name, the `WorkFailed` ref and the event filter (`ActionEvent.action_id`,
+`ActionFinished.result.action_id`) are that id from the start. A Try again makes a new id. Each marks
+itself running (§2.1 rule 9) with "Stripes is stopping printing on {machines}.", "Stripes is resuming
+printing on {machines}." or "Stripes is setting the clocks on {machines}." Machine names come from
+`data.current.machines`.
 
 ### 8.1 Stop (and the Something's wrong flow)
 
@@ -1636,7 +1680,7 @@ Every page follows these steps (`AdminPage`):
    never deleted: there is no delete button anywhere; "Active" or a status of "Not active" retires a
    record (architecture decision 9).
 4. **Leaving** a dirty record (another row, another page, closing the window):
-   `ask(Msg(N_("Discard your changes to {name}?")), yes=N_("Discard"), no=N_("Keep editing"))`; "Keep
+   `ask(Msg(N_("Discard your changes to {name}?"), {"name": <the record's name>}), yes=N_("Discard"), no=N_("Keep editing"))`; "Keep
    editing" restores the selection.
 5. **Save** (`save_button`):
    1. Read the form into a copy of `working` with `parse_number` for numeric fields. A bad number is a
@@ -1710,10 +1754,11 @@ names), `new_button`, `save_button`, `revert_button`, `reload_button`, `problems
 | `bag_counter` | 3 Radiobuttons: `PMCNT`, `MSCNT`, `none` | OPEN in architecture §11; default `PMCNT` |
 
 1. **Look up**: `bg.run(lambda: hx_win.lookup_group_sid(name))`; a SID fills the SID entry, None shows
-   `tell(Msg(N_("Windows couldn't find a group called {name}.")))`.
+   `tell(Msg(N_("Windows couldn't find a group called {name}."), {"name": name}))`.
 2. **Before saving**, after `validate_company`:
    - When `admin_group_sid not in identity.sids`: `ask(Msg(N_("You aren't in {group}. After saving, you
-     won't be able to change the MapleJet settings. Save anyway?")), yes=N_("Save anyway"),
+     won't be able to change the MapleJet settings. Save anyway?"), {"group": company.admin_group}),
+     yes=N_("Save anyway"),
      no=N_("Go back"))`.
    - `conflicts = origin_conflicts(data, company)`: when not empty, `ask(Msg(N_("With this country
      list, these records contain words about origin and can't be sent until they're fixed:
@@ -1820,7 +1865,8 @@ else "Type the notify user as DOMAIN\name, for example EXAMPLE\jsmith."
    "Type the printer's IP address, for example 192.0.2.10." unless `ipaddress.IPv4Address(host)`
    parses; "{name} already has this address." when another active printer has the same host and port;
    "The port must be a number from 1 to 65535."; "The UID must be a whole number from 1 to
-   2147483647." The two name texts are the existing Zebra ones.
+   4294967295." (the range protocol.md §5.2 accepts for HXUI). The two name texts are the existing
+   Zebra ones.
 5. "Used by:" the active machine with this `printer_id`, with its headline and age from the board, or
    "Not used by any machine yet." Stripes checks a printer through its machine, so the admin sees
    whether the password works on that machine's card ("Stripes can't log in to this printer") within
@@ -2202,10 +2248,10 @@ Shows `TestEvent`s with this `run_id`:
 | `status` | `status_label` |
 |---|---|
 | `building` | "Building and checking the next message..." |
-| `printing` | "Printing: {bags} of {per} bags" (`per` = `bags_per_step`; "Printing..." when `bags` is None) |
+| `printing` | "Printing: {bags} of {per} bags" (`per` = `bags_per_step`; "Printing..." when `bags` is None); send.md posts it after each switch and again whenever the step's count changes, so the count moves during a step |
 | `ok` | "Step done." |
 | `failed` | `text(event.msg)` (`Bad.TLabel`) |
-| `stopping` | "Stopping: finishing this step, then printing off and emptying slots 9 and 10." |
+| `stopping` | "Stopping: printing off, then emptying slots 9 and 10." (Stop test takes effect after the current request, architecture §7.5 rule 3) |
 | `cleared` | "Printing is off and slots 9 and 10 are empty." |
 
 `step_label` "Step {step} of {of}"; `label_text` (`BagText` 14 bold) the step's label from
@@ -2226,6 +2272,16 @@ On `TestFinished` (or `WorkFailed`) with this run id: `mark_done`; then:
    "Resolution", "Fonts", so the admin can match each mark on the film to its values.
 4. `film_button` "Open the film": `nav.open_admin(page="products", record_id=film_id)`, with the hint
    "Type the chosen values into the film. That's a normal edit; the film's status doesn't change."
+5. **Printing not confirmed off** (`result.printing_off` is False): the window turns into the full-screen
+   red page of §8.1 item 7 (`attributes("-fullscreen", True)`, `-topmost`, `RED_BG`), with "Stop it at
+   the printer now", "Stripes couldn't stop printing on {machines}." (the test's machine), "Press
+   Print On/Off on that printer now. Its card shows "Stop it at the printer" until Stripes reads that
+   printing is off.", `text(result.msg)`, and `end_try_button` "Try again" and Close. Try again runs
+   `run.end_again(services.bus.post)` (send.md §15.5) on `start_thread(services,
+   f"hx-test-{run_id}", run_id, ...)` with `mark_running`; the administrator who ran the test may use it
+   without being a sender (Stop, on the machine card, needs the sender group). Its `TestFinished`
+   replaces the result: `printing_off` True returns to the normal finished page; False keeps the red
+   page. Close is always allowed on this page.
 
 `close()` while running: `ask(Msg(N_("Stop the test print?")), yes=N_("Stop test"), no=N_("Keep it
 running"))`; yes cancels, and the window stays until `TestFinished` (the end procedure always runs).
@@ -2234,15 +2290,15 @@ Otherwise it closes.
 Test attributes: `machine_box`, `empty_film_var`, `start_entry`, `stop_entry`, `step_entry`,
 `bold_vars`, `width_vars`, `resolution_vars`, `font_rows`, `estimate_label`, `problems_label`,
 `start_button`, `plan`, `cancel_token`, `panel` (`TestRunPanel`: `step_label`, `label_text`,
-`status_label`, `picture`, `stop_button`), `steps_tree`, `film_button`.
+`status_label`, `picture`, `stop_button`), `steps_tree`, `film_button`, `end_try_button`.
 
 ## 13. The calibration window (OPEN)
 
 How encoder machines are calibrated is open while the encoder is worked out (plan; architecture §11).
-This window is the interface and the safe default; the procedure is to be confirmed on the test unit.
-`CalibrationWindow(master, services, *, machine_id)` (administrators, from the machine page), title
-"Calibrate {machine}". A delay machine gets `tell(Msg(N_("Delay machines aren't calibrated.")))` and no
-window.
+This window is the interface and the safe default; it follows send.md §16 exactly, and the procedure is
+to be confirmed on the test unit. `CalibrationWindow(master, services, *, machine_id)`
+(administrators, from the machine page), title "Calibrate {machine}". A delay machine gets
+`tell(Msg(N_("Delay machines aren't calibrated.")))` and no window.
 
 ```
 ┌ Calibrate Line 1 Bagger 1 ──────────────────────────────────────────────────────────────┐
@@ -2250,16 +2306,20 @@ window.
 │ confirmed on the test unit.                                              (Muted)        │
 │ Film loaded for calibration [EXCO1 · Rev C (610 mm) v]                                  │  film_box
 │ [x] Line 1 Bagger 1 is running empty film, with no product.                             │  empty_film_var
-│ ── 1. Distance scale ──                                                                  │
-│ Stripes prints two marks 300 mm apart. Measure the gap between them on the film.         │
-│ [Print the two marks]                                                                    │  print_spacing_button
-│ Measured gap (mm) [300.5 ]   The gap is within 2 mm: the wheel size is right.            │  spacing_var, spacing_result
-│ ── 2. Head distance ──                                                                   │
-│ Rough head distance by tape measure (mm) [400 ]                                          │  rough_var
+│ ── 1. Rough head distance ──                                                             │
+│ Rough head distance by tape measure (mm) [400 ]  [Save rough distance]                   │  rough_var, save_rough_button
 │   From the print head back along the film path to where a bag's bottom edge sits when    │
 │   the film stops. It can be longer than one bag.                                         │
-│ Print one mark [100 ] mm after the trigger  [Print the mark]                             │  head_sent_var, print_head_button
-│ Measured from the bag's bottom edge (mm) [136 ]                                          │  head_measured_var
+│ Saved: 400 mm.                                                                            │  rough_status
+│ ── 2. Distance scale ──                                                                   │
+│ Stripes prints two marks 300 mm apart, at 365 mm and 55 mm after the trigger.            │  spacing_text
+│ [Print the two marks]                                                                    │  print_spacing_button
+│ Mark A from the bag's bottom edge (mm) [167 ]  Mark B (mm) [467.5 ]                       │  mark_a_var, mark_b_var
+│ Gap: 300.5 mm. The gap is within 2 mm: the wheel size is right.                           │  spacing_result
+│ ── 3. Head distance ──                                                                   │
+│ Stripes prints one mark 515 mm after the trigger.                                        │  head_text
+│ [Print the mark]                                                                         │  print_head_button
+│ Measured from the bag's bottom edge (mm) [317 ]                                          │  head_measured_var
 │ Head distance: 412 mm                                                                    │  head_result
 │ ── ──                                                                                    │
 │ Last spacing check: 300.5 mm by EXAMPLE\jsmith at 2026-10-29 13:00.                      │
@@ -2272,38 +2332,57 @@ window.
 1. At the top, in `Muted.TLabel`: "Calibrate once, at installation, with empty film. This procedure is
    still being confirmed on the test unit." (remove the second sentence once confirmed). `film_box`
    ("Film loaded for calibration"): films of any status that have `length_mm`, by product and code,
-   shown "{code} · {revision} ({length} mm)" (data). The film's length decides where the marks land.
-2. **Distance scale.** `print_spacing_button`: `plan_test(machine_id, film_id,
-   TestRanges(vary="position", start=0.0, stop=float(sent), step=float(sent)), data, identity,
-   kind="spacing")` with `sent = calibration.spacing_sent_mm` (300), under the text "Stripes prints two
-   marks {mm} mm apart. Measure the gap between them on the film."; it runs in the `TestRunPanel`
-   exactly as in §12.3–§12.5. After the admin types the measured gap: within
-   `hx_message.SPACING_TOLERANCE_MM` of `sent` → "The gap is within {mm} mm: the wheel size is right."
-   (`Ok.TLabel`); otherwise, with `machine.encoder_wheel_mm` set, "Correct the wheel size on the
-   printer to {wheel} mm, then print the marks again." (`wheel = hx_message.wheel_suggestion_mm(...)`),
-   or, without it, "The gap is {measured} mm instead of {sent} mm. Correct the wheel size on the
-   printer, then print the marks again." Stripes never changes the wheel size itself (plan).
-3. **Head distance.** The admin types the rough tape measurement (hint: "From the print head back
-   along the film path to where a bag's bottom edge sits when the film stops. It can be longer than one
-   bag."), then `print_head_button` runs
-   `plan_test(..., TestRanges(vary="position", start=p, stop=p, step=1.0), ..., kind="head_distance")`
-   with `p` = `head_sent_var` (default 100 mm after the trigger; OPEN: send.md §16 decides how this kind
-   treats `start`). After the admin types where the mark landed, `head_result` shows "Head distance: {mm}
-   mm" with `mm = hx_message.head_distance_from_print(p, measured, film.length_mm, rough)`.
-4. **Save calibration** (`save_button`): the machine's `Calibration` from `data.calibrations` (or a new
-   one, `id = machine_id`), with the spacing fields set when a gap was measured (`spacing_sent_mm`,
-   `spacing_measured_mm`, `spacing_by = identity.user`, `spacing_at = clock.time()`) and the head fields
-   when a head distance was worked out (`rough_head_distance_mm`, `head_print_sent_mm`,
-   `head_print_measured_mm`, `head_distance_mm`, `head_by`, `head_at`); `data.save(cal,
-   expected_revision=...)`. Storage copies the head distance into the machine (storage.md §13.4 step 8).
-   Done: "Saved. The head distance of {machine} is now {mm} mm."
-5. History lines from the machine's `Calibration`: "Last spacing check: {mm} mm by {user} at {time}."
+   shown "{code} · {revision} ({length} mm)" (data). The film's length `L` decides where the marks
+   land.
+2. **Rough head distance first.** send.md §16.2 plans neither print without
+   `Calibration.rough_head_distance_mm`, so this is step 1. `save_rough_button` "Save rough distance":
+   `cal` = the machine's `Calibration` from `data.current.calibrations` (a copy), or a new
+   `Calibration(id=machine_id, machine_id=machine_id)`; `cal.rough_head_distance_mm = <rough_var>`;
+   `bg.run(lambda: data.save(cal, expected_revision=<cal's revision, None when new>))`. The print buttons
+   stay disabled ("Save the rough distance first.") until a `DataUpdate` arrives whose
+   `calibrations[machine_id].rough_head_distance_mm` equals the saved value; `rough_status` then reads
+   "Saved: {mm} mm." Changing the rough value disables them again until it is saved.
+3. **The plans.** With the rough distance in `data.current`, the window plans both prints on the Tk
+   thread (pure): `spacing_plan = plan_test(machine_id, film_id, TestRanges(vary="position", start=0.0,
+   stop=0.0, step=1.0), data, identity, kind="spacing")` and `head_plan = plan_test(...,
+   kind="head_distance")`. The `TestRanges` is a placeholder: send.md §16.2 ignores it for these kinds.
+   A `PlanError` shows its problems under the step and disables its button. The positions shown are the
+   ones that will be sent, read from the plans: `a = spacing_plan.steps[0].position_mm`, `b =
+   spacing_plan.steps[1].position_mm` and `h = head_plan.steps[0].position_mm` (whole mm; the base plan's
+   head distance is 0, so these are the DLYMM values sent). `spacing_text` reads "Stripes prints two
+   marks {mm} mm apart, at {a} mm and {b} mm after the trigger." and `head_text` "Stripes prints one mark
+   {h} mm after the trigger."
+4. **Distance scale.** `print_spacing_button` "Print the two marks" runs `spacing_plan` in the
+   `TestRunPanel` exactly as in §12.3–§12.5. The admin then measures each mark from the bag's bottom
+   edge, as send.md §16.1 asks: `mark_a_var` ("Mark A from the bag's bottom edge (mm)") and `mark_b_var`
+   ("Mark B (mm)"). `gap = hx_message.spacing_gap_mm(a_measured, b_measured, L)`; `spacing_result` reads
+   "Gap: {gap} mm." then, within `hx_message.SPACING_TOLERANCE_MM` of `spacing_sent_mm` (300), "The gap is
+   within {mm} mm: the wheel size is right." (`Ok.TLabel`); otherwise, with `machine.encoder_wheel_mm`
+   set, "Correct the wheel size on the printer to {wheel} mm, then print the marks again." (`wheel =
+   hx_message.wheel_suggestion_mm(machine.encoder_wheel_mm, spacing_sent_mm, gap)`), or, without it,
+   "The gap is {measured} mm instead of {sent} mm. Correct the wheel size on the printer, then print the
+   marks again." Stripes never changes the wheel size itself (plan).
+5. **Head distance.** `print_head_button` "Print the mark" runs `head_plan` the same way. After the
+   admin types where the mark landed (`head_measured_var`), `head_result` shows "Head distance: {mm} mm"
+   with `mm = hx_message.head_distance_from_print(sent, measured, L, rough)`, where `sent =
+   int(head_plan.steps[0].position_mm)`, the DLYMM Stripes printed (not a value the admin typed), and
+   `rough` = the saved rough distance. A `PlanError` ("The tape measurement is too far ...") shows
+   under the step.
+6. **Save calibration** (`save_button`): the machine's `Calibration` from `data.current.calibrations`
+   (the one step 2 saved), with the spacing fields set when a gap was worked out (`spacing_sent_mm`,
+   `spacing_measured_mm = gap`, `spacing_by = identity.user`, `spacing_at = clock.time()`) and the head
+   fields when a head distance was (`head_print_sent_mm = sent`, `head_print_measured_mm`,
+   `head_distance_mm`, `head_by`, `head_at`); `data.save(cal, expected_revision=cal.revision)`. Storage
+   copies the head distance into the machine (storage.md §13.4 step 8). Done: "Saved. The head distance
+   of {machine} is now {mm} mm."
+7. History lines from the machine's `Calibration`: "Last spacing check: {mm} mm by {user} at {time}."
    and "Last head distance: {mm} mm by {user} at {time}.", each shown only when recorded.
-6. Each print takes the printer's lock for its run, shows "TEST by ..." on the board, and ends with
-   printing off and both slots empty, like any test print.
+8. Each print takes the printer's lock for its run (purpose `calibration`), shows "TEST by ..." on the
+   board, and ends with printing off and both slots empty, like any test print.
 
-Test attributes: `film_box`, `empty_film_var`, `print_spacing_button`, `spacing_var`, `spacing_result`,
-`rough_var`, `head_sent_var`, `print_head_button`, `head_measured_var`, `head_result`, `save_button`,
+Test attributes: `film_box`, `empty_film_var`, `rough_var`, `save_rough_button`, `rough_status`,
+`spacing_plan`, `head_plan`, `spacing_text`, `print_spacing_button`, `mark_a_var`, `mark_b_var`,
+`spacing_result`, `head_text`, `print_head_button`, `head_measured_var`, `head_result`, `save_button`,
 `panel`.
 
 ## 14. Per-user settings
@@ -2395,7 +2474,10 @@ Tk thread:
 ### 15.3 Navigator
 
 `Navigator(root)` holds `root`, `services`, `windows: dict[str, HxWindow]`, `tab` (the `MapleJetTab`,
-set by its constructor), `tab_shown`, `sounder` and the last monitor flag.
+set by its constructor), `tab_shown`, `sounder`, `offline_sends` and the last monitor flag. `hx_ui`
+imports `hx_ui_send` and `hx_ui_admin` inside the Navigator methods that open their windows, not at
+the top of the module, so `hx_ui`, `hx_ui_common` and `hx_ui_monitor` build and test before those two
+exist (they are built in parallel).
 
 | Method | Role needed | Does |
 |---|---|---|
@@ -2422,6 +2504,16 @@ set by its constructor), `tab_shown`, `sounder` and the last monitor flag.
    `floor` changed, `sounder.evaluate(watcher.latest)`. It is called on tab changes, when the monitor or
    floor board opens or closes, and on every `BoardUpdate` (which also catches the main window being
    hidden to the tray).
+3. **Sends made without the share** (send.md §14.1). `note_offline_send(send_id)` (called by the Send
+   window when a result has a `no_lock` machine, §5.8) adds the id to `offline_sends`;
+   `note_offline_answer(send_id, ids, everything_right)` (called by the result window when `confirm`
+   raised a `ShareError` for a Send in `offline_sends`) remembers the answer. The Navigator subscribes
+   to `ShareHealth`; on each `ShareHealth(ok=True)` while `offline_sends` isn't empty and no such run is
+   going, it runs one `bg.run` that, for each id: `entry = data.find_send(id)`; when found,
+   `services.pipeline().record_offline(entry)`, then, when an answer was remembered,
+   `pipeline.confirm(id, ids, everything_right)`; an id is dropped from the list once both succeeded
+   (errors keep it for the next `ShareHealth`). The list lives in memory only: a restart loses it, and
+   the machine then shows `drift` until the next Send (architecture §12.1).
 
 ### 15.4 can_quit and stop_services
 
@@ -2429,9 +2521,10 @@ set by its constructor), `tab_shown`, `sounder` and the last monitor flag.
    If you quit now, a printer may be left halfway through. Quit anyway?"), {"running": r[0]}),
    yes=N_("Quit anyway"), no=N_("Keep Stripes open"))`. The question is asked once per quit
    (architecture §10.6 rule 2).
-2. `stop_services(services, timeout_s=2.0)` is safe on services that were never started (deploy.md
-   §5.8: then it only calls `hx_win.stop_alert()`; each service's `stop()` returns at once when its
-   thread never ran). Otherwise: `nav.sounder.stop()` first (silence at once); then
+2. `stop_services(services, timeout_s=2.0)` is safe on services that were never started: when
+   `nav.sounder` is None or the services were never started, it only calls `hx_win.stop_alert()`, and
+   each `stop()` returns at once when its thread never ran. Otherwise: `nav.sounder.stop()` first
+   (silence at once); then
    `poller.stop(timeout_s)` (it hands its printers over), `watcher.stop(timeout_s)` and
    `data.stop(timeout_s)` on three helper threads started together and joined against one deadline of
    `timeout_s + 0.5` s; then `hx_win.stop_alert()`. Running Send or test threads are daemon threads:
@@ -2532,6 +2625,9 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Lot | Lote |
 | Floor board | Tablero de planta |
 | No lines are set up yet. | Todavía no hay líneas configuradas. |
+| Stop it at the printer now | Deténgala en la impresora ahora |
+| Stripes couldn't stop printing on {machines}. | Stripes no pudo detener la impresión en {machines}. |
+| Press Print On/Off on that printer now. Its card shows "Stop it at the printer" until Stripes reads that printing is off. | Presione Print On/Off en esa impresora ahora. Su tarjeta muestra "Deténgala en la impresora" hasta que Stripes lea que la impresión está apagada. |
 | You can refresh once every {seconds} s. | Puede actualizar una vez cada {seconds} s. |
 
 ### 16.2 hx_ui_send
@@ -2561,6 +2657,9 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Origin is pre-printed on this film: | El origen viene preimpreso en esta película: |
 | Origin on the bag: | Origen en la bolsa: |
 | Same origin as now. | Mismo origen que ahora. |
+| {machine} isn't ticked and is still printing: | {machine} no está marcada y sigue imprimiendo: |
+| This line will print two origins. | Esta línea imprimirá dos orígenes. |
+| I know this line will print two origins | Sé que esta línea imprimirá dos orígenes |
 | (origin unknown) → | (origen desconocido) → |
 | Prints: | Imprime: |
 | Still needed: | Falta: |
@@ -2575,7 +2674,6 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Hang on, we're working on it | Espere, estamos trabajando en ello |
 | Press Cancel to stop the Send. | Presione Cancelar para detener el envío. |
 | The Send is running. Wait for it to finish. | El envío está en curso. Espere a que termine. |
-| Cancelled. Nothing was sent. | Cancelado. No se envió nada. |
 | Stripes hit a problem during the Send. Check each machine's card on the MapleJet tab. | Stripes tuvo un problema durante el envío. Revise la tarjeta de cada máquina en la pestaña MapleJet. |
 | Check the new messages | Revise los mensajes nuevos |
 | Sent by {user} on {computer} at {time}. | Enviado por {user} en {computer} el {time}. |
@@ -2606,6 +2704,8 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Sent | Enviado |
 | Read back | Leído |
 | Last confirmed printing: {name} | Lo último confirmado que imprimía: {name} |
+| Printing before this Send (not confirmed): {name} | Lo que imprimía antes de este envío (sin confirmar): {name} |
+| Try again was cancelled. | Se canceló Intentar de nuevo. |
 | Stripes doesn't know what this machine was last confirmed printing. | Stripes no sabe qué fue lo último confirmado que imprimía esta máquina. |
 | {machines} went live. Confirm them in the result window. | {machines} quedaron activas. Confírmelas en la ventana de resultados. |
 | Only {user} can choose Try again or Leave it. | Solo {user} puede elegir Intentar de nuevo o Dejarlo así. |
@@ -2617,9 +2717,6 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Stopping printing... | Deteniendo la impresión... |
 | Printing stopped on {machines}. {line} needs a new Send. | Se detuvo la impresión en {machines}. {line} necesita un nuevo envío. |
 | Printing stopped on {machines}. | Se detuvo la impresión en {machines}. |
-| Stop it at the printer now | Deténgala en la impresora ahora |
-| Stripes couldn't stop printing on {machines}. | Stripes no pudo detener la impresión en {machines}. |
-| Press Print On/Off on that printer now. Its card shows "Stop it at the printer" until Stripes reads that printing is off. | Presione Print On/Off en esa impresora ahora. Su tarjeta muestra "Deténgala en la impresora" hasta que Stripes lea que la impresión está apagada. |
 | {machine}: {problem} | {machine}: {problem} |
 | Wait until Stripes has finished stopping printing. | Espere a que Stripes termine de detener la impresión. |
 | Stripes is stopping printing on {machines}. | Stripes está deteniendo la impresión en {machines}. |
@@ -2785,7 +2882,7 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Type the printer's IP address, for example 192.0.2.10. | Escriba la dirección IP de la impresora, por ejemplo 192.0.2.10. |
 | {name} already has this address. | {name} ya tiene esta dirección. |
 | The port must be a number from 1 to 65535. | El puerto debe ser un número de 1 a 65535. |
-| The UID must be a whole number from 1 to 2147483647. | El UID debe ser un número entero de 1 a 2147483647. |
+| The UID must be a whole number from 1 to 4294967295. | El UID debe ser un número entero de 1 a 4294967295. |
 | Used by: | La usa: |
 | Not used by any machine yet. | Todavía no la usa ninguna máquina. |
 | Add new version | Agregar versión nueva |
@@ -2935,7 +3032,7 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Printing: {bags} of {per} bags | Imprimiendo: {bags} de {per} bolsas |
 | Printing... | Imprimiendo... |
 | Step done. | Paso terminado. |
-| Stopping: finishing this step, then printing off and emptying slots 9 and 10. | Deteniendo: se termina este paso, luego se apaga la impresión y se vacían las posiciones 9 y 10. |
+| Stopping: printing off, then emptying slots 9 and 10. | Deteniendo: se apaga la impresión y luego se vacían las posiciones 9 y 10. |
 | Printing is off and slots 9 and 10 are empty. | La impresión está apagada y las posiciones 9 y 10 están vacías. |
 | Stop test | Detener la prueba |
 | Finished: {done} of {of} steps. | Terminado: {done} de {of} pasos. |
@@ -2954,18 +3051,23 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Delay machines aren't calibrated. | Las máquinas con retardo no se calibran. |
 | Calibrate once, at installation, with empty film. This procedure is still being confirmed on the test unit. | Calibre una vez, al instalar, con película vacía. Este procedimiento todavía se está confirmando en la unidad de prueba. |
 | Film loaded for calibration | Película cargada para calibrar |
-| 1. Distance scale | 1. Escala de distancia |
-| Stripes prints two marks {mm} mm apart. Measure the gap between them on the film. | Stripes imprime dos marcas a {mm} mm de distancia. Mida el espacio entre ellas en la película. |
+| 1. Rough head distance | 1. Distancia aproximada del cabezal |
+| Save rough distance | Guardar la distancia aproximada |
+| Saved: {mm} mm. | Guardado: {mm} mm. |
+| Save the rough distance first. | Guarde primero la distancia aproximada. |
+| 2. Distance scale | 2. Escala de distancia |
+| Stripes prints two marks {mm} mm apart, at {a} mm and {b} mm after the trigger. | Stripes imprime dos marcas a {mm} mm de distancia, a {a} mm y {b} mm después del disparo. |
 | Print the two marks | Imprimir las dos marcas |
-| Measured gap (mm) | Espacio medido (mm) |
+| Mark A from the bag's bottom edge (mm) | Marca A desde el borde inferior de la bolsa (mm) |
+| Mark B (mm) | Marca B (mm) |
+| Gap: {gap} mm. | Espacio: {gap} mm. |
 | The gap is within {mm} mm: the wheel size is right. | El espacio está dentro de {mm} mm: el tamaño de la rueda es correcto. |
 | Correct the wheel size on the printer to {wheel} mm, then print the marks again. | Corrija el tamaño de la rueda en la impresora a {wheel} mm y vuelva a imprimir las marcas. |
 | The gap is {measured} mm instead of {sent} mm. Correct the wheel size on the printer, then print the marks again. | El espacio es de {measured} mm en vez de {sent} mm. Corrija el tamaño de la rueda en la impresora y vuelva a imprimir las marcas. |
-| 2. Head distance | 2. Distancia del cabezal |
+| 3. Head distance | 3. Distancia del cabezal |
 | Rough head distance by tape measure (mm) | Distancia aproximada del cabezal con cinta métrica (mm) |
 | From the print head back along the film path to where a bag's bottom edge sits when the film stops. It can be longer than one bag. | Desde el cabezal, hacia atrás por el recorrido de la película, hasta donde queda el borde inferior de una bolsa cuando la película se detiene. Puede ser más larga que una bolsa. |
-| Print one mark | Imprimir una marca |
-| mm after the trigger | mm después del disparo |
+| Stripes prints one mark {h} mm after the trigger. | Stripes imprime una marca {h} mm después del disparo. |
 | Print the mark | Imprimir la marca |
 | Measured from the bag's bottom edge (mm) | Medido desde el borde inferior de la bolsa (mm) |
 | Head distance: {mm} mm | Distancia del cabezal: {mm} mm |
@@ -3001,10 +3103,16 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 `i18n.ES` additions (stripes.py, §1.6): "Zebra labels and MapleJet bag printing" → "Etiquetas Zebra e
 impresión de bolsas MapleJet"; "MapleJet monitor" → "Monitor MapleJet" (architecture §10.6).
 
-## 17. Tests (test_hx_ui.py)
+## 17. Tests (test_hx_ui.py, test_hx_ui_send.py, test_hx_ui_admin.py)
 
 Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole when `tk.Tk()` raises
 `TclError`. One withdrawn `tk.Tk()` per test class, destroyed in `tearDownClass` (architecture §9.3).
+
+The tests are in three files, so the UI can be built in two parts at the same time (one owning
+`hx_ui_common`, `hx_ui_monitor` and `hx_ui`, the other `hx_ui_send` and `hx_ui_admin`): `test_hx_ui.py` covers `hx_ui_common`, `hx_ui_monitor` and `hx_ui`; `test_hx_ui_send.py`
+covers `hx_ui_send`; `test_hx_ui_admin.py` covers `hx_ui_admin`. The "File" column of §17.2 says which
+holds each test. All three use the §17.1 set-up (each file has its own copy of the helper class, so no
+file imports another test file).
 
 ### 17.1 Set-up
 
@@ -3013,7 +3121,7 @@ Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole
 2. `unittest.mock.patch.dict(os.environ, {"STRIPES_V2": world.share_root, "STRIPES_V2_ROAMING": ...,
    "STRIPES_V2_LOCAL": ..., "STRIPES_V2_MACHINE": ...})` with three temp subfolders.
 3. `services = hx_ui.make_services(root, config_path=None, bg=SyncBackground(), version="test",
-   timings=TIMINGS.scaled(0.05), identity=world.identity("EXAMPLE\\jsmith", admin=True, sender=True),
+   timings=TIMINGS.scaled(0.05), identity=world.identity("jsmith", admin=True, sender=True),
    fs=world.fs.view(), gates=GateRegistry(), key=hx_protocol.release_key())`, then
    `services.data.run_once()`.
 4. `hx_ui_common.STRICT_THREADS = True`; `tell` and `ask` patched on `hx_ui_common` (every UI module
@@ -3026,40 +3134,48 @@ Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole
 
 ### 17.2 Tests
 
-| Test | Checks |
-|---|---|
-| `test_tab_builds_and_gates_roles` | `MapleJetTab` builds for a plain user, a sender and an administrator: `send_button`/`clocks_button` mapped only for the sender, `admin_button` only for the administrator; `who_label` texts of §4.2 |
-| `test_zebra_shortcut_guard` | `stripes.App._zebra_shortcut(fake_self, event, action)` with `fake_self` holding a two-tab notebook: the action runs for a widget on the Zebra tab while it is selected; not while the MapleJet tab is selected; never for a widget inside an `HxWindow` or the `ask` dialog |
-| `test_send_flow` | Send window: tick Line 1, choose the product, the film (no film pre-selected before), the default print text is pre-filled, lot "4417", countries USA then Canada; `origin_text.get() == "Product of USA and Canada"`; `change_texts` highlight against the board's origin; `send_button` enabled and reads "Send to 1 machine"; invoke; pump until a `ResultWindow` for the send is open; its `pictures[mid].bmp` is the second running read; invoke "Everything is right"; the machine's expected state is `confirmed`; the fake's `writes` ⊆ `ALLOWED_WRITE_TAGS`, `max_in_flight == 1`, no `violations` |
-| `test_send_blocked_banners` | data from the local copy shows `local_banner`; `can_send()` False shows `blocked_banner` and disables `send_button`; Retry calls `probe_now` and `reload` |
-| `test_countdown_cancel_sends_nothing` | invoke `cancel_button` at once; pump until `page == "choose"`; "Cancelled. Nothing was sent."; the fake printer received no write |
-| `test_cancel_disappears_after_first_request` | with a scaled countdown, `cancel_button` is gone once a `STEP_CHECK_MACHINE` event arrives |
-| `test_failure_window` | `FakePrinter.web_reply_hook` corrupts the idle-slot read-back: a full-screen `FailureWindow` opens with one row at `STEP_VERIFY_IDLE`; `close()` tells "Choose Try again or Leave it." and stays; Leave it (ask → True) calls `leave_it` and the expected state has `left_by` |
-| `test_try_again_restricts_plan` | Try again opens a `SendWindow` already running a plan with only the failed machines and a new send_id |
-| `test_something_wrong_flow` | after a good Send, "Something's wrong" records the rejection, then `StopDialog(reason="rejected")` opens; Stop printing → done text with `fix_button`; Fix and send again opens a Send window prefilled with the same lot and countries |
-| `test_stop_failure_goes_red` | the fake goes silent before Stop: the dialog's `state == "failed"`, full screen, with Try again |
-| `test_resume_dialog_shows_picture` | `check_resume` results fill `pictures`/`origins`; a refused machine shows its message; only allowed machines are resumed |
-| `test_result_from_log` | after a Send, closing the result window and `nav.open_result(send_id)` refills it from the log with the pending machine; for another identity the buttons are absent and "Only {user} can confirm this Send." shows |
-| `test_line_board` | a hand-made board renders one card per line and one row per machine in order; origins in `BagText`; "(origin unknown)" for `""`; machine buttons follow `can_stop`, `can_resume`, `needs_send`, `confirm_pending_by` (same user only) and roles; BLUE rows have no buttons; with a `FakeClock` advanced 3 s, `age_label` reads 3 s more |
-| `test_floor_layout` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2 |
-| `test_floor_board` | rows in board order; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="800x600"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
-| `test_alert_sounder` | `hx_win.play_alert`/`stop_alert` patched: a board with a sound alert to `user:EXAMPLE\jsmith` plays once (a second board doesn't replay); an acknowledged board stops it; a `"floor"` alert rings only while the floor board is open; the `AlertPopup` opens for the personal alert only |
-| `test_alert_wav` | `assets/alert.wav` matches `alert_wav_bytes()` within 1 per sample; 22,050 Hz, mono, 16-bit, 66,150 frames |
-| `test_admin_save_and_conflict` | change a line's name and save: revision + 1 and "Saved Line 1." ; after another store writes a newer revision, Save shows the `RevisionConflict` text and `reload_button` |
-| `test_admin_refuses_non_admin` | `nav.open_admin()` for a sender only tells "Only Stripes Administrators can do this." |
-| `test_printer_password_once` | a new printer with password "123321": the saved token unscrambles to `make_token("123321")`; the password entry is empty after Save; neither "123321", its md5 hex nor the plain token appears in the record file or in any `hx-admin` log file; the status reads "A password is saved..." |
-| `test_film_files_and_previews` | with `filedialog.askopenfilename` patched to a generated JPEG: `save_file` and `save_preview` ran, the `FileRef` is in `working.files`, the thumbnail shows, a second front photo replaces the first ref; a PDF gets no preview |
-| `test_print_text_membership` | ticking a film in the print-text designer and saving adds the id to the film's `print_text_ids`; unticking a film's default is refused with its problem and nothing is saved |
-| `test_longest_values_preview` | for the storage.md print text (gap 4 on the lot) and the `FakeWorld` countries, `preview_lines` gives `["Packed on 10/29/26", "Product of USA, Canada, and Mexico Lot 88888888"]` for 29 Oct 2026 |
-| `test_origin_preview_matches_plan` | `origin_preview` equals `merge_plan(...).machines[0].origin_line` for a normal and a pre-printed film |
-| `test_origin_rule_ok_matches_validate_film` | for every film/print-text pair of a small world, `origin_rule_ok` is False exactly when `validate_film` reports the origin-rule problem |
-| `test_test_print_window` | estimate text for a 5-step delay range; Start (ask → True) runs the test on the fake; pump until finished; "Printing is off and slots 9 and 10 are empty..."; the fake's slots 9 and 10 are empty and printing is off |
-| `test_calibration_refuses_delay_machine` | `CalibrationWindow` for a delay machine tells "Delay machines aren't calibrated." |
-| `test_user_settings` | defaults; bad values (`"huge"`, `-1`, `"10x10"`) fall back; save then load round-trips |
-| `test_bag_text_survives_spanish` | with a prefilled Send window (trial plan built), a `ResultWindow` of a made-up result and a floor board: every `BagText.get()`, every `itemcget(text_item, "text")` and every floor `origin_items` text is recorded; `i18n.set_language("es")`, `stripes.App._retranslate(root)`, `hx_ui.language_changed(services)`: all identical, while `send_button` now reads "Enviar a 1 máquina"; back to English restores "Send to 1 machine" |
-| `test_strict_threads` | `BagText.set` from a worker thread raises `RuntimeError` |
-| `test_can_quit` | nothing running: True without asking; `mark_running` then ask → False: False |
-| `test_monitor_flag` | `poller.set_monitor_open` patched: opening the MapleJet monitor calls `(True, floor_board=False)`, the floor board `(True, floor_board=True)`, closing both `(False, floor_board=False)` |
+`test_stripes.py` is the integration package's (architecture §9.2): the two tests marked for it need
+`stripes.App` with the architecture §10.3 and §10.4 hooks and every UI module, so they run last.
+
+| Test | File | Checks |
+|---|---|---|
+| `test_tab_builds_and_gates_roles` | `test_hx_ui.py` | `MapleJetTab` builds for a plain user, a sender and an administrator: `send_button`/`clocks_button` mapped only for the sender, `admin_button` only for the administrator; `who_label` texts of §4.2 |
+| `test_zebra_shortcut_guard` | `test_stripes.py` | `stripes.App._zebra_shortcut(fake_self, event, action)` with `fake_self` holding a two-tab notebook: the action runs for a widget on the Zebra tab while it is selected; not while the MapleJet tab is selected; never for a widget inside an `HxWindow` or the `ask` dialog |
+| `test_send_flow` | `test_hx_ui_send.py` | Send window: tick Line 1, choose the product, the film (no film pre-selected before), the default print text is pre-filled, lot "4417", countries USA then Canada; `origin_text.get() == "Product of USA and Canada"`; `change_texts` highlight against the board's origin; `send_button` enabled and reads "Send to 1 machine"; invoke; pump until a `ResultWindow` for the send is open; its `pictures[mid].bmp` is the second running read; invoke "Everything is right"; the machine's expected state is `confirmed`; the fake's `writes` ⊆ `ALLOWED_WRITE_TAGS`, `max_in_flight == 1`, no `violations` |
+| `test_send_blocked_banners` | `test_hx_ui_send.py` | data from the local copy shows `local_banner`; `can_send()` False shows `blocked_banner` and disables `send_button`; Retry calls `probe_now` and `reload` |
+| `test_countdown_cancel_sends_nothing` | `test_hx_ui_send.py` | invoke `cancel_button` at once; pump until `page == "choose"`; "Cancelled. Nothing was sent."; the fake printer received no write |
+| `test_cancel_disappears_at_go` | `test_hx_ui_send.py` | with a scaled countdown, `cancel_button` is gone and `page == "working"` as soon as the whole-send `SendEvent(step=STEP_LOCK, status="ok")` is pumped, before any `STEP_CHECK_MACHINE` event |
+| `test_unticked_machine_warning` | `test_hx_ui_send.py` | Line 1 with two machines on the board, both printing "Product of USA"; untick Bagger 2 and choose countries USA and Canada: Bagger 2's warning row shows with its origin in a `BagText`, `send_button` is disabled until `two_origins_var` is ticked; with the same origin (USA) no warning shows; with Bagger 2 `off` no warning shows |
+| `test_failure_window` | `test_hx_ui_send.py` | `FakePrinter.web_reply_hook` corrupts the idle-slot read-back: a full-screen `FailureWindow` opens with one row at `STEP_VERIFY_IDLE`; `close()` tells "Choose Try again or Leave it." and stays; Leave it (ask → True) calls `leave_it` and the expected state has `left_by` |
+| `test_try_again_restricts_plan` | `test_hx_ui_send.py` | Try again opens a `SendWindow` already running a plan with only the failed machines and a new send_id; the red window is withdrawn, not destroyed, until the retry's "go" event, then destroyed; a retry that ends with `WorkFailed` during its countdown (templates changed) shows the red window again with the message; with another Send window open on its choice page, Try again asks "Replace the choices..." and reuses it (no second `SendWindow`) |
+| `test_something_wrong_flow` | `test_hx_ui_send.py` | after a good Send, "Something's wrong" records the rejection, then `StopDialog(reason="rejected")` opens; Stop printing → done text with `fix_button`; Fix and send again opens a Send window prefilled with the same lot and countries |
+| `test_stop_failure_goes_red` | `test_hx_ui_send.py` | the fake goes silent before Stop: the dialog's `state == "failed"`, full screen, with Try again |
+| `test_resume_dialog_shows_picture` | `test_hx_ui_send.py` | `check_resume` results fill `pictures`/`origins`; a refused machine shows its message; only allowed machines are resumed |
+| `test_result_from_log` | `test_hx_ui_send.py` | after a Send, closing the result window and `nav.open_result(send_id)` refills it from the log with the pending machine; for another identity the buttons are absent and "Only {user} can confirm this Send." shows |
+| `test_line_board` | `test_hx_ui.py` | a hand-made board renders one card per line and one row per machine in order; origins in `BagText`; "(origin unknown)" for `""`; machine buttons follow `can_stop`, `can_resume`, `needs_send`, `confirm_pending_by` (same user only) and roles; BLUE rows have no buttons; with a `FakeClock` advanced 3 s, `age_label` reads 3 s more |
+| `test_floor_layout` | `test_hx_ui.py` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2 |
+| `test_floor_board` | `test_hx_ui.py` | rows in board order; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="800x600"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
+| `test_alert_sounder` | `test_hx_ui.py` | `hx_win.play_alert`/`stop_alert` patched: a board with a sound alert to `user:EXAMPLE\jsmith` plays once (a second board doesn't replay); an acknowledged board stops it; a `"floor"` alert rings only while the floor board is open; the `AlertPopup` opens for the personal alert only |
+| `test_alert_wav` | `test_hx_ui.py` | `assets/alert.wav` matches `alert_wav_bytes()` within 1 per sample; 22,050 Hz, mono, 16-bit, 66,150 frames |
+| `test_admin_save_and_conflict` | `test_hx_ui_admin.py` | change a line's name and save: revision + 1 and "Saved Line 1." ; after another store writes a newer revision, Save shows the `RevisionConflict` text and `reload_button` |
+| `test_admin_refuses_non_admin` | `test_hx_ui_admin.py` | `nav.open_admin()` for a sender only tells "Only Stripes Administrators can do this." |
+| `test_printer_password_once` | `test_hx_ui_admin.py` | a new printer with password "123321": the saved token unscrambles to `make_token("123321")`; the password entry is empty after Save; neither "123321", its md5 hex nor the plain token appears in the record file or in any `hx-admin` log file; the status reads "A password is saved..." |
+| `test_film_files_and_previews` | `test_hx_ui_admin.py` | with `filedialog.askopenfilename` patched to a generated JPEG: `save_file` and `save_preview` ran, the `FileRef` is in `working.files`, the thumbnail shows, a second front photo replaces the first ref; a PDF gets no preview |
+| `test_print_text_membership` | `test_hx_ui_admin.py` | ticking a film in the print-text designer and saving adds the id to the film's `print_text_ids`; unticking a film's default is refused with its problem and nothing is saved |
+| `test_longest_values_preview` | `test_hx_ui_admin.py` | for the storage.md print text (gap 4 on the lot) and the `FakeWorld` countries, `preview_lines` gives `["Packed on 10/29/26", "Product of USA, Canada, and Mexico Lot 88888888"]` for 29 Oct 2026 |
+| `test_origin_preview_matches_plan` | `test_hx_ui_send.py` | `origin_preview` equals `merge_plan(...).machines[0].origin_line` for a normal and a pre-printed film |
+| `test_origin_rule_ok_matches_validate_film` | `test_hx_ui_admin.py` | for every film/print-text pair of a small world, `origin_rule_ok` is False exactly when `validate_film` reports the origin-rule problem |
+| `test_test_print_window` | `test_hx_ui_admin.py` | estimate text for a 5-step delay range; Start (ask → True) runs the test on the fake; pump until finished; "Printing is off and slots 9 and 10 are empty..."; the fake's slots 9 and 10 are empty and printing is off |
+| `test_calibration_refuses_delay_machine` | `test_hx_ui_admin.py` | `CalibrationWindow` for a delay machine tells "Delay machines aren't calibrated." |
+| `test_calibration_window` | `test_hx_ui_admin.py` | an encoder world (`{"placement": "encoder"}`), film length 610: the print buttons are disabled until "Save rough distance" (400) has been saved and a `DataUpdate` shows it; `spacing_text` names 365 and 55 and `head_text` 515 (from the plans); printing the head mark on the fake records `printed[-1]["position_mm"] == 515`, and with 317 typed, `head_result` reads 412 mm, with `head_distance_from_print` (patched to record its arguments) called with `sent` equal to that DLYMM; marks A 167 and B 467.5 give "Gap: 300.5 mm." and the within-tolerance text; Save writes the `Calibration` and the machine's `head_distance_mm` becomes 412 |
+| `test_test_print_not_stopped` | `test_hx_ui_admin.py` | a `TestFinished` with `printing_off` False turns the test window into the red "Stop it at the printer now" page; its Try again calls `end_again` for an administrator who isn't a sender |
+| `test_action_ids` | `test_hx_ui_send.py` | each of the three dialogs starts its thread as `hx-action-<action_id>` with the id it passed to `PrinterActions`, and ignores an `ActionEvent` with another id |
+| `test_offline_send_recorded` | `test_hx_ui.py` | a Send with the share down (`no_lock`): `nav.offline_sends` holds its id; after `ShareHealth(ok=True)` `record_offline` runs once (patched pipeline) and the id is dropped |
+| `test_user_settings` | `test_hx_ui.py` | defaults; bad values (`"huge"`, `-1`, `"10x10"`) fall back; save then load round-trips |
+| `test_bag_text_survives_spanish` | `test_stripes.py` | with a prefilled Send window (trial plan built), a `ResultWindow` of a made-up result and a floor board: every `BagText.get()`, every `itemcget(text_item, "text")` and every floor `origin_items` text is recorded; `i18n.set_language("es")`, `stripes.App._retranslate(root)`, `hx_ui.language_changed(services)`: all identical, while `send_button` now reads "Enviar a 1 máquina"; back to English restores "Send to 1 machine" |
+| `test_strict_threads` | `test_hx_ui.py` | `BagText.set` from a worker thread raises `RuntimeError` |
+| `test_can_quit` | `test_hx_ui.py` | nothing running: True without asking; `mark_running` then ask → False: False |
+| `test_monitor_flag` | `test_hx_ui.py` | `poller.set_monitor_open` patched: opening the MapleJet monitor calls `(True, floor_board=False)`, the floor board `(True, floor_board=True)`, closing both `(False, floor_board=False)` |
 
 `test_i18n.py` changes as architecture §9.2 says; every text of §16 then needs its Spanish.
 
@@ -3067,7 +3183,7 @@ Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole
 
 | Item | Interface here | Safe default built now |
 |---|---|---|
-| Encoder calibration procedure (plan; architecture §11) | `CalibrationWindow`, `TestRanges` for kinds `spacing` and `head_distance`, `head_sent_var` | As §13: two marks 300 mm apart and one mark 100 mm after the trigger; the head distance from `head_distance_from_print`; an encoder machine without a head distance can't be sent to. send.md §16 decides how `kind="head_distance"` treats `start` |
+| Encoder calibration procedure (plan; architecture §11) | `CalibrationWindow`, `plan_test(kind="spacing" / "head_distance")` | As §13, following send.md §16: the rough distance saved first, two marks 300 mm apart measured from the bag's edge (A and B), one mark at the position send.md chooses, the head distance from `head_distance_from_print` with the DLYMM actually sent; an encoder machine without a head distance can't be sent to |
 | Which counter counts bags | Company page radio (`bag_counter`); test-print estimate text | `PMCNT`; "none" shows timed steps (`seconds_per_bag × bags_per_step`) |
 | Print speed units and range | Machines page "Print speed (cm/min)" | cm/min, 1–2500, no default (empty blocks sending) |
 | Beacon | none | no UI at all (`BEACON_SUPPORTED = False`) |
@@ -3124,7 +3240,8 @@ Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole
 21. **Long runs use `start_thread`** and report crashes as `WorkFailed`; `STRICT_THREADS` makes off-thread
     widget updates fail in tests.
 22. **`TestPrintWindow` only runs `kind="test"`**; calibration has its own window sharing
-    `TestRunPanel`; the head-distance mark defaults to 100 mm after the trigger.
+    `TestRunPanel`, saves the rough distance before either print, and shows the positions send.md's
+    plans will send (the admin never types a print position for calibration).
 23. **The Zebra tab is selected at start**, and the header subtitle becomes "Zebra labels and MapleJet
     bag printing".
 24. **Numbers accept a decimal comma.**
@@ -3143,3 +3260,15 @@ Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole
 33. **Line cards use two columns from 1100 px**, in the fixed board order.
 34. **`hx_ui_common.tell`/`ask` are called through the module** everywhere, so one patch covers every
     screen in tests; the `ask` dialog is also marked `hx_window` so the Zebra shortcuts ignore it.
+35. **Unticked machines that still print another origin** must be acknowledged with "I know this line
+    will print two origins" before the Send button works, and the log records them.
+36. **The red window stays (withdrawn) until a Try again is past its countdown**, and comes back if the
+    retry fails before its first printer request, so a red line is never left without it.
+37. **Try again goes through the one Send window** (`run_send` via the Navigator).
+38. **Cancel disappears at the pipeline's "go"** (`SendEvent(STEP_LOCK, "ok")`), the moment the pipeline
+    starts ignoring it.
+39. **The UI makes each action's id** and names the thread after it.
+40. **Sends made without the share** are remembered by the Navigator for the session and recorded when
+    the share returns (send.md §14.1), together with any answer the sender gave meanwhile.
+41. **A test whose end couldn't confirm printing off** gets the full-screen "Stop it at the printer now"
+    page with a Try again the administrator can use (`end_again`).
