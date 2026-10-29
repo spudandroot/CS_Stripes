@@ -54,7 +54,7 @@ Spec index:
 | states.md | The per-machine state machine (codes, colours, transitions, second readings); the poller cycle (what is read when, request budget, backoff, daily checks, standalone mode, when the automatic clock set fires); line aggregation; alerts (kinds, recipients, sound); acknowledgements; the status watcher; floor-board content and order | `hx_state`, `hx_poller` |
 | send.md | The Send pipeline step by step; plan merge and validation; message build (items, placement, date codes, print settings); message names and content codes; compare and fingerprint; print position and delay; failure flows (red window data, Try again, Leave it, PC crash); Stop, Resume and Set clocks; test print and calibration; time (SNTP, the TD command, midnight rollover, daylight-saving detection); origin-wording rules; send-log and event-log contents | `hx_message`, `hx_time`, `hx_send` |
 | ui.md | The Zebra and MapleJet tabs; every MapleJet screen (Send, result and confirm, red window, Stop/Resume/Set clocks, monitor, floor board, admin screens, film editor, print-text designer, test print and calibration windows); per-user settings; i18n texts and their Spanish; bag-text widgets; shortcuts; the alert sound | `hx_ui`, `hx_ui_common`, `hx_ui_send`, `hx_ui_monitor`, `hx_ui_admin` |
-| deploy.md | Build and release: the single-file `Stripes.exe` by PyInstaller (no MSI), `pyinstaller.spec`, `make_version.py` and the scrambling-key injection (`hx_key.py`), CI (tests on Windows and under xvfb on Linux, build, self-check, signing, release), self-check additions, the folder-script spec (v2 folders, permissions, one-time Zebra copy), README updates | `pyinstaller.spec`, `make_version.py`, `.github/workflows/build.yml`, `build.bat`, `.gitignore`, README, the folder script |
+| deploy.md | Build and release: `pyinstaller.spec`, `make_version.py` and the scrambling-key injection (`hx_key.py`), CI (tests on `windows-latest`; Linux under xvfb is the developers' run), build, self-check, signing, release, the single-file `Stripes.exe` (no MSI); the self-check list; the three `stripes.py` key hooks (§10.6 item 5); the folder-script spec (v2 folders, permissions, one-time Zebra copy); the test-PC instructions; README updates | `pyinstaller.spec`, `make_version.py`, `test_make_version.py`, `test_deploy.py`, `.github/workflows/build.yml`, `build.bat`, `.gitignore`, `README.md`, the generated `hx_key.py`; delivered after development: `tools/New-StripesV2Folders.ps1`, `test_folder_script.py`, `docs/maplejet/test-pc.md` |
 
 ## 2. Glossary
 
@@ -103,14 +103,14 @@ outside the UI modules (see §5.2).
 | 6 | `hx_ui_monitor` | Line board cards, MapleJet monitor window, floor board, `AlertSounder` | ui.md | layers 0–5 |
 | 6 | `hx_ui_admin` | Admin window and pages, film editor, print-text designer, test print and calibration windows | ui.md | layers 0–5 |
 | 7 | `hx_ui` | `HxServices`, `make_services`/`start_services`/`stop_services`, `MapleJetTab`, `Navigator`, startup, `self_check` | ui.md | layers 0–6 |
-| 8 | `stripes.py` | Hosts both tabs; the hooks in §10 | architecture.md §10 | `hx_ui`, `hx_share` (paths only) |
+| 8 | `stripes.py` | Hosts both tabs; the hooks in §10 | architecture.md §10 (deploy.md §1.3 for the key hooks) | `hx_ui`, `hx_share` (paths only), `hx_key` (only to set `HX_KEYED`, §10.6 item 5) |
 | test | `hx_fake` | `FakePrinter`, `FakeSntp`, `FakeWorld`; also runnable as a script for manual UI work | protocol.md | layers 0–3, `http.server`, `PIL` |
 | build | `hx_key` | Generated at build time, git-ignored: `KEY = b"..."`. Absent in source checkouts | deploy.md | nothing |
 
 Rules:
 
 1. A module imports only from lower layers. Same-layer imports are only those listed (`hx_state` uses
-   `hx_message.fingerprint` and `parse_message_name`). The three layer-6 UI modules never import each
+   `hx_message.fingerprint`, `parse_message_name` and `NOTE_TEXTS`). The three layer-6 UI modules never import each
    other; they reach each other's screens through `HxServices.nav` (§6.10).
 2. No module below layer 5 imports `tkinter` or `PIL`. No module imports `stripes`.
 3. Application code never imports `hx_fake`. It is test-only and isn't bundled (nothing imports it).
@@ -761,8 +761,11 @@ class MessageName:
 
 The dataclasses below are the contents of the status files. storage.md owns the file names, the
 envelope and how they are written; states.md owns what the poller puts in `PollStatus`,
-`MachineSnapshot` and `Alert`, and may add optional fields to those three; send.md owns what senders
-put in `ExpectedState` and `LineStatus` and may add optional fields to those two.
+`MachineSnapshot` and `Alert`; send.md owns what senders put in `ExpectedState` and `LineStatus`.
+The optional fields those two files added (states.md §11.2, send.md §1.4) are written into the blocks
+below, marked with their owner, so the `hx_model` builder takes every field from this section alone.
+`from_json` ignores unknown keys, so a field missing here would be silently dropped on every read: a
+spec file that adds a field must add it here too.
 
 ```python
 @dataclass(kw_only=True)
@@ -823,6 +826,13 @@ class Alert:
     started_at: float
     recipients: list[str] = []   # "user:<DOMAIN\\name>", "floor", "admins", "monitor"
     active: bool = True
+    # added by states.md §11.2:
+    colour: str = ""             # RED, AMBER or "" (doesn't colour the machine)
+    ref: str = ""                # the send_id or run_id the alert belongs to; "" for time-based ids
+    acked_by: str = ""
+    acked_at: float | None = None
+    ended_at: float | None = None
+    waiting: list[str] = []      # recipients with no live heartbeat yet (states.md §4.6)
 
 @dataclass(kw_only=True)
 class Ack:                       # status\alerts\<alert_id>.json, written once
@@ -856,6 +866,15 @@ class PollStatus:                # status\machines\<machine_id>.poll.json; one w
     state: MachineSnapshot | None = None
     alerts: list[Alert] = []
     foreign_client: bool = False # "Something else is talking to printer X"
+    # added by states.md §11.2:
+    problem: str = ""            # "" | "wrong_printer" | "login_failed"
+    expected_counter: int = 0    # ExpectedState.counter at the last judgement (0: there was no E)
+    reread_seen: str = ""        # the last ExpectedState.reread_token acted on
+    unreachable_since: float | None = None   # wall time reachable last became False; None while reachable
+    running_ok_at: float | None = None       # wall time of the last successful running-message Load (display)
+    running_unchecked: bool = False          # committed fact: the running message can't be read (states.md §6.5)
+    dst: dict = {}               # the daylight-saving clock set of the current change (states.md §6.11)
+    standalone: bool = False     # True only in Poller.local_statuses() in standalone mode
 
 @dataclass(kw_only=True)
 class FailureInfo:
@@ -893,7 +912,13 @@ class ExpectedState:             # status\machines\<machine_id>.expected.json; w
     left_by: str = ""            # "Leave it"
     left_at: float | None = None
     reread_token: str = ""       # a new value asks the poller to load the running message now
-    test: dict | None = None     # {"run_id": ..., "by": ..., "step": 12, "of": 40}
+    test: dict | None = None     # {"run_id": ..., "kind": ..., "by": ..., "step": 12, "of": 40}
+    # added by send.md §1.4:
+    sender: str = ""             # who made the Send (or test) this state belongs to; written_by is only
+                                 # the last writer (a confirm, Leave it or clock set doesn't change it)
+    stop_reason: str = ""        # "user" | "rejected" | "test"; "" while not stopped
+    stopped_by: str = ""
+    stopped_at: float | None = None
 
 @dataclass(kw_only=True)
 class LineStatus:                # status\lines\<line_id>.json; informational: the line's last Send
@@ -915,6 +940,8 @@ class LineStatus:                # status\lines\<line_id>.json; informational: t
     confirmed: bool = False
     confirmed_by: str = ""
     stopped_needs_send: bool = False
+    # added by send.md §1.4:
+    sender: str = ""             # who made the Send this file describes
 ```
 
 ### 5.9 Results and events
