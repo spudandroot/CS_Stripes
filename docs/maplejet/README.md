@@ -77,9 +77,10 @@ The whole suite should stay under about two minutes: no test sleeps more than 0.
 threaded tests use `TIMINGS.scaled(...)` and logic tests use `FakeClock` (architecture §9). Windows-only
 share tests (`test_hx_share_windows.py`) skip elsewhere.
 
-## Owner sign-off needed
+## Owner sign-offs
 
-These are built as described, the safe way, but differ from the plan's wording or accept a risk:
+The owner accepted all four on 30 Oct 2026. They are built as described, the safe way, but differ
+from the plan's wording or accept a risk:
 
 1. The font list and firmware version are read with two small web GETs (`/sfl.xml`, `/idn.xml`),
    besides the message Load the plan calls "the only web request" (architecture §6.4, §12.1).
