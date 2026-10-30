@@ -952,6 +952,57 @@ class RetranslateTests(TkCase):
         self.assertEqual(plain.cget("text"), "Simple")
 
 
+class BackgroundTests(TkCase):
+    """The Zebra side, every MapleJet window and the tray (App.call) share one Background
+    (architecture §10.1 item 2), so one failing done() mustn't stop the others' results (§8 rule 1)."""
+
+    def test_a_failing_callback_doesnt_stop_the_rest(self):
+        bg = zl.Background(self.root)
+        self.addCleanup(cancel_timers, self.root)
+        cancel_timers(self.root)            # the test runs the first round itself
+        got = []
+
+        def broken(result, error):
+            # e.g. a MapleJet window's done() touching a widget destroyed meanwhile
+            raise tk.TclError('invalid command name ".!sendwindow.!label"')
+
+        bg.results.put((broken, 1, None))
+        bg.results.put((lambda result, error: got.append(result), "printer ready", None))
+        zl.App.call(types.SimpleNamespace(bg=bg), lambda: got.append("Quit Stripes"))   # a tray menu item
+        with mock.patch("traceback.print_exc") as print_exc:
+            bg._poll()
+        self.assertEqual(got, ["printer ready", "Quit Stripes"])
+        print_exc.assert_called_once_with()                 # printed, not swallowed
+        self.assertEqual(len(self.root.tk.splitlist(self.root.tk.call("after", "info"))), 1)   # polls on
+        # And through the real loop: a worker's result after the failure still arrives
+        def pump_until(ready):
+            deadline = time.monotonic() + 5.0
+            while not ready() and time.monotonic() < deadline:
+                self.root.update()
+                time.sleep(0.01)
+
+        with mock.patch("traceback.print_exc") as print_exc:
+            bg.run(lambda: 1, broken)
+            pump_until(lambda: print_exc.called)
+            bg.run(lambda: "config loaded", lambda result, error: got.append(result))
+            pump_until(lambda: len(got) > 2)
+        print_exc.assert_called_once_with()
+        self.assertEqual(got[2:], ["config loaded"])
+
+    def test_polls_on_whatever_a_callback_raises(self):
+        bg = zl.Background(self.root)
+        self.addCleanup(cancel_timers, self.root)
+        cancel_timers(self.root)
+
+        def interrupted(result, error):
+            raise KeyboardInterrupt
+
+        bg.results.put((interrupted, None, None))
+        with self.assertRaises(KeyboardInterrupt):
+            bg._poll()
+        self.assertEqual(len(self.root.tk.splitlist(self.root.tk.call("after", "info"))), 1)
+
+
 # ui.md §17.1's scaled timings, with printer and share timeouts that leave room for a busy machine
 SCALED = replace(TIMINGS.scaled(0.05), http_timeout_s=0.5, web_repeat_window_s=0.5, share_timeout_s=1.0,
                  lock_stale_s=30.0)
@@ -1056,10 +1107,10 @@ class BagTextTests(TkCase):
 
 class FakeTray:
     def __init__(self, app):
-        self.app, self.stopped = app, 0
+        self.app, self.stopped, self.notes = app, 0, []
 
     def notify(self, text):
-        pass
+        self.notes.append(text)
 
     def stop(self):
         self.stopped += 1
@@ -1094,6 +1145,7 @@ class AppTests(unittest.TestCase):
                                                                       port=closed_port()))],
                                        "last_printer": "Packing"})
         self.events, self.made, self.bound = [], [], {}
+        self.config = None                  # no ConfigPath on this PC, unless a test sets one
         real_bind_all = tk.Misc.bind_all
 
         def bind_all(widget, *args, **kw):
@@ -1101,7 +1153,8 @@ class AppTests(unittest.TestCase):
             return real_bind_all(widget, *args, **kw)
 
         def start_services(root, *, config_path, bg, version):
-            self.events.append(("start_services", hasattr(root, "top_tabs"), bg is getattr(root, "bg", None)))
+            self.events.append(("start_services", hasattr(root, "top_tabs"), bg is getattr(root, "bg", None),
+                                config_path))
             services = hx_ui.make_services(root, config_path=config_path, bg=bg, version=version, clock=FakeClock(),
                                            identity=Identity(user="EXAMPLE\\jsmith", computer="FLOOR01",
                                                              sids=frozenset(), pid=os.getpid()),
@@ -1114,7 +1167,7 @@ class AppTests(unittest.TestCase):
 
         for target, name, value in ((zl.App, "bind_all", bind_all), (hx_ui, "start_services", start_services),
                                     (hx_ui, "startup", startup), (zl, "Tray", FakeTray),
-                                    (zl, "configured_folder", lambda: None), (zl, "local_folders", lambda: []),
+                                    (zl, "configured_folder", lambda: self.config), (zl, "local_folders", lambda: []),
                                     (zl, "VERSION", "dev"), (zl, "HX_KEYED", False),
                                     (zl.App, "_first_run", mock.Mock()), (hx_win, "stop_alert", mock.Mock())):
             patcher = mock.patch.object(target, name, value)
@@ -1130,6 +1183,25 @@ class AppTests(unittest.TestCase):
             cancel_timers(self.app)
             self.app.destroy()
 
+    def with_config_folder(self):
+        """The window again, on a PC whose ConfigPath points at a copy of the example config.
+        Returns the share's Stripes folder (the config folder's parent)."""
+        share = os.path.join(self.tmp, "Share", "Stripes")
+        shutil.copytree(EXAMPLE_CONFIG, os.path.join(share, "config"))
+        self.close_app()
+        self.config, self.events, self.made = os.path.join(share, "config"), [], []
+        self.app = zl.App(start_hidden=True)
+        self.app.update_idletasks()
+        return share
+
+    def pump_until(self, ready):
+        """Let Background deliver its workers' results (bounded; each wait is short)."""
+        deadline = time.monotonic() + 5.0
+        while not ready() and time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        return ready()
+
     def header_texts(self):
         return [w.cget("text") for w in descendants(self.app)
                 if isinstance(w, ttk.Label) and not inside(w, self.app.top_tabs)]
@@ -1137,13 +1209,83 @@ class AppTests(unittest.TestCase):
     def test_start_up_order(self):
         app = self.app
         # The services before the window is built (with its Background), the floor board last
-        self.assertEqual(self.events, [("start_services", False, True), ("startup", True, app.hx)])
+        self.assertEqual(self.events, [("start_services", False, True, None), ("startup", True, app.hx)])
         self.assertIs(app.hx, self.made[0])
         self.assertIsNone(app.config_folder)
         # The older version's settings were brought along before they were read
         self.assertEqual(app.printer_var.get(), "Packing")
         with open(self.old_settings, "rb") as old, open(zl.settings_path(), "rb") as new:
             self.assertEqual(new.read(), old.read())
+
+    def test_both_sides_get_the_config_folder(self):
+        # architecture §10.1 item 2: the MapleJet services get the ConfigPath and find v2 next to it,
+        # and the Zebra printers are read from the same folder, in the background
+        share = self.with_config_folder()
+        app = self.app
+        self.assertEqual(self.events[0], ("start_services", False, True, self.config))
+        self.assertEqual((app.config_folder, app.hx.paths.share_root), (self.config, os.path.join(share, "v2")))
+        self.assertTrue(self.pump_until(lambda: app.cfg.printers))
+        self.assertEqual(app.cfg.source, self.config)
+
+    def test_deployment_status_lists_both_folders(self):
+        # architecture §10.5 item 4: the rollout view reads this version's folder and the older versions' one
+        share = self.with_config_folder()
+        app = self.app
+        new, old = os.path.join(share, "v2", "status", "deployment"), os.path.join(share, "status")
+        for folder, computer, user, version, seen in ((new, "FLOOR01", "jsmith", "v2.0.0", "2026-10-30 07:00:00"),
+                                                      (old, "FLOOR02", "akim", "v1.4.0", "2026-10-29 09:00:00")):
+            write_json(os.path.join(folder, f"{computer}_{user}.json"),
+                       {"computer": computer, "user": user, "version": version, "last_seen": seen})
+        shown = []
+
+        def wait_window(widget, window=None):
+            if isinstance(window, zl.DeploymentWindow):
+                self.pump_until(lambda: len(window.tree.get_children()) == 2)
+                rows = [window.tree.set(row, "computer") for row in window.tree.get_children()]
+                shown.append((window.folders, rows))
+                window.destroy()
+
+        def no_grab(widget):
+            pass                            # nothing to grab in a test, and nothing waits
+
+        with mock.patch.object(zl.PrinterDialog, "wait_window", wait_window), \
+                mock.patch.object(zl.PrinterDialog, "grab_set", no_grab), \
+                mock.patch.object(zl.DeploymentWindow, "grab_set", no_grab):
+            dialog = zl.PrinterDialog(app)
+            buttons = [w for w in descendants(dialog)
+                       if isinstance(w, ttk.Button) and w.cget("text") == "Deployment status..."]
+            self.assertEqual(len(buttons), 1)
+            buttons[0].invoke()
+        dialog.destroy()
+        self.assertEqual(shown, [([new, old], ["FLOOR01", "FLOOR02"])])
+
+    def test_hiding_to_the_tray_leaves_the_maplejet_side_running(self):
+        # ui.md §3.4: hiding to the tray stops no Send, poll or alert sound, and the MapleJet
+        # monitor (a window of its own) stays open
+        app, hx = self.app, self.app.hx
+        app.tray = FakeTray(app)
+        hx.nav.sounder = mock.Mock()        # as start_services leaves it
+        app.deiconify()
+        app.show_hx_monitor()
+        monitor = hx.nav.window("monitor")
+        hx_win.stop_alert.reset_mock()
+        with mock.patch.object(hx_ui, "stop_services") as stop_services, \
+                mock.patch.object(hx_ui, "can_quit") as can_quit, \
+                mock.patch.object(hx.poller, "stop") as poller_stop, \
+                mock.patch.object(hx.watcher, "stop") as watcher_stop, \
+                mock.patch.object(hx.data, "stop") as data_stop:
+            app.hide_to_tray()
+            app.update_idletasks()
+            self.assertEqual(app.wm_state(), "withdrawn")
+            app.deiconify()
+            app.hide_to_tray()
+        for stopped in (stop_services, can_quit, poller_stop, watcher_stop, data_stop, hx.nav.sounder.stop,
+                        hx_win.stop_alert):
+            stopped.assert_not_called()
+        self.assertIs(hx.nav.window("monitor"), monitor)
+        self.assertEqual(monitor.wm_state(), "normal")
+        self.assertEqual(len(app.tray.notes), 1)        # the hint, the first time only
+        self.assertTrue(zl.load_settings()["tray_hint_shown"])
 
     def test_two_tabs(self):
         app, tabs = self.app, self.app.top_tabs
@@ -1271,10 +1413,22 @@ class AppTests(unittest.TestCase):
 
 class SelfCheckOrderTests(unittest.TestCase):
     """deploy.md §1.3 item 3: the key first, before Tk starts; the MapleJet checks last, inside the try."""
+    _gc_was_enabled = True
 
     @classmethod
     def setUpClass(cls):
         tk_or_skip().destroy()
+        cls._gc_was_enabled = gc.isenabled()
+        gc.disable()                    # the self-check's Tk root is collected here, on the Tk thread
+
+    @classmethod
+    def tearDownClass(cls):
+        gc.collect()
+        if cls._gc_was_enabled:
+            gc.enable()
+
+    def setUp(self):
+        self.addCleanup(gc.collect)
 
     def test_key_first_maplejet_last(self):
         order = []

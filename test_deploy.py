@@ -7,6 +7,7 @@ themselves when Tk can't start.
 """
 
 import ast
+import gc
 import os
 import shutil
 import subprocess
@@ -92,31 +93,60 @@ class RepoTests(unittest.TestCase):
         self.assertEqual([n for n in excludes if n.startswith("hx_")], ["hx_fake"])
 
 
+def run_without_excluded(folder):
+    """Import every app module of a folder with the exe's exclusions blocked, in a subprocess. All of
+    them, not just stripes and hx_ui: hx_ui only imports the Send and admin screens when they open
+    (ui.md §15.3), and the exe has to run those too (deploy.md §12 decision 21)."""
+    modules = [name[:-3] for name in app_sources()]
+    code = "\n".join((
+        "import importlib, sys",
+        f"sys.path.insert(0, {folder!r})",
+        f"for name in {BLOCKED!r}:",
+        "    sys.modules[name] = None",
+        "import hashlib",
+        f"for name in {modules!r}:",
+        "    importlib.import_module(name)",
+        "import hx_protocol",
+        "assert hashlib.md5(b'123321').hexdigest() == 'c8837b23ff8aaa8a2dde915473ce0991'",
+        "key = hx_protocol.release_key()",
+        "token = hx_protocol.make_token('123321')",
+        "assert hx_protocol.unscramble(hx_protocol.scramble(token, key), key) == token",
+        "print('ok')",
+    ))
+    return subprocess.run([sys.executable, "-c", code], cwd=folder, capture_output=True, text=True, timeout=60)
+
+
 class BundleTests(unittest.TestCase):
     def test_app_runs_without_excluded_modules(self):
         # The exe's exclusions, simulated: a dependency on any of them fails here, on every platform,
         # before PyInstaller runs (deploy.md §2.2)
-        code = "\n".join((
-            "import sys",
-            f"sys.path.insert(0, {HERE!r})",
-            f"for name in {BLOCKED!r}:",
-            "    sys.modules[name] = None",
-            "import hashlib",
-            "import stripes, hx_ui, hx_protocol",
-            "assert hashlib.md5(b'123321').hexdigest() == 'c8837b23ff8aaa8a2dde915473ce0991'",
-            "key = hx_protocol.release_key()",
-            "token = hx_protocol.make_token('123321')",
-            "assert hx_protocol.unscramble(hx_protocol.scramble(token, key), key) == token",
-            "print('ok')",
-        ))
-        done = subprocess.run([sys.executable, "-c", code], cwd=HERE, capture_output=True, text=True, timeout=60)
+        names = app_sources()
+        for name in ("stripes.py", "hx_ui.py", "hx_ui_send.py", "hx_ui_admin.py", "hx_ui_monitor.py"):
+            self.assertIn(name, names)
+        done = run_without_excluded(HERE)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.strip(), "ok", done.stderr)
 
+    def test_a_screen_opened_later_is_checked_too(self):
+        # A copy of the app whose admin screen (imported only when it opens) needs multiprocessing
+        tmp = tempfile.mkdtemp(prefix="stripes_bundle_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name in app_sources():
+            shutil.copy(os.path.join(HERE, name), tmp)
+        with open(os.path.join(tmp, "hx_ui_admin.py"), "a", encoding="utf-8") as f:
+            f.write("\nimport multiprocessing\n")
+        done = run_without_excluded(tmp)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("multiprocessing", done.stderr)
+
 
 class SelfCheckTests(unittest.TestCase):
-    """The exe's --self-check, run from source (non-frozen; its Windows rows run on Windows CI)."""
+    """The exe's --self-check, run from source (non-frozen; its Windows rows run on Windows CI).
+
+    The self-check leaves Tk objects in garbage cycles (its own root among them). They're collected
+    here, on the Tk thread: freed later by a worker thread of another test, Tcl aborts the process."""
     root = None
+    _gc_was_enabled = True
 
     @classmethod
     def setUpClass(cls):
@@ -125,12 +155,19 @@ class SelfCheckTests(unittest.TestCase):
         except tk.TclError as e:
             raise unittest.SkipTest(f"Tk can't start: {e}")
         cls.root.withdraw()
+        cls._gc_was_enabled = gc.isenabled()
+        gc.disable()
 
     @classmethod
     def tearDownClass(cls):
+        gc.collect()
         cls.root.destroy()
+        gc.collect()
+        if cls._gc_was_enabled:
+            gc.enable()
 
     def setUp(self):
+        self.addCleanup(gc.collect)     # registered first, so it runs after every other cleanup
         self.tmp = tempfile.mkdtemp(prefix="stripes_deploy_")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.out = os.path.join(self.tmp, "self-check.txt")

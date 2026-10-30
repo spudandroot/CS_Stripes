@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import queue
 import urllib.request
 from dataclasses import dataclass, asdict, field, fields, replace
@@ -1045,13 +1046,20 @@ class Background:
         threading.Thread(target=target, daemon=True).start()
 
     def _poll(self):
+        # The Zebra side, every MapleJet window and the tray all hand results back through here,
+        # so a bug in one done() is printed and the rest still get theirs.
         try:
             while True:
-                done, result, error = self.results.get_nowait()
-                done(result, error)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll)
+                try:
+                    done, result, error = self.results.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    done(result, error)
+                except Exception:
+                    traceback.print_exc()
+        finally:
+            self.root.after(100, self._poll)
 
 
 TRAY_FLAG = "--tray"  # start hidden in the tray (the logon shortcut uses this)
