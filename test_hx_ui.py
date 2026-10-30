@@ -1167,11 +1167,12 @@ class NavigatorTests(UiCase):
         # Meanwhile the result window's confirm hit a ShareError and hands the answer over
         nav.note_offline_answer("sd_x", ["mc_1"], False)
         self.assertEqual(fake.record_offline.call_count, 1)        # one run at a time
-        services.bg.finish()
+        done, result, error = services.bg.pending.pop(0)
+        done(result, error)
         # The first run had no answer: the Send stays and runs again for its answer
         fake.confirm.assert_called_once_with("sd_x", ["mc_1"], False)
         self.assertEqual(fake.record_offline.call_count, 2)
-        self.assertEqual(nav.offline_sends, ["sd_x"])
+        self.assertEqual((nav.offline_sends, nav.offline_answers), (["sd_x"], {"sd_x": (["mc_1"], False)}))
         services.bg.finish()
         self.assertEqual((nav.offline_sends, nav.offline_answers), ([], {}))
         self.assertEqual(fake.confirm.call_count, 1)
