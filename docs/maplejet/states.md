@@ -189,8 +189,9 @@ def matches_expected(running: RunningMessage | None, *, name: str, slot: int | N
 2. During `switch_pending`, "the new message" is the same call, and "the old message" is
    `matches_expected(R, name=E.previous_message_name, slot=None, fingerprint=E.previous_fingerprint)`.
 3. R is `reading.running` when the cycle loaded it, else `prev.running`. The poller sets
-   `reading.running_reset` when R may no longer describe the printer (after a lock, after E changed)
-   and the Load failed, so a stale R is never used (§6.4).
+   `reading.running_reset` when R may no longer describe the printer (after a lock, after E changed,
+   after a worker start, after the printer was unreachable) and the Load failed, so a stale R is never
+   used (§6.4).
 4. Drift is decided only from web Loads, which carry their own request numbers. A MSGNAM that differs
    from the expected name only makes the poller load the running message at once (§6.5): `judge` sets
    `Judgement.read_running_now` when `reading.message_name` was read, the cycle made no Load, R is
@@ -217,7 +218,7 @@ trusted and `F.printing is False`, "carried" = §3.7.
 | C5 | E.mode `stop_requested_at_printer`: `on` gives `stop_failed`; not trusted, or `F.printing is None`, gives `stop_requested`; `off_read` gives nothing here | `stop_failed` / `stop_requested` | `stop_failed` |
 | C6 | `E.failure` is set | `left_red` if `E.left_by`, else `failed_after_switch` or `failed_before_switch` by `E.failure.after_switch` | `send_failed`, ref = E.send_id |
 | C7 | E.rejected and E.mode `running` and no E.failure | `rejected` | `send_rejected`, ref = E.send_id |
-| C7b | E.rejected (any mode) | none | `send_rejected`, ref = E.send_id (the same need as C7; one alert) |
+| C7b | E.rejected and no E.failure (any mode) | none | `send_rejected`, ref = E.send_id (the same need as C7; one alert) |
 | C8 | `on` and E.mode in (`stopped_by_user`, `test_finished`). Carried while not trusted | `printing_on_unexpected` | `printing_on` |
 | C9 | not `F.reachable`, and (prev's `went_silent` alert is active, or (`prev.reachable` and `was_printing(prev, data.company)`)), and that alert isn't acknowledged | `unreachable_printing` | `went_silent` |
 | C10 | `off_read` and E.mode `running` and not E.rejected and not (`E.failure` and `E.failure.after_switch`), and (prev's `printing_off` alert is active, or (`prev.reachable` and `prev.printing is True` and `prev.problem == ""`)). Carried while not trusted | `printing_off` | `printing_off` |
@@ -255,7 +256,9 @@ Notes:
    web page, or replies that never match) is a failed check (plan: "A failed or unrecognised read
    counts as a failed check"): without it a machine would stay green on its last good reading while
    drift isn't being checked. `running_confirmed` therefore needs R, and `effective_origin` shows the
-   origin as unknown while the code is `message_unchecked` (§5.3).
+   origin as unknown while the code is `message_unchecked` or P's `running_unchecked` is True, and
+   whenever R is None while E.mode is `switch_pending`, even when a higher code (`failed_after_switch`,
+   `left_red`, `interrupted_*`, `ink_out`) hides C11b (§5.3).
 
 ### 3.5 Precedence
 
@@ -288,8 +291,8 @@ lock always loads the running message (§6.5).
 
 C4 (interrupted Send) is true when, with `sid` = L.run_id (or E.send_id when there is no L):
 
-- L.purpose is `send` and not (E.send_id == sid and E.failure) and not (E.send_id == sid and E.mode
-  `running` and E.confirmed); or
+- L.purpose is `send` and not (E.send_id == sid and E.failure) and not (E.send_id == sid and
+  E.rejected) and not (E.send_id == sid and E.mode `running` and E.confirmed); or
 - there is no L, E.mode is `switch_pending` and E.failure is None (the lock was removed but the final
   expected state was never written).
 
@@ -301,7 +304,7 @@ Then the code is:
 | E.send_id == sid, mode `switch_pending` | `on` and R is the new message | `interrupted_new` | AMBER |
 | | `on` and R is the old message | `interrupted_old` | RED |
 | | anything else: printing off, R neither, R unknown, not trusted | `interrupted_unknown` | RED |
-| E.send_id == sid, mode `running`, not confirmed (both running reads passed, the PC stopped before releasing) | `on` and R matches E | `interrupted_new` | AMBER |
+| E.send_id == sid, mode `running`, not confirmed and not rejected (both running reads passed, the PC stopped before releasing) | `on` and R matches E | `interrupted_new` | AMBER |
 | | anything else | `interrupted_unknown` | RED |
 
 With `switch_pending` E carries the fingerprint of the idle-slot read-back (send.md §14), so "the new
@@ -416,7 +419,8 @@ computer names and numbers, never bag text (architecture §4: bag text is shown 
 | `failed_before_switch`, `failed_after_switch`, `left_red` | | `E.failure.msg` (send.md's message for the failed step) |
 | `running_confirmed`, `confirmed_with_notes` | | "Confirmed by {user}." (E.confirmed_by) |
 | `confirmed_with_notes` | | one per note in E.notes: `hx_message.NOTE_TEXTS[note]` (send.md §19.1), the same text the result window shows |
-| `unconfirmed`, `interrupted_new` | | "Waiting for {user} to confirm." (E.sender) |
+| `unconfirmed`, and `interrupted_new` while E.mode is `running` | | "Waiting for {user} to confirm." (E.sender) |
+| `interrupted_new` while E.mode is `switch_pending` | | "Started by {user}. This machine needs a new Send." (L.user, else E.sender): nobody can confirm it (§5.3 `confirm_pending_by` is `""`, and it is in `needs_send`) |
 | `message_unchecked` | | "Message last read {minutes} min ago." when `P.running_ok_at` is set (minutes since then, rounded down, at least 1), else "Stripes hasn't been able to read the message yet." |
 | `off`, `unreachable_printing` | | "Not answering for {minutes} min." once it is at least 1 minute (`P.unreachable_since`) |
 | any, with a stale `stop`/`resume`/`clock` lock | | "A Stop on {computer} didn't finish." / "A Resume on {computer} didn't finish." / "A clock set on {computer} didn't finish." |
@@ -432,7 +436,7 @@ starts (§4.3).
 | Kind | Raised by | Sound | Colour | Roles | Ends when | ref |
 |---|---|---|---|---|---|---|
 | `send_failed` | C6 | yes | RED | sender, notify | E.failure is cleared or E.send_id changes | E.send_id |
-| `send_rejected` | C7/C7b | yes | RED | sender, notify | E.rejected is cleared or E.send_id changes | E.send_id |
+| `send_rejected` | C7/C7b | yes | RED | sender, notify | E.rejected is cleared, E.failure is set, or E.send_id changes | E.send_id |
 | `send_interrupted` | C4 | yes | the code's (RED, or AMBER for `interrupted_new`) | sender, notify | C4 is false (a new lock and E, or a confirm) | the interrupted send_id |
 | `stop_failed` | C5 | yes | RED | last sender, notify, floor | printing read off, or E.mode changes | |
 | `drift` | C11 | yes | RED | notify, last sender, floor | R matches again; acknowledged while not trusted | |
@@ -646,8 +650,13 @@ def expected_code(e: ExpectedState) -> str | None:
 
 ```python
 def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) -> str:
-    # 0. If poll and poll.state and poll.state.code == "message_unchecked": ""  (unknown: the
-    #    message can't be read, so neither the last reading nor E is shown as what prints)
+    # 0. If poll and (poll.running_unchecked or (poll.state and poll.state.code == "message_unchecked")):
+    #    ""  (unknown: the message can't be read, so neither the last reading nor E is shown as what
+    #    prints, also when a higher code such as ink_out or rejected hides message_unchecked)
+    # 0b. If (poll is None or poll.running is None) and expected and expected.mode == "switch_pending":
+    #    ""  (unknown: the new message was never read back running by the poller (a failure after the
+    #    switch, Leave it, an interrupted Send, standalone), so E's origin is not shown as what prints,
+    #    whatever code won)
     # 1. R = poll.running. If R and expected and expected.fingerprint != "" and R.origin_line == ""
     #    and R matches expected: expected.origin_line (the pre-printed case: "USA (pre-printed)" has
     #    no origin item on the printer, and the fingerprint proves the content is the one sent)
@@ -810,9 +819,21 @@ Every `heartbeat_s` (5 s), waiting with `clock.sleep(heartbeat_s, cancel)`:
    printing. Log `polling_started` with the reason (`assigned`, `takeover`, `handover`, `restart`).
 2. Settle (storage.md §11.6): keep writing P every `poll_fast_s` (counter + 1, nothing else changed),
    and make the first request only after a lock read taken at least `hx_share.settle_s()` (6 s) after
-   step 1's write still shows no lock.
-3. The first cycle reads HXUI and loads the running message (§6.5). The message check (§6.5) starts
-   afresh: `load_ok_mono` = the moment of step 1's write, `loads_failed` = 0.
+   step 1's write still shows no lock. Then, right before the first request, the **rank check**: the
+   worker computes `ranks = hx_share.assign(printer_ids, store.live_heartbeats())` itself (a fresh
+   read, not the coordinator's last one). If this PC isn't rank 0 for the printer and rank 0's
+   heartbeat is live, it makes no request: it writes P with `yielded_to = <rank 0 key>` (counter + 1),
+   logs `polling_stopped` with reason `rank` and exits. Rank 0 carries on even if P now names another
+   poller. This settles the start race: rank 0 starts when P is missing or stale for `stale_s`, and
+   rank 1 at `takeover_after_s(1)`, also 15 s, so on a first start, a new printer, or a rank-0 PC whose
+   heartbeat and P went stale together, two coordinators can start workers in the same moment; the
+   rank-1 one yields here, after its settle and before any request. A `ShareUnavailable` from
+   `live_heartbeats()` makes no request either (§6.13).
+3. The first cycle reads HXUI and loads the running message (§6.5). The message check (§6.5)
+   continues from P: `load_ok_mono` = the moment of step 1's write, and `loads_failed` =
+   `UNCHECKED_LOADS` when `P.running_unchecked` is True (so `message_unreadable` keeps its id across a
+   takeover, §15 decision 11), else 0. This first Load is a required one (§6.4): if it fails, the
+   reading has `running_reset = True`, so an R inherited from P is never used to judge green.
 
 ### 6.4 The worker cycle (share mode)
 
@@ -822,6 +843,12 @@ ticks aren't caught up). **P is written at every tick** the share allows, whatev
 tick:
 
 1. **Still mine?** If the coordinator asked this worker to hand over or stop, do that and exit.
+   Otherwise the rank check of storage.md §12.6 rule 6, made by the worker itself at the start of
+   every cycle: `hx_share.assign(printer_ids, live)` with the coordinator's latest `live` list (§6.2
+   item 3.2, kept in memory; the start of §6.3 step 2 reads a fresh one). If this PC isn't rank 0 for
+   the printer while rank 0's heartbeat is live, hand over now (as §6.2 item 3.3's first bullet: write
+   P with `yielded_to = <rank 0 key>`, log `polling_stopped` with reason `rank`) and exit, without
+   waiting for the coordinator's next tick.
 2. **E**: `store.read_expected(machine_id)`. `FormatTooNew`: write P with state
    `MachineSnapshot(code="update_stripes", colour=GREY, ...)` and no alerts, make no request, end the
    tick. `ShareUnavailable`: §6.13, end the tick.
@@ -835,31 +862,39 @@ tick:
    count and the acks (that judgement can only change through E, L or acks, so it commits at once,
    §3.8 step 2). Write P, end the tick.
 6. **Plan** the requests (§6.5).
-7. **Read**, one request at a time, through the `PrinterClient` from `ClientPool`. Right before each
-   request, in this order:
-   1. **Keep P fresh.** `p_ok` is the `clock.monotonic()` of the last successful `write_poll`, and
-      `end = p_ok + stale_s / 2 + http_timeout_s` (9.5 s after it) is the latest any request may
-      still be running. A `read` or `command` fits when `now + worst_case_s(call) <= end` (protocol.md
-      §8.3); a web call (`load_slot`, `fonts`, `firmware`) fits when `now + http_timeout_s <= end`,
-      because it gets `end` as its deadline. The worker never calls `check_uid()` or `read_twice()`
-      (their worst case is longer); it reads `read("HXUI")` and lets the two-reading rule confirm a
-      mismatch (§3.8). If `now − p_ok >= poll_fast_s`, or the request doesn't fit, write P first
-      (counter + 1, everything else as last written), which moves `p_ok` and `end` on. If it still doesn't fit (the
-      write failed), make no further request this cycle; and once `now − p_ok >= stale_s / 2`
-      (7.5 s), apply §6.13: P can no longer prove this worker is alive, so another PC may soon start
-      polling the printer.
-   2. **Check the lock** again (`local_locks`, then `read_lock`). A fresh lock: abandon the cycle
-      without judging and go to step 3's paused write.
-   3. **Send it**; a web call gets `deadline=end` (`load_slot(0, deadline=end)`, `fonts(deadline=end)`,
-      `firmware(deadline=end)`).
-   With the default timings no request can then still be running 9.5 s after the last good P write,
-   while other PCs wait at least `stale_s` (15 s) of unchanged counter before taking over and a sender
-   waits `stale_s` before treating P as stale. A lock read or P write that takes longer than `stale_s /
-   4` (3.75 s) counts as a failed one for §6.13, even when it succeeds. Exceptions map as in §6.6.
+7. **Read**, one request at a time, through the `PrinterClient` from `ClientPool`. `p_ok` is the
+   `clock.monotonic()` taken just before the `write_poll` call that last succeeded (another PC counts
+   from when it saw the counter change, which can be any moment during that call), and `end = p_ok +
+   stale_s / 2 + http_timeout_s` (9.5 s after it) is the latest any request may still be running.
+   Right before each request, in this order:
+   1. **Check the lock** (`local_locks`, then `read_lock`). A fresh lock: abandon the cycle without
+      judging and go to step 3's paused write. A `read_lock` that took longer than `stale_s / 4`
+      (3.75 s) is not used: make no further request this cycle (and count it for §6.13).
+   2. **Keep P fresh**, with `now` read after the lock read returned (and again after any P write). A
+      `read` or `command` fits when `now + worst_case_s(call) <= end` (protocol.md §8.3); a web call
+      (`load_slot`, `fonts`, `firmware`) fits when `now + http_timeout_s <= end`, because it gets
+      `end` as its deadline. The worker never calls `check_uid()` or `read_twice()` (their worst case
+      is longer); it reads `read("HXUI")` and lets the two-reading rule confirm a mismatch (§3.8). If
+      `now − p_ok >= poll_fast_s`, or the request doesn't fit, write P first (counter + 1, everything
+      else as last written), which moves `p_ok` and `end` on. If it still doesn't fit, make no further
+      request this cycle; and once `now − p_ok >= stale_s / 2` (7.5 s), apply §6.13: P can no longer
+      prove this worker is alive, so another PC may soon start polling the printer. Nothing (no share
+      operation, no sleep) runs between this check and the call.
+   3. **Send it** at once. Every call gets `deadline=end`: `read(tag, deadline=end)`, `command(cmd,
+      deadline=end)`, `load_slot(0, deadline=end)`, `fonts(deadline=end)`, `firmware(deadline=end)`.
+      A call that has to wait for this PC's gate (a Stop, Resume or clock set on this PC took it
+      between the lock check and the call) never waits past `end`, and one that gets the gate too
+      late to finish by `end` sends nothing (protocol.md §9 item 2): `PrinterBusy`, which isn't a
+      failure (§6.6), or the web call's `WebReadFailed`.
+   With the default timings no request can then still be running 9.5 s after the start of the last
+   good P write, while other PCs wait at least `stale_s` (15 s) of unchanged counter before taking over
+   and a sender waits `stale_s` before treating P as stale. A lock read or P write that takes longer
+   than `stale_s / 4` (3.75 s) counts as a failed one for §6.13, even when it succeeds. Exceptions map
+   as in §6.6.
 8. **Judge**: build the `Reading` and call `judge(P, reading, E, L, machine, line, data, timings)`.
 9. **Load now**: if `judgement.read_running_now`, the cycle had no Load, and no such extra Load was
    made in the last 30 s for this printer, sleep `second_reading_s`, then `load_slot(0)` by step 7's
-   rules (P kept fresh, the lock checked, the deadline), and judge again as a first reading. (The
+   rules (the lock checked, P kept fresh, the deadline), and judge again as a first reading. (The
    30 s limit keeps a printer whose MSGNAM and Load names disagree for good within the budget.)
 10. **Second reading**: if `judgement.recheck`, sleep `second_reading_s` (cancellable), re-read the
     items (§3.8) by step 7's rules, and judge the second reading.
@@ -869,9 +904,11 @@ tick:
     `alert_acknowledged` from the judgement (§9).
 13. **Reach**: `reach.reached()` when any request got a reply this cycle.
 
-R is reset as §3.3 says: when the cycle follows a paused tick (`lock_seen`) or sees an E counter
-different from `P.expected_counter`, it must load the running message; if that Load fails, the reading
-has `running_reset = True` (and `read_running_now` brings the next try).
+R is reset as §3.3 says: when the cycle follows a paused tick (`lock_seen`), sees an E counter
+different from `P.expected_counter`, is the first cycle after a worker start (§6.3), or is the first
+cycle after the printer was unreachable, it must load the running message; if that Load fails, the
+reading has `running_reset = True` (and the next slow set, or `read_running_now`, brings the next
+try).
 
 An exception that isn't an `HxError` (a bug) is caught at the top of the tick, printed with its
 traceback, logged as `internal_error`, and P is written with state code `internal_error` (RED), alerts
@@ -905,13 +942,13 @@ its previous value.
 **The message check** (C11b). The worker keeps, on its monotonic clock, `load_ok_mono` (the last
 successful running-message Load, or the worker's start, §6.3) and `loads_failed` (running-message
 Loads that failed in a row since the last success, the last paused tick or the last change of E's
-counter; any of those resets it to 0). A Load fails when it raises `WebReadFailed`, `NoReply` or
-`PrinterBusy`. `reading.running_unchecked = loads_failed >= UNCHECKED_LOADS or now − load_ok_mono >=
-UNCHECKED_SLOW_SETS × poll_slow_s`; it is computed only in share mode (None in standalone, carrying the
-previous value). With Loads failing every slow set, the machine turns amber `message_unchecked` and the
-`message_unreadable` warning starts within 2 slow sets (about 2 minutes) and at the latest after 3
-minutes. A successful Load sets `load_ok_mono = now`, `loads_failed = 0` and `P.running_ok_at` to its
-wall time.
+counter; any of those resets it to 0, and a worker start carries it from P, §6.3). A Load fails when
+it raises `WebReadFailed`, `NoReply` or `PrinterBusy`. `reading.running_unchecked = loads_failed >=
+UNCHECKED_LOADS or now − load_ok_mono >= UNCHECKED_SLOW_SETS × poll_slow_s`; it is computed only in
+share mode (None in standalone, carrying the previous value). With Loads failing every slow set, the
+machine turns amber `message_unchecked` and the `message_unreadable` warning starts within 2 slow
+sets (about 2 minutes) and at the latest after 3 minutes. A successful Load sets `load_ok_mono =
+now`, `loads_failed = 0` and `P.running_ok_at` to its wall time.
 
 Budget per printer at the default timings, steady state: 3 requests every 5 s (36 a minute), plus 1
 HXUI, 5 slow reads and one Load (one Load request plus about one repeat) a minute: about 44 requests a
@@ -1026,36 +1063,52 @@ send.md §9.6 points here. `hx_poller` can't import `hx_send`, so it runs the cl
 2. **When.** Each share-mode worker, while there is a pending change: when the printer is trusted (its
    last committed facts) and `P.dst.get("change") != id`, the next cycle is a clock-set cycle: HXUI and
    PRIN as usual, then the steps below instead of the other items. Every request follows §6.4 step 7
-   (P kept fresh, the lock checked right before it, the time bound), so the TD is sent right after its
-   own lock check. A fresh lock abandons the cycle with nothing written; the next free cycle starts the
-   steps again.
+   (the lock checked, P kept fresh, the call with its deadline), so the TD is sent right after its own
+   lock check. A fresh lock abandons the cycle (before the TD, item 3.6 puts `dst` back); the next
+   free cycle starts the steps again.
 3. **Steps.** `t = time_source.cached()` first (never a query, §6.9).
    1. `d0 = read("DATE")`, `t0 = read("TIME")`; `before = clock_from(d0, t0)`; `expected =
       time_source.now_from(t).local`; `diff = (before − expected).total_seconds()`, brought to the
       nearest whole day as in §6.9.
    2. `abs(diff) <= clock_warn_s`: the clock is already right (a Send or Set clocks set it since the
-      change). No TD. Record `ok` True, `skipped` True.
-   3. Otherwise `client.command(hx_message.clock_command(time_source.now_from(t).local))`, once.
-   4. `d1 = read("DATE")`, `t1 = read("TIME")`, `after = clock_from(d1, t1)`, `expected =
+      change). No TD. Record `ok` True, `skipped` True, `sent` False.
+   3. **Record first.** Before the TD, write P with `dst = {"change": id, "at": <wall time>, "ok":
+      False, "skipped": False, "sent": True, "by": <heartbeat key>, "source": t.source}` (counter + 1,
+      everything else as last written). If that write fails, send no TD and end the cycle (the steps
+      run again at the next cycle). Every later P write of the cycle, including §6.4 step 7.2's
+      keep-fresh writes, carries this `dst`. So once a TD may have gone out, P already says so, and a
+      poller that takes over after a crash, a failed write or a §6.13 stop never sends a second one
+      (the same rule as send.md decision 38 for PRINTMSG).
+   4. Then `client.command(hx_message.clock_command(time_source.now_from(t).local))`, once, by §6.4
+      step 7's rules (its own lock check right before it).
+   5. `d1 = read("DATE")`, `t1 = read("TIME")`, `after = clock_from(d1, t1)`, `expected =
       time_source.now_from(t).local`. `abs(after − expected) <= CLOCK_SET_TOLERANCE_S` (90 s): `ok`
       True. Otherwise read DATE and TIME once more (a pair read across midnight can be a day out) and
       check again; still off: `ok` False with the message "{machine}'s clock reads {printer_time} after
       it was set to {expected}." (send.md's text).
-   5. A read that fails in step 1 ends the cycle with nothing recorded (no TD was sent, so the steps run
-      again at the next cycle). Once the TD has been sent, whatever happens next, the result is
-      recorded and the TD is never sent again for this change (plan: "never repeated"): a `NoReply`,
-      `CommandRefused` or failed read-back is recorded with `ok` False.
-4. **Record.** `P.dst = {"change": id, "at": <wall time>, "ok": bool, "skipped": bool, "by": <heartbeat
-   key>, "source": t.source}`, written with the cycle's P. Because it is in P, a poller that takes over
-   the printer later doesn't do it again for the same change, and a printer that was off at the change
-   gets its clock set when it next answers within `DST_KEEP_S`; after that the `clock_off` warning and
-   the next Send cover it.
+   6. A read that fails in step 1 ends the cycle with nothing recorded (no TD was sent, so the steps run
+      again at the next cycle). When the cycle ends after step 3's write but before the TD request was
+      sent (a fresh lock at its lock check, the time bound of §6.4 step 7.2, the cancel token), the
+      worker knows no TD went out: its next P write puts `dst` back to what it was before step 3, so
+      the steps run again at the next free cycle; if that write fails, the record stands and this
+      change gets no automatic TD (the safe side; the `clock_off` warning and the next Send cover it).
+      Once the TD request has been sent, whatever happens next, the TD is never sent again for this
+      change (plan: "never repeated"): a `NoReply`, `CommandRefused` or failed read-back is recorded
+      with `ok` False.
+4. **Record.** `P.dst = {"change": id, "at": <wall time>, "ok": bool, "skipped": bool, "sent": bool,
+   "by": <heartbeat key>, "source": t.source}`, written with the cycle's P; after a TD it is step 3's
+   record with `ok` overwritten by the result. Because it is in P, a poller that takes over the printer
+   later doesn't do it again for the same change, and a printer that was off at the change gets its
+   clock set when it next answers within `DST_KEEP_S`; after that the `clock_off` warning and the next
+   Send cover it. A record left with `sent` True and `ok` False by a poller that stopped before item 4
+   is never retried, for the same reason.
 5. **Log** `dst_clock_set` to `hx-events` (§9; plan: "logged as automatic") with exactly these fields:
-   `change`, `change_at` (`at` of item 1), `previous_offset_s`, `offset_s`, `ok`, `skipped`, `msg` (Msg
-   or null), and `clock`, send.md §9.5's record: `{"sent": <the TD's date and time "%Y-%m-%d %H:%M"> or
-   None when skipped, "before": before "%Y-%m-%d %H:%M:%S", "after": after or None, "difference_s":
-   <after (or before, when skipped) minus expected, rounded to 0.1>, "source": t.source, "server":
-   t.server, "offset_s": round(t.offset_s, 3)}`.
+   `change`, `change_at` (`at` of item 1), `previous_offset_s`, `offset_s` (`old_s` and `new_s` of item
+   1, the PC's UTC offsets before and after the change; not the `offset_s` inside `clock`), `ok`,
+   `skipped`, `msg` (Msg or null), and `clock`, send.md §9.5's record: `{"sent": <the TD's date and
+   time "%Y-%m-%d %H:%M"> or None when skipped, "before": before "%Y-%m-%d %H:%M:%S", "after": after or
+   None, "difference_s": <after (or before, when skipped) minus expected, rounded to 0.1>, "source":
+   t.source, "server": t.server, "offset_s": round(t.offset_s, 3)}`.
 6. Not done in standalone mode. When `t.source == "pc"` (the time server hasn't answered the `hx-time`
    thread), the PC's time is used, as the plan allows, and the log says `source "pc"`.
 
@@ -1126,7 +1179,7 @@ commit (§3.8).
 | `expected_counter` | `E.counter` at the last judgement (0 when there was no E) |
 | `reread_seen` | the last `E.reread_token` acted on |
 | `unreachable_since` | wall time when `reachable` last became False; None while reachable |
-| `dst` | §6.11 item 4: `{"change", "at", "ok", "skipped", "by", "source"}` of the current change, `{}` before the first |
+| `dst` | §6.11 item 4: `{"change", "at", "ok", "skipped", "sent", "by", "source"}` of the current change (written before the TD, §6.11 item 3.3), `{}` before the first |
 | `standalone` | True only in `local_statuses()` |
 
 Example (a machine in drift, alert unacknowledged):
@@ -1212,9 +1265,9 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
    - A `ShareUnavailable` part-way through: use the last good value of everything not yet read this
      cycle and build the board with `share_ok=False`.
 3. **Standalone** (`poller.mode == "standalone"`): P = `poller.local_statuses()`, ages from the watcher's
-   own `CounterWatch` over their counters, E and line statuses = the last good ones, L = None except for
-   printers in `store.local_locks` (a `LockInfo` built from the store's private record, age 0), acks =
-   this PC's own.
+   own `CounterWatch` over their counters, E and line statuses = the last good ones, L =
+   `store.local_lock_info(printer_id)` for printers in `store.local_locks`, with `lock_ages[printer_id]
+   = 0.0`, and None otherwise, acks = this PC's own.
 4. **Share down, poller idle**: the last good P, E and line statuses, with ages still growing (so every
    machine becomes `not_monitored` after 30 s), `share_ok=False`.
 5. `board = board_view(...)`; set `board.next_check_s` from the last `PollerUpdate`; set `latest`; post
@@ -1405,6 +1458,7 @@ Values: `machine` = `Machine.name`, `printer` = `Printer.name`, `computer`, `use
 | English | Spanish |
 |---|---|
 | Started by {user}. | Iniciado por {user}. |
+| Started by {user}. This machine needs a new Send. | Iniciado por {user}. Esta máquina necesita un nuevo envío. |
 | After a test by {user}. | Después de una prueba de {user}. |
 | Confirmed by {user}. | Confirmado por {user}. |
 | Waiting for {user} to confirm. | Esperando la confirmación de {user}. |
@@ -1596,11 +1650,14 @@ message, and stale `LockInfo`s for every purpose.
    drift for a rejected or after-switch-failed machine; `printing_off` only after a read-on, otherwise
    `not_printing`; `printing_on_unexpected` for stopped and test-finished; `stop_failed` vs
    `stop_requested` vs `stopped_needs_send` vs `stopped`; `failed_before_switch` with a drift alert as
-   well; `left_red`; `rejected` then `stopped_needs_send` with the same `send_rejected` alert key; ink
+   well; `left_red`; `rejected` then `stopped_needs_send` with the same `send_rejected` alert key; a
+   rejected E followed by a Send that failed before the switch gives `failed_before_switch` with
+   `send_failed` only (no `send_rejected`); ink
    levels 0 to 4 printing and not printing; clock offset 119 s (nothing) and 121 s (`clock_off`); a
    first-ever Send failure with mode `none`; `not_from_stripes` and `idle`.
 3. **Crash recovery** (§3.6): every row of the table, plus: a confirmed E with a stale send lock of the
-   same id is not interrupted; a recorded failure of the same id gives the failure code; an older
+   same id is not interrupted; nor is a rejected E with a stale send lock of the same id (it gives
+   `rejected` with `send_rejected` only); a recorded failure of the same id gives the failure code; an older
    failure plus a newer interrupted send gives `interrupted_old`; no lock with an orphan
    `switch_pending` behaves as a stale lock; stale test lock with printing on/off; stale stop lock adds
    the detail.
@@ -1642,11 +1699,15 @@ message, and stale `LockInfo`s for every purpose.
     `message_unreadable` (no sound, AMBER) to the notify user, `admins` and `monitor`; a later reading
     with R set and `running_unchecked` False gives `running_confirmed` and ends the alert; in standalone
     the same E with R None gives `running_confirmed`. `effective_origin` is `""` while P's code is
-    `message_unchecked`.
+    `message_unchecked`, and also for `ink_out` with `running_unchecked` True.
 14. **Origin after a failed content check**: E `switch_pending` with a fingerprint, a failure after the
     switch, and R with the new name and slot but a different origin TXT and fingerprint:
     `effective_origin` is R's origin line, not E's; a pre-printed film (R.origin_line `""`, matching
-    fingerprint) shows E's "USA (pre-printed)"; E with an empty fingerprint never uses rule 1.
+    fingerprint) shows E's "USA (pre-printed)"; E with an empty fingerprint never uses rule 1. With E
+    `switch_pending` and an after-switch failure (and again with `left_by` set), `P.running` None and
+    `P.message_name` equal to `E.message_name`: `effective_origin` is `""`, not E.origin_line. The same
+    for `interrupted_unknown` (stale send lock, R None) and for a standalone status with MSGNAM equal
+    to the new name.
 15. **The sender**: E with `sender` `EXAMPLE\jsmith` rewritten by `EXAMPLE\akim` (`written_by` akim, a
     clock set): `confirm_pending_by` is jsmith, a new `drift` alert's last-sender recipient is jsmith,
     and `stopped` shows E.stopped_by.
@@ -1692,15 +1753,21 @@ of real time.
 11. **Daily check**: runs one item per cycle, logs `daily_check`; changing the fake's `ENWHD` raises
     `encoder_changed` after the second reading; recording the new value on the machine (revision + 1)
     reruns the check and ends it.
-12. **DST**: the `TimeSource` built with an offset function that changes once (EDT to EST at 1 Nov
-    2026 06:00 UTC) and the fake's clock an hour off after it: exactly one TD write per printer, only
+12. **DST**: the `TimeSource` built with an offset function `fn` that changes once (EDT to EST at 1
+    Nov 2026 06:00 UTC), and the fake built with the same one (`FakeWorld(printers=[{"offset_fn":
+    fn}])`, protocol.md §1.2), so its clock, which never follows daylight saving, is an hour off after
+    the change whatever the host's time zone: exactly one TD write per printer, only
     when no lock is held (a lock held at that moment delays it to the next free cycle, and the TD is
     preceded by its own lock check); DATE and TIME are read before and after it; the `dst_clock_set`
     entry has the §6.11 item 5 fields with `ok` True and a `clock` record whose `after` is within 90 s;
     `P.dst` has change `20261101-18000`; a second poller taking over doesn't write again; a TD answered
     `3` is recorded `ok` False and not repeated. Catch-up: a poller started 2 hours after the change
     (no `P.dst`) still makes the one TD; started 25 hours after, it makes none. Skipped: when the fake's
-    clock is already right, no TD is sent and `P.dst` records `skipped` True. No poller worker calls
+    clock is already right (`clock_offset_s = -3600` set after the change), no TD is sent and `P.dst`
+    records `skipped` True. P carries `dst` with
+    `sent` True before the TD reaches the fake (checked from a callable `override("TD", ...)` that reads
+    poll.json); a P write that fails after that record (`FlakyFileOps` failing the poller's writes from
+    then on) stops the worker, and the poller that takes over sends no second TD. No poller worker calls
     `TimeSource.now()` (patched to fail the test); only the `hx-time` thread does.
 13. **Standalone**: `FlakyFileOps(down=True)` with `set_monitor_open(True, False)`: after
     `lock_stale_s`, mode `standalone`, checks every `standalone_poll_s` with quick items only (no Load
@@ -1718,21 +1785,41 @@ of real time.
 18. **Message check**: a `web_reply_hook` that breaks every slot 0 Load turns a `running_confirmed`
     machine AMBER `message_unchecked`, with `message_unreadable`, within 3 simulated minutes, and its
     `MachineView.origin_line` is `""`; removing the hook brings it back to green at the next slow set.
+    With the hook still in place, a handover to a second poller (item 15's setup) and a worker restart
+    after a §6.13 suspension each keep the machine AMBER `message_unchecked`: no `running_confirmed` is
+    ever committed, the `message_unreadable` id stays the same, and there is no `alert_ended` or second
+    `alert_started`.
 19. **Ink names**: INKT answering a name not in `Company.inks` once (then a listed one) uses the listed
     one and counts one nonsense event; answering the same unknown name twice keeps the previous
     `ink_name` and counts nothing.
 20. **Keeping P fresh**: with `latency_s` such that every read takes about 0.4 × `stale_s / 2` (scaled),
     P's counter never stands still for `stale_s / 2` while the worker is polling, and no request starts
-    that couldn't end within `stale_s / 2 + http_timeout_s` of the last P write (checked from the fake's
-    `requests` times against the store's P write times).
+    that couldn't end within `stale_s / 2 + http_timeout_s` of the start of the last P write (checked
+    from the fake's `requests` times against the store's P write times). Two more cases, each asserting
+    that no fake request ends later than `p_ok + stale_s / 2 + http_timeout_s`: (a) `FlakyFileOps`
+    making only lock reads take just under `stale_s / 4`; (b) a Stop on the same store taking the
+    printer's gate while the worker is in `read_lock` (the worker's call waits no later than its
+    deadline and then sends nothing, `PrinterBusy`).
 21. **Standalone delay**: `FlakyFileOps(down=True)` with the monitor open: the mode stays `idle` for
     `lock_stale_s` and then becomes `standalone`; each check reads HXUI, PRIN, MSGNAM and the counter.
 22. **Probe**: with no live poller for a printer and this PC without reach, the coordinator probes it
     through `probe()`: the fake records no request; with the printer's gate held by another thread the
     probe returns None and `probed()` isn't called; a printer that another store polls is never
     probed.
+23. **Origin after a failed switch**: a Send fails at confirm_1 (a `web_reply_hook` changing the origin
+    CTEXT TXT of slot 0 Loads), then the poller's next Loads are dropped: `MachineView.origin_line` is
+    `""` ("(origin unknown)" on the card and floor row) until a Load succeeds, after which it is the
+    read-back origin.
+24. **Start race**: two stores whose coordinators tick in phase, no poll.json for the printer, and
+    `FlakyFileOps.slow_s` large enough that one coordinator tick takes longer than the settle: both
+    start a worker, the rank-1 one yields at its rank check before any request (`polling_stopped`
+    reason `rank`, P with `yielded_to` naming rank 0), exactly one worker sends requests, and the
+    fake's `max_in_flight == 1` with no "two requests in flight" violation.
 
 ### 12.3 test_hx_sim.py (shared with storage.md and protocol.md)
+
+The file is written by WP6 (README.md "Work packages"), with the storage.md and protocol.md cases;
+it needs `hx_send` (WP5) for the Sends from two PCs.
 
 States-related assertions: with every poller gone, every machine is `not_monitored` on a remaining
 watcher after 30 s (scaled); a takeover keeps alert ids (no second `alert_started` for the same
@@ -1762,7 +1849,9 @@ Two cases from the review:
 - `running` (after both confirm reads) has `fingerprint` from read-back 3, `printing_expected` True,
   `confirmed` False, and `notes` for amber reasons.
 - A failure before the switch keeps the mode and the previous message's `message_name`, `slot` and
-  `fingerprint`, so drift is still judged against what is printing.
+  `fingerprint`, so drift is still judged against what is printing. It sets `rejected` False and keeps
+  `resume_blocked`, so an earlier rejection doesn't raise a second `send_rejected` next to the new
+  `send_failed`.
 - Stop writes `stopped_by_user` (with `rejected`/`resume_blocked` after "Something's wrong"); a failed
   Stop writes `stop_requested_at_printer`; Resume writes `running` with the resumed message; a test
   writes `test_running` with `test = {"run_id", "by", "step", "of"}` and `test_finished` at the end.
@@ -1782,12 +1871,14 @@ is open or the floor board is open; make `assets/alert.wav` to §4.4's cadence; 
 `board_banner`, `can_acknowledge` and `StatusWatcher.acknowledge`; draw §8; pass `local=` to `Poller`;
 don't register different Spanish for §10's texts.
 
-**protocol.md**: the poller uses `read` (HXUI included, never `check_uid` or `read_twice`),
-`load_slot(0, deadline=...)`, `fonts(deadline=...)`, `firmware(deadline=...)`, `probe()` (None when the
+**protocol.md**: the poller uses `read(tag, deadline=...)` (HXUI included, never `check_uid` or
+`read_twice`), `command(cmd, deadline=...)` (the daylight-saving TD), `load_slot(0, deadline=...)`,
+`fonts(deadline=...)`, `firmware(deadline=...)`, `probe()` (None when the
 gate is busy), `login`, `worst_case_s`, `nonsense` and `busy_replies` as specified there.
 
 **storage.md**: the poller follows §11.6 and §12 there, probes only printers without a live poller
-(§12.3), and needs no poller memory file (the daylight-saving change is recomputed, §6.11).
+(§12.3), and needs no poller memory file: daily checks are in P.daily and the daylight-saving clock
+set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
 
 ## 14. OPEN items
 
@@ -1862,7 +1953,9 @@ gate is busy), `login`, `worst_case_s`, `nonsense` and `busy_replies` as specifi
     way from `recent_dst_change`, so it happens once per printer per change even across takeovers and
     restarts (a PC started up to a day after the change still makes it), and waits up to 24 hours for
     a printer that is off. It reads the clock first and sends no TD when the clock is already right,
-    and verifies the clock after the TD as a Send does; the TD itself is never repeated.
+    and verifies the clock after the TD as a Send does; the TD itself is never repeated, because P
+    records it (`sent` True) before it is sent, so a takeover after a crash or a failed write can't
+    send a second one.
 25. **Standalone mode** judges with the cached E and no locks, skips crash recovery and drift, shows
     `unknown_while_down` when the message name differs from the last Send on record, logs with
     `"standalone": true`, and keeps acks local.
@@ -1894,11 +1987,12 @@ gate is busy), `login`, `worst_case_s`, `nonsense` and `busy_replies` as specifi
 36. **A running message that can't be read is a failed check**: amber `message_unchecked` with a
     no-sound warning, green needs a successful Load since E last changed, and the origin shows as
     unknown meanwhile.
-37. **P stays fresh while the poller works**: P is rewritten before any request when 5 s have passed, no
-    request may outlive `stale_s / 2 + http_timeout_s` after the last good P write, slow share
-    operations count as failures, and workers never wait on the time server (`cached()` plus the
-    `hx-time` thread). So a sender or a takeover poller can never start while this poller still has a
-    request in flight.
+37. **P stays fresh while the poller works**: P is rewritten before any request when 5 s have
+    passed, no request may outlive `stale_s / 2 + http_timeout_s` after the start of the last good P
+    write (the lock is read before that check, and every request carries the time as its deadline,
+    which also bounds the wait for this PC's gate), slow share operations count as failures, and
+    workers never wait on the time server (`cached()` plus the `hx-time` thread). So a sender or a
+    takeover poller can never start while this poller still has a request in flight.
 38. **Standalone checks start after `lock_stale_s` of continuous outage**, so a short outage on one PC
     never overlaps the other PCs' polling; a longer partial outage is the residual risk named in
     architecture §7.3 rule 7.

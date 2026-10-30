@@ -128,6 +128,8 @@ class PrinterClient:                      # additions to architecture §6.4
         # TCP connect and close under the gate, no request (§9 item 7); None when the gate was busy
     # load_slot(slot, *, deadline=None), fonts(*, deadline=None), firmware(*, deadline=None):
     # architecture §6.4; the deadline rule is §10.6 step 0
+    # query(tag, *, deadline=None), read(tag, *, deadline=None), command(cmd, *, deadline=None):
+    # architecture §6.4; with a deadline the gate wait is bounded and a late gate sends nothing (§9 item 2)
 ```
 
 ### 1.2 hx_fake
@@ -143,6 +145,11 @@ class FakePrinter:                        # additions to architecture §6.9
     # Knobs: plain attributes, changed at any time (handlers read them under self.lock).
     uid: int; password: str; placement: str; fonts: tuple; firmware: str   # from the constructor
     latency_s: float; mixup: bool; busy_on_overlap: bool                    # from the constructor
+    offset_fn: Callable[[float], float]   # constructor keyword, default hx_time.local_utc_offset
+    base_offset_s: float                  # offset_fn(clock.time()) at construction; never changes
+    def printer_clock(self) -> datetime: ...
+        # datetime(1970, 1, 1) + timedelta(seconds=clock.time() + base_offset_s + clock_offset_s):
+        # naive, and it never follows daylight saving, like the real printer's clock (§15.3)
     drop_after_idle_s: float | None; editor_page_bytes: int; editor_stall_s: float
     hx_name: str = " Printer 1"           # the HXNA answer, with the real printer's leading space
     mixup_p: float = 0.5
@@ -385,7 +392,8 @@ The internal helper `_ask(xml) -> str` is always called with the gate held. It m
 `http_exchange` (`max_body=MAX_AUTOPILOT_REPLY`), sets `last_request_at = clock.monotonic()` when the
 exchange ends however it ends, then applies §2.4 and §4.2.
 
-`query(tag) -> str`
+`query(tag, *, deadline=None) -> str` (the deadline rule of §9 item 2 applies to `query`, `read` and
+`command`)
 
 1. `check_query(tag)`: `ForbiddenCommand` for any tag outside `QUERY_SPECS`. Every
    `FORBIDDEN_QUERY_TAGS` tag is outside it.
@@ -395,7 +403,7 @@ exchange ends however it ends, then applies §2.4 and §4.2.
    returned as it is, without a spec check.
 4. After a second failure, raise the last `NoReply` or `PrinterBusy`.
 
-`read(tag) -> int | str | None`
+`read(tag, *, deadline=None) -> int | str | None`
 
 1. As `query`, but every answer goes through `check_reply`. A `BadReply` from the check adds 1 to
    nonsense and counts as a failed attempt, like `NoReply`.
@@ -416,10 +424,10 @@ exchange ends however it ends, then applies §2.4 and §4.2.
    raises `WrongPrinter(expected=uid, got=str(value))`. Two different answers: nonsense + 1 and
    `BadReply`.
 
-`command(cmd)`
+`command(cmd, *, deadline=None)`
 
 1. `check_write(cmd)` before anything else (`ForbiddenCommand`).
-2. Take the gate.
+2. Take the gate (with a deadline, §9 item 2).
 3. Warm-up: if `last_request_at is None`, or `clock.monotonic() - last_request_at >= idle_warmup_s`,
    run the `read("HXUI")` algorithm with the gate held. A different UID raises `WrongPrinter`, and any
    failure is raised as it is. In both cases the write is not sent.
@@ -648,6 +656,14 @@ One PC can poll 12 printers on separate threads because each printer still sees 
    own `GateRegistry()`.
 2. Every public `PrinterClient` method takes the gate with `lock.acquire(timeout=gate_wait_s)` (real
    time). A timeout raises `PrinterBusy` "{printer} is busy with another request from this PC."
+   `query`, `read` and `command` take an optional `deadline` (a `clock.monotonic()` time), as the web
+   calls do (§10.6 step 0). With one, the call may start no later than `latest = deadline −
+   worst_case_s(call)` (for the web calls, `deadline − http_timeout_s`): the gate is taken with
+   `timeout=min(gate_wait_s, max(0.0, latest − clock.monotonic()))`, and a gate acquired when
+   `clock.monotonic() > latest` is released at once. Either way nothing is sent; `query`, `read` and
+   `command` raise `PrinterBusy` "{printer} is busy with another request from this PC.", the web calls
+   their §10.6 step 0 error. So a caller with a deadline never waits for the gate past it, and never
+   sends a request that could still be running after it (the poller, states.md §6.4 step 7).
 3. What one acquisition covers:
    - `query`, `read`: both attempts and the wait between them.
    - `command`: the warm-up read and the write.
@@ -747,8 +763,8 @@ gives `None`.
    `read_retry_s` sleep, the client checks that `clock.monotonic() + http_timeout_s (+ read_retry_s for
    a sleep) <= deadline`; if not, it starts nothing more and raises `WebReadFailed` "{printer} didn't
    send back the message in slot {slot} in time." (counted like any `WebReadFailed`, not as nonsense).
-   So the call returns by the deadline plus at most the gate wait. Waiting for the gate counts too:
-   a gate acquired after the deadline is released at once with the same error.
+   Waiting for the gate counts too (§9 item 2): it is bounded by the deadline, and a gate acquired too
+   late is released at once with the same error, so the call returns by the deadline.
 1. `ValueError` unless 0 ≤ slot ≤ 10. Take the gate.
 2. If there are no cookies, log in (§10.1).
 3. `xid += 1`, `started = clock.monotonic()`, send the Load (`sme_request(repeat=False)`,
@@ -1123,7 +1139,7 @@ The client sees "connection closed without reply". `rng` is `random.Random(seed)
    | PRIN | `1` or `0` from `printing` |
    | MSGNAM | the current slot's name; `None` when it is unnamed or the slot is empty |
    | MSCNT, PMCNT | `counters` |
-   | DATE, TIME | the printer clock, `clock.time() + clock_offset_s` in local time, as `dd/mm/yyyy` and `hh:mm:ss`, zero-padded |
+   | DATE, TIME | the printer clock `printer_clock()` (§1.2: the clock's time plus `base_offset_s` plus `clock_offset_s`, naive, never following daylight saving or the host's time zone), as `dd/mm/yyyy` and `hh:mm:ss`, zero-padded |
    | INKT | `ink_name`; `None` when it is `""` |
    | INKL, PHTP | `ink_level`, `head_temp_c` |
    | ECOMOD | `eco` |
@@ -1146,7 +1162,7 @@ The client sees "connection closed without reply". `rng` is `random.Random(seed)
    | SAVEMSG n | stores the design as `slots[n]` with `slot_style[n] = "verbose"`, ends the design, and sets the buffer to a TYPE Save result (§15.4). n not 9 or 10 adds the violation "write outside slots 9 and 10"; n equal to the current slot while printing adds "SAVEMSG to the printing slot". Both are still carried out | n outside 1..10: `3`; no design: `5` |
    | PRINTMSG n | `current_slot = n`; MSCNT goes back to 0 when the slot changes (OPEN). n not 9 or 10 adds the violation | n outside 1..10: `3`; an empty slot: `4` (OPEN) |
    | PRINT v | `printing = (v == 1)` | v not 0 or 1: `3` |
-   | TD | sets `clock_offset_s` so the printer clock shows the fields given with seconds 00 (missing fields keep the printer's current values; HOUR 24 means 0) and keeps DTRH and DTRM in `rollover` | DAY 1..31, MNTH 1..12, YEAR 2000..2050, HOUR 0..24, MIN 0..59, DTRH 0..24, DTRM 0..59 and a real date, else `3` |
+   | TD | sets `clock_offset_s` so that `printer_clock()` shows the fields given with seconds 00 (missing fields keep the printer's current values; HOUR 24 means 0) and keeps DTRH and DTRM in `rollover` | DAY 1..31, MNTH 1..12, YEAR 2000..2050, HOUR 0..24, MIN 0..59, DTRH 0..24, DTRM 0..59 and a real date, else `3` |
 
    A write that was carried out answers `0`, or `0 <value>` for PRINT, PRINTMSG and SAVEMSG when
    `write_echo` is set.
@@ -1168,10 +1184,11 @@ The client sees "connection closed without reply". `rng` is `random.Random(seed)
    fields not sent: FONTIND 1, SIZE 0 (as if 1 was sent), POS "0,0", MARG "0,0", PREF, POSF and TXT "",
    XRID, YRID, SXAS and SYAS 0, DAY, MON and YEAR 0, INDX 1, and OBJID the next automatic number (1, 2,
    …, counting only objects sent without one).
-2. CTDAT's TXT is rendered at each Load from FRMT on the printer clock plus the offsets (years, then
-   months with the day kept within the month's length, then days). `Y` is the 4-digit year, `y` the
-   2-digit year, `M` the 2-digit month, `m` JAN to DEC, `D` the 2-digit day, `H` the 2-digit hour, `U`
-   the minute and `E` the second; any other character is copied. CLOT's TXT is `lots[INDX]`.
+2. CTDAT's TXT is rendered at each Load from FRMT on the printer clock (`printer_clock()`) plus the
+   offsets (years, then months with the day kept within the month's length, then days). `Y` is the
+   4-digit year, `y` the 2-digit year, `M` the 2-digit month, `m` JAN to DEC, `D` the 2-digit day,
+   `H` the 2-digit hour, `U` the minute and `E` the second; any other character is copied. CLOT's
+   TXT is `lots[INDX]`.
 3. BOUND is computed at each render. `x1,y1` is POS, `x2 = x1 + chars × round(CW[font] × size)` and
    `y2 = y1 + round(CH[font] × size)`, where `size` is the size sent (stored + 1), `chars = len(PREF +
    TXT + POSF)`, `CW = {1: 13/3, 2: 3.5, 3: 3.0, 4: 3.5, 5: 4.0, 6: 4.0}` and `CH = {1: 23/3, 2: 9.0,
@@ -1224,7 +1241,9 @@ The client sees "connection closed without reply". `rng` is `random.Random(seed)
     PRNSPD 2500 and ENCST `1` if `placement == "encoder"` else `0`); `current_slot = 1`; `printing =
     True`; slots 2 to 10 empty. So the idle slot is 9 at the start, as on the real printer. Counters:
     PMCNT 100000, MSCNT 0. `ink_name "Example Black"`, `ink_level 1`, `head_temp_c 25`, `eco 0`,
-    `clock_offset_s 0.0`, `encoder = {"ENCST": 1 if placement == "encoder" else 0, "ENWHD": 56,
+    `clock_offset_s 0.0`, `base_offset_s = offset_fn(clock.time())` (so the fake's clock starts at the
+    local time of the same offset function a test gives its `TimeSource`, whatever the host's time
+    zone), `encoder = {"ENCST": 1 if placement == "encoder" else 0, "ENWHD": 56,
     "ENPPR": 5000, "ENTPM": 1}`.
 
 ### 15.5 Web model
@@ -1711,6 +1730,7 @@ exactly 29,482 bytes.
 | | stale kinds | `leave_in_buffer(<the other-client fixture>)`: the load works and nonsense is 1. Two loads in a row: the second's first reply is our own previous result, nonsense 0 |
 | | cap | `web_result_delay_s = float("inf")` with `FakeClock`: `WebReadFailed` after exactly 1 Load and 5 repeats; with `Timings(read_retry_s=1.0)`, after 2 repeats |
 | | deadline | `FakeClock`: `load_slot(9, deadline=clock.monotonic() + 1.0)` raises `WebReadFailed` before any request; with `web_result_delay_s = float("inf")` and `deadline = clock.monotonic() + 3.5`, it stops after the Load and the repeats that fit (none starts later than `deadline - http_timeout_s`) |
+| | gate deadline | another thread holds the client's gate (the test takes `gates.gate(f"{host}:{port}")` on a second thread): `read("PRIN", deadline=clock.monotonic() + 5.3)` waits at most about 0.3 s (5.3 minus `worst_case_s("read")` 5.0, default timings, `SystemClock`) and raises `PrinterBusy` with no request in the fake's `requests`; a gate freed in time lets it through; `command(..., deadline=...)` and `load_slot(0, deadline=...)` behave the same (the latter with `WebReadFailed`) |
 | | fresh | `web_first_reply_fresh = True`: no repeat is sent |
 | | logging in again | after `expire_web_session()` the next load gets 401, logs in and succeeds, `relogins == 1`; after `set_password("other")` it raises `AuthFailed` after one login attempt |
 | | dropped Load | after one `load_slot`, `drop_after_idle_s=3.0` and `clock.advance(5)`: the next `load_slot`'s first Load is dropped, a second Load with the next XID succeeds |
@@ -1821,4 +1841,6 @@ test_hx_time covers SNTP against `FakeSntp`, and test_hx_send covers `compare` a
     that sends nothing.
 31. **`load_slot` takes a deadline** and `worst_case_s` gives every call's worst case, so lock holders
     and the poller can prove a request ends before another PC may judge their lock or `poll.json`
-    stale (architecture §7.3 rule 8).
+    stale (architecture §7.3 rule 8). `query`, `read` and `command` take one too, and with a deadline
+    the wait for this PC's gate is bounded by it (§9 item 2), so the poller never sits behind a local
+    lock holder past its bound and then sends late.

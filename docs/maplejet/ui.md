@@ -331,11 +331,13 @@ class MapleJetTab(ttk.Frame):                       # architecture; §4
 
 ### 1.6 stripes.py and i18n.py
 
-Only what architecture §10 lists. ui.md uses its one allowance (architecture §10.2 rule 1): the header
-subtitle becomes `tr("Zebra labels and MapleJet bag printing")`, with Spanish "Etiquetas Zebra e
-impresión de bolsas MapleJet" added to `i18n.ES`. The old key "Zebra label printing" stays in
-`i18n.ES` (an unused entry is harmless). "MapleJet monitor" → "Monitor MapleJet" is added to `i18n.ES`
-by architecture §10.6; the UI modules use the same pair.
+Only what architecture §10 lists. ui.md uses its one allowance (architecture §10.2 rule 1): the
+header subtitle becomes `tr("Zebra labels and MapleJet bag printing")`, with Spanish "Etiquetas
+Zebra e impresión de bolsas MapleJet" added to `i18n.ES`. Both are specified here and written by
+other packages (README.md "Work packages"): the subtitle in `stripes.py` by WP9, the `i18n.ES` pairs
+in `i18n.py` by WP1; the UI modules' builders (WP7, WP8) edit neither file. The old key "Zebra label
+printing" stays in `i18n.ES` (an unused entry is harmless). "MapleJet monitor" → "Monitor MapleJet"
+is added to `i18n.ES` by architecture §10.6; the UI modules use the same pair.
 
 ## 2. Rules for every MapleJet screen
 
@@ -2346,32 +2348,45 @@ to be confirmed on the test unit. `CalibrationWindow(master, services, *, machin
    thread (pure): `spacing_plan = plan_test(machine_id, film_id, TestRanges(vary="position", start=0.0,
    stop=0.0, step=1.0), data, identity, kind="spacing")` and `head_plan = plan_test(...,
    kind="head_distance")`. The `TestRanges` is a placeholder: send.md §16.2 ignores it for these kinds.
-   A `PlanError` shows its problems under the step and disables its button. The positions shown are the
-   ones that will be sent, read from the plans: `a = spacing_plan.steps[0].position_mm`, `b =
-   spacing_plan.steps[1].position_mm` and `h = head_plan.steps[0].position_mm` (whole mm; the base plan's
-   head distance is 0, so these are the DLYMM values sent). `spacing_text` reads "Stripes prints two
-   marks {mm} mm apart, at {a} mm and {b} mm after the trigger." and `head_text` "Stripes prints one mark
-   {h} mm after the trigger."
+   Both work on a machine that has never been calibrated (`head_distance_mm` None, send.md §15.2 item
+   6). A `PlanError` shows its problems under the step and disables its button. The positions shown are
+   the ones that will be sent, read from the plans: `a = spacing_plan.steps[0].position_mm`, `b =
+   spacing_plan.steps[1].position_mm` and `h = head_plan.steps[0].position_mm` (whole mm in `[0, L)`,
+   each equal to `test_step_plan(plan.base, step).settings.position_mm`, the DLYMM sent; send.md §16.2).
+   `spacing_text` reads "Stripes prints two marks {mm} mm apart, at {a} mm and {b} mm after the
+   trigger." and `head_text` "Stripes prints one mark {h} mm after the trigger." Pressing a print
+   button keeps what that run prints: `spacing_run` = (`spacing_plan`, its `film_id`, `L`, the saved
+   rough `R`) or `head_run` = (`head_plan`, its `film_id`, `L`, `R`, `sent = int(head_plan.steps[0].
+   position_mm)`). When the saved rough distance in `data.current` or `film_box`'s film no longer
+   equals the one kept, the window clears `mark_a_var`, `mark_b_var`, `head_measured_var`,
+   `spacing_result`, `head_result`, `spacing_run` and `head_run`, and the marks must be printed again.
 4. **Distance scale.** `print_spacing_button` "Print the two marks" runs `spacing_plan` in the
-   `TestRunPanel` exactly as in §12.3–§12.5. The admin then measures each mark from the bag's bottom
-   edge, as send.md §16.1 asks: `mark_a_var` ("Mark A from the bag's bottom edge (mm)") and `mark_b_var`
-   ("Mark B (mm)"). `gap = hx_message.spacing_gap_mm(a_measured, b_measured, L)`; `spacing_result` reads
-   "Gap: {gap} mm." then, within `hx_message.SPACING_TOLERANCE_MM` of `spacing_sent_mm` (300), "The gap is
-   within {mm} mm: the wheel size is right." (`Ok.TLabel`); otherwise, with `machine.encoder_wheel_mm`
-   set, "Correct the wheel size on the printer to {wheel} mm, then print the marks again." (`wheel =
-   hx_message.wheel_suggestion_mm(machine.encoder_wheel_mm, spacing_sent_mm, gap)`), or, without it,
-   "The gap is {measured} mm instead of {sent} mm. Correct the wheel size on the printer, then print the
-   marks again." Stripes never changes the wheel size itself (plan).
-5. **Head distance.** `print_head_button` "Print the mark" runs `head_plan` the same way. After the
-   admin types where the mark landed (`head_measured_var`), `head_result` shows "Head distance: {mm} mm"
-   with `mm = hx_message.head_distance_from_print(sent, measured, L, rough)`, where `sent =
-   int(head_plan.steps[0].position_mm)`, the DLYMM Stripes printed (not a value the admin typed), and
-   `rough` = the saved rough distance. A `PlanError` ("The tape measurement is too far ...") shows
-   under the step.
+   `TestRunPanel` exactly as in §12.3–§12.5. `mark_a_var` ("Mark A from the bag's bottom edge (mm)") and
+   `mark_b_var` ("Mark B (mm)") are disabled, with the hint "Print the marks first, then measure them.",
+   until that run's `TestFinished` arrives with `steps_done == 2`. The admin then measures each mark from
+   the bag's bottom edge, as send.md §16.1 asks. `gap = hx_message.spacing_gap_mm(a_measured,
+   b_measured, L)` with the `L` kept in `spacing_run`; `spacing_result` reads "Gap: {gap} mm." then,
+   within `hx_message.SPACING_TOLERANCE_MM` of `spacing_sent_mm` (300), "The gap is within {mm} mm: the
+   wheel size is right." (`Ok.TLabel`); otherwise, when `machine.encoder_wheel_mm` is set and `wheel =
+   hx_message.wheel_suggestion_mm(machine.encoder_wheel_mm, spacing_sent_mm, gap)` isn't None (a whole
+   mm, as ENWHD takes), "Correct the wheel size on the printer to {wheel} mm and set Expected wheel size
+   on this machine's page to {wheel} mm, then print the marks again."; otherwise "The gap is {measured}
+   mm instead of {sent} mm. Correct the wheel size on the printer and set the same value as Expected
+   wheel size on this machine's page, then print the marks again." Stripes never changes the wheel
+   size on the printer itself (plan); the machine record must match it, or the next print fails the
+   machine check (send.md §16.1 item 2).
+5. **Head distance.** `print_head_button` "Print the mark" runs `head_plan` the same way.
+   `head_measured_var` is disabled, with the hint "Print the mark first, then measure it.", until that
+   run's `TestFinished` arrives with `steps_done >= 1`. After the admin types where the mark landed,
+   `head_result` shows "Head distance: {mm} mm" with `mm = hx_message.head_distance_from_print(sent,
+   measured, L, rough)`, where `sent`, `L` and `rough` are those kept in `head_run` (the head print that
+   ran, not the current plan and not a value the admin typed). A `PlanError` ("The tape measurement is
+   too far ...") shows under the step.
 6. **Save calibration** (`save_button`): the machine's `Calibration` from `data.current.calibrations`
-   (the one step 2 saved), with the spacing fields set when a gap was worked out (`spacing_sent_mm`,
-   `spacing_measured_mm = gap`, `spacing_by = identity.user`, `spacing_at = clock.time()`) and the head
-   fields when a head distance was (`head_print_sent_mm = sent`, `head_print_measured_mm`,
+   (the one step 2 saved), with the spacing fields set when `spacing_result` holds a gap from
+   `spacing_run` (`spacing_sent_mm`, `spacing_measured_mm = gap`, `spacing_by = identity.user`,
+   `spacing_at = clock.time()`) and the head fields only while `head_run` is set and `head_result`
+   holds a value (`head_print_sent_mm` = the `sent` of `head_run`, `head_print_measured_mm`,
    `head_distance_mm`, `head_by`, `head_at`); `data.save(cal, expected_revision=cal.revision)`. Storage
    copies the head distance into the machine (storage.md §13.4 step 8). Done: "Saved. The head distance
    of {machine} is now {mm} mm."
@@ -2381,9 +2396,9 @@ to be confirmed on the test unit. `CalibrationWindow(master, services, *, machin
    board, and ends with printing off and both slots empty, like any test print.
 
 Test attributes: `film_box`, `empty_film_var`, `rough_var`, `save_rough_button`, `rough_status`,
-`spacing_plan`, `head_plan`, `spacing_text`, `print_spacing_button`, `mark_a_var`, `mark_b_var`,
-`spacing_result`, `head_text`, `print_head_button`, `head_measured_var`, `head_result`, `save_button`,
-`panel`.
+`spacing_plan`, `head_plan`, `spacing_run`, `head_run`, `spacing_text`, `print_spacing_button`,
+`mark_a_var`, `mark_b_var`, `spacing_result`, `head_text`, `print_head_button`, `head_measured_var`,
+`head_result`, `save_button`, `panel`.
 
 ## 14. Per-user settings
 
@@ -3062,8 +3077,10 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Mark B (mm) | Marca B (mm) |
 | Gap: {gap} mm. | Espacio: {gap} mm. |
 | The gap is within {mm} mm: the wheel size is right. | El espacio está dentro de {mm} mm: el tamaño de la rueda es correcto. |
-| Correct the wheel size on the printer to {wheel} mm, then print the marks again. | Corrija el tamaño de la rueda en la impresora a {wheel} mm y vuelva a imprimir las marcas. |
-| The gap is {measured} mm instead of {sent} mm. Correct the wheel size on the printer, then print the marks again. | El espacio es de {measured} mm en vez de {sent} mm. Corrija el tamaño de la rueda en la impresora y vuelva a imprimir las marcas. |
+| Correct the wheel size on the printer to {wheel} mm and set Expected wheel size on this machine's page to {wheel} mm, then print the marks again. | Corrija el tamaño de la rueda en la impresora a {wheel} mm y ponga {wheel} mm en Tamaño de rueda esperado en la página de esta máquina; luego vuelva a imprimir las marcas. |
+| The gap is {measured} mm instead of {sent} mm. Correct the wheel size on the printer and set the same value as Expected wheel size on this machine's page, then print the marks again. | El espacio es de {measured} mm en vez de {sent} mm. Corrija el tamaño de la rueda en la impresora y ponga el mismo valor en Tamaño de rueda esperado en la página de esta máquina; luego vuelva a imprimir las marcas. |
+| Print the marks first, then measure them. | Primero imprima las marcas y luego mídalas. |
+| Print the mark first, then measure it. | Primero imprima la marca y luego mídala. |
 | 3. Head distance | 3. Distancia del cabezal |
 | Rough head distance by tape measure (mm) | Distancia aproximada del cabezal con cinta métrica (mm) |
 | From the print head back along the film path to where a bag's bottom edge sits when the film stops. It can be longer than one bag. | Desde el cabezal, hacia atrás por el recorrido de la película, hasta donde queda el borde inferior de una bolsa cuando la película se detiene. Puede ser más larga que una bolsa. |
@@ -3100,16 +3117,18 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Quit anyway | Salir de todos modos |
 | Keep Stripes open | Dejar Stripes abierto |
 
-`i18n.ES` additions (stripes.py, §1.6): "Zebra labels and MapleJet bag printing" → "Etiquetas Zebra e
-impresión de bolsas MapleJet"; "MapleJet monitor" → "Monitor MapleJet" (architecture §10.6).
+`i18n.ES` additions (stripes.py, §1.6; specified here, written by WP1 in `i18n.py`): "Zebra labels and
+MapleJet bag printing" → "Etiquetas Zebra e impresión de bolsas MapleJet"; "MapleJet monitor" →
+"Monitor MapleJet" (architecture §10.6).
 
 ## 17. Tests (test_hx_ui.py, test_hx_ui_send.py, test_hx_ui_admin.py)
 
 Under xvfb on Linux and on `windows-latest`, with `unittest`; skipped as a whole when `tk.Tk()` raises
 `TclError`. One withdrawn `tk.Tk()` per test class, destroyed in `tearDownClass` (architecture §9.3).
 
-The tests are in three files, so the UI can be built in two parts at the same time (one owning
-`hx_ui_common`, `hx_ui_monitor` and `hx_ui`, the other `hx_ui_send` and `hx_ui_admin`): `test_hx_ui.py` covers `hx_ui_common`, `hx_ui_monitor` and `hx_ui`; `test_hx_ui_send.py`
+The tests are in three files, so the UI can be built in two parts at the same time (WP7 writing
+`hx_ui_common`, `hx_ui_monitor` and `hx_ui`, WP8 `hx_ui_send` and `hx_ui_admin`; README.md "Work
+packages"): `test_hx_ui.py` covers `hx_ui_common`, `hx_ui_monitor` and `hx_ui`; `test_hx_ui_send.py`
 covers `hx_ui_send`; `test_hx_ui_admin.py` covers `hx_ui_admin`. The "File" column of §17.2 says which
 holds each test. All three use the §17.1 set-up (each file has its own copy of the helper class, so no
 file imports another test file).
@@ -3134,8 +3153,9 @@ file imports another test file).
 
 ### 17.2 Tests
 
-`test_stripes.py` is the integration package's (architecture §9.2): the two tests marked for it need
-`stripes.App` with the architecture §10.3 and §10.4 hooks and every UI module, so they run last.
+`test_stripes.py` is WP9's (README.md "Work packages", architecture §9.2): the two tests marked for
+it need `stripes.App` with the architecture §10.3 and §10.4 hooks and every UI module, so they run
+last.
 
 | Test | File | Checks |
 |---|---|---|
@@ -3152,6 +3172,7 @@ file imports another test file).
 | `test_stop_failure_goes_red` | `test_hx_ui_send.py` | the fake goes silent before Stop: the dialog's `state == "failed"`, full screen, with Try again |
 | `test_resume_dialog_shows_picture` | `test_hx_ui_send.py` | `check_resume` results fill `pictures`/`origins`; a refused machine shows its message; only allowed machines are resumed |
 | `test_result_from_log` | `test_hx_ui_send.py` | after a Send, closing the result window and `nav.open_result(send_id)` refills it from the log with the pending machine; for another identity the buttons are absent and "Only {user} can confirm this Send." shows |
+| `test_result_from_log_no_entry` | `test_hx_ui_send.py` | with the `send` entry removed from the share and the queue, `nav.open_result(send_id)` lists the live machine from its expected state with its `read_preview` picture and the note "This PC can't find the full record of this Send. These are the printers' latest pictures."; the sender's "Everything is right" confirms it; another identity sees no buttons; a second active machine not in the Send whose expected.json has a newer `format_version` doesn't stop it |
 | `test_line_board` | `test_hx_ui.py` | a hand-made board renders one card per line and one row per machine in order; origins in `BagText`; "(origin unknown)" for `""`; machine buttons follow `can_stop`, `can_resume`, `needs_send`, `confirm_pending_by` (same user only) and roles; BLUE rows have no buttons; with a `FakeClock` advanced 3 s, `age_label` reads 3 s more |
 | `test_floor_layout` | `test_hx_ui.py` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2 |
 | `test_floor_board` | `test_hx_ui.py` | rows in board order; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="800x600"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
@@ -3167,7 +3188,7 @@ file imports another test file).
 | `test_origin_rule_ok_matches_validate_film` | `test_hx_ui_admin.py` | for every film/print-text pair of a small world, `origin_rule_ok` is False exactly when `validate_film` reports the origin-rule problem |
 | `test_test_print_window` | `test_hx_ui_admin.py` | estimate text for a 5-step delay range; Start (ask → True) runs the test on the fake; pump until finished; "Printing is off and slots 9 and 10 are empty..."; the fake's slots 9 and 10 are empty and printing is off |
 | `test_calibration_refuses_delay_machine` | `test_hx_ui_admin.py` | `CalibrationWindow` for a delay machine tells "Delay machines aren't calibrated." |
-| `test_calibration_window` | `test_hx_ui_admin.py` | an encoder world (`{"placement": "encoder"}`), film length 610: the print buttons are disabled until "Save rough distance" (400) has been saved and a `DataUpdate` shows it; `spacing_text` names 365 and 55 and `head_text` 515 (from the plans); printing the head mark on the fake records `printed[-1]["position_mm"] == 515`, and with 317 typed, `head_result` reads 412 mm, with `head_distance_from_print` (patched to record its arguments) called with `sent` equal to that DLYMM; marks A 167 and B 467.5 give "Gap: 300.5 mm." and the within-tolerance text; Save writes the `Calibration` and the machine's `head_distance_mm` becomes 412 |
+| `test_calibration_window` | `test_hx_ui_admin.py` | an encoder world (`{"placement": "encoder"}`) whose machine is first written with `head_distance_mm=None` and no `Calibration`, film length 610: both plans are made and both prints run; the print buttons are disabled until "Save rough distance" (400) has been saved and a `DataUpdate` shows it; `spacing_text` names 365 and 55 and `head_text` 515 (from the plans); printing the head mark on the fake records `printed[-1]["position_mm"] == 515`, and with 317 typed, `head_result` reads 412 mm, with `head_distance_from_print` (patched to record its arguments) called with `sent` equal to that DLYMM; marks A 167 and B 467.5 give "Gap: 300.5 mm." and the within-tolerance text; the mark entries are disabled until each run's `TestFinished`; Save writes the `Calibration` with `head_print_sent_mm` 515 and the machine's `head_distance_mm` goes from None to 412; after the head print, saving rough 450 clears `head_measured_var` and `head_result`, 317 can't be entered until the mark is printed again, and then `head_distance_from_print` receives the `sent` of that new run (465); marks A 167 and B 473 give the wheel text with `{wheel}` 57; after the fake's ENWHD is changed without updating the machine's `encoder_wheel_mm`, the next print ends with the encoder-settings failure |
 | `test_test_print_not_stopped` | `test_hx_ui_admin.py` | a `TestFinished` with `printing_off` False turns the test window into the red "Stop it at the printer now" page; its Try again calls `end_again` for an administrator who isn't a sender |
 | `test_action_ids` | `test_hx_ui_send.py` | each of the three dialogs starts its thread as `hx-action-<action_id>` with the id it passed to `PrinterActions`, and ignores an `ActionEvent` with another id |
 | `test_offline_send_recorded` | `test_hx_ui.py` | a Send with the share down (`no_lock`): `nav.offline_sends` holds its id; after `ShareHealth(ok=True)` `record_offline` runs once (patched pipeline) and the id is dropped |
@@ -3183,7 +3204,7 @@ file imports another test file).
 
 | Item | Interface here | Safe default built now |
 |---|---|---|
-| Encoder calibration procedure (plan; architecture §11) | `CalibrationWindow`, `plan_test(kind="spacing" / "head_distance")` | As §13, following send.md §16: the rough distance saved first, two marks 300 mm apart measured from the bag's edge (A and B), one mark at the position send.md chooses, the head distance from `head_distance_from_print` with the DLYMM actually sent; an encoder machine without a head distance can't be sent to |
+| Encoder calibration procedure (plan; architecture §11) | `CalibrationWindow`, `plan_test(kind="spacing" / "head_distance")` | As §13, following send.md §16: the rough distance saved first, two marks 300 mm apart measured from the bag's edge (A and B), one mark at the position send.md chooses, the head distance from `head_distance_from_print` with the DLYMM, film length and rough distance of the run that printed the mark; the wheel size suggested in whole mm, to be set on the printer and on the machine record; an encoder machine without a head distance can't be sent to, but can be calibrated |
 | Which counter counts bags | Company page radio (`bag_counter`); test-print estimate text | `PMCNT`; "none" shows timed steps (`seconds_per_bag × bags_per_step`) |
 | Print speed units and range | Machines page "Print speed (cm/min)" | cm/min, 1–2500, no default (empty blocks sending) |
 | Beacon | none | no UI at all (`BEACON_SUPPORTED = False`) |

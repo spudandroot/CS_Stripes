@@ -94,7 +94,7 @@ outside the UI modules (see §5.2).
 | 2 | `hx_state` | Machine state machine, line aggregation, alerts, views, floor-board rows, which alerts sound here. Pure | states.md | `hx_core`, `hx_model`, `hx_message` |
 | 2 | `hx_win` | Every Windows call through ctypes or `winsound`, each with a non-Windows fallback: identity and group SIDs, swap-safe file open, monitors, alert sound | architecture.md (§6.3) | `hx_core`, `hx_model` |
 | 3 | `hx_protocol` | `PrinterClient`, `ClientPool`, request gate, token, scrambling, SME parser, query catalogue, write whitelist | protocol.md | `hx_core`, `hx_model` |
-| 3 | `hx_time` | SNTP client, `TimeSource`, local time conversion, `DstWatcher` | send.md | `hx_core`, `hx_model` |
+| 3 | `hx_time` | SNTP client, `TimeSource`, local time conversion, `recent_dst_change` | send.md | `hx_core`, `hx_model` |
 | 3 | `hx_share` | Paths, `ShareStore`, `FileOps`, `PrinterLock`, `Heartbeat`, `CounterWatch`, assignment formula, `LocalStore`, `DataService`, logs and queue | storage.md | `hx_core`, `hx_model`, `hx_win` |
 | 4 | `hx_send` | `SendPipeline`, `PrinterActions` (Stop, Resume, Set clocks), `TestPrintRun` | send.md | layers 0–3 except `hx_state` |
 | 4 | `hx_poller` | `Poller` (coordinator plus per-printer workers, heartbeat, assignment), `StatusWatcher` | states.md | layers 0–3 (incl. `hx_state`) |
@@ -125,8 +125,14 @@ Other files:
 | `docs/maplejet/*.md` | This spec | each author |
 | `testdata/hx/` | Sanitized captures used as parser fixtures (UID 1109, host 192.0.2.10, tokens removed) | protocol.md |
 | `assets/alert.wav` | The alert sound, bundled with the existing `assets` folder | ui.md (deploy.md checks it's bundled) |
-| `i18n.py` | One new function, `add_spanish` (§10.6), and the Spanish for the few new `stripes.py` texts | architecture.md |
-| `test_hx_*.py` | Tests, one file per module (the five UI modules share three files, ui.md §17) plus `test_hx_sim.py` (§9) | each module's owner |
+| `i18n.py` | One new function, `add_spanish` (§10.6), and the Spanish for the few new `stripes.py` texts (this file's, ui.md §1.6's and deploy.md §1.5's) | architecture.md (written by WP1) |
+| `test_hx_*.py` | Tests, one file per module (the five UI modules share three files, ui.md §17) plus `test_hx_sim.py` (§9; written by WP6) | each module's owner |
+| `test_stripes.py`, `test_i18n.py` | Changed (§9.2) | `test_stripes.py`: architecture.md, with ui.md §17.2's two tests (written by WP9); `test_i18n.py`: architecture.md (written by WP1) |
+
+The spec files say what each file must do; the work packages in README.md "Work packages" say which
+agent writes it. Each file has one writer package, so `stripes.py` is written only by WP9 and
+`i18n.py` only by WP1, whichever spec file describes a change to them. The packages change no name or
+boundary here.
 
 ## 4. hx_core (complete specification)
 
@@ -367,11 +373,35 @@ problems=problems)`.
 def to_json(obj) -> dict: ...                 # any dataclass here, recursively; tuples become lists; Msg via Msg.to_json
 def from_json(cls: type, d: dict): ...        # builds cls from a dict, recursively by type hints;
                                               # unknown keys are ignored, missing keys take defaults;
-                                              # raises ValueError for a wrong type or a missing required field
+                                              # raises ValueError for a wrong type (the rules below)
+                                              # or a missing required field
 def new_id(prefix: str) -> str: ...           # f"{prefix}_{secrets.token_hex(5)}", e.g. "fm_3f9a1c22b0"
 def adjustment_id(machine_id: str, film_id: str) -> str: ...   # f"{machine_id}__{film_id}"
 def same_user(a: str, b: str) -> bool: ...    # Windows names compare case-insensitively
 ```
+
+`from_json` type rules (every module's files and tests rely on them, so they are fixed here):
+
+1. An int is accepted for a `float` field and converted to float (JSON writes `610` for `610.0`, and
+   records written by hand or by `FakeWorld` hold ints).
+2. A bool is rejected for `int` and `float` fields (`True` isn't 1 here); an `int` field accepts only
+   an int (not a float, not a string).
+3. A `str` field accepts only a str.
+4. A JSON list is accepted for a `tuple[...]` hint and converted to a tuple, each element checked by
+   its hint (a bare `tuple` hint, as in `Timings`, converts without checks). `to_json` writes tuples
+   as lists, so the `(font, size)` pairs of `TestStep.fonts` and the `(tag, text)` pairs of
+   `DesignItem.pairs` come back as tuples inside their lists. `list[X]` elements and `dict[str, X]`
+   values are checked by `X`. JSON object keys are always strings, and `dict[str, X]` keeps them as
+   strings.
+5. None is accepted only for `X | None` hints (and for a missing field with a default of None).
+6. A dict becomes a nested dataclass by its hint (recursively, with these rules); a `Msg` hint uses
+   `Msg.from_json`.
+7. Fields typed plain `dict` or `list` (no element type) keep any JSON value as it is.
+8. Anything else raises `ValueError` naming the class and the field.
+
+`test_hx_model.py` checks each rule, including `from_json(Film, {..., "length_mm": 610})` giving
+`610.0`, `from_json(Film, {..., "length_mm": True})` raising, and `TestStep.fonts` and
+`DesignItem.pairs` round-tripping with tuple elements.
 
 ID prefixes: `ln` line, `mc` machine, `pr` printer, `pd` product, `fm` film, `pt` print text, `sd` a
 Send, `tp` a test print or calibration run, `ac` a Stop, Resume or Set clocks action. The company
@@ -1316,15 +1346,19 @@ class PrinterClient:
     host: str; port: int; uid: int
     nonsense: int                # replies thrown away so far (BadReply, mixed-up web replies)
     last_request_at: float | None    # clock.monotonic() of the last request
-    def query(self, tag: str) -> str: ...
+    def query(self, tag: str, *, deadline: float | None = None) -> str: ...
         # one Autopilot query; the reply text, stripped. Re-asked once after read_retry_s on
         # NoReply or PrinterBusy. Raises ForbiddenCommand for FORBIDDEN_QUERY_TAGS.
-    def read(self, tag: str) -> int | str | None: ...
-        # query + QUERY_SPECS check; a failed check is thrown away and asked once more; then BadReply
+        # deadline (clock.monotonic()): the gate wait is bounded by it, and a gate acquired later than
+        # deadline - worst_case_s(call) is released at once with PrinterBusy, nothing sent (protocol.md §9)
+    def read(self, tag: str, *, deadline: float | None = None) -> int | str | None: ...
+        # query + QUERY_SPECS check; a failed check is thrown away and asked once more; then BadReply;
+        # deadline as query
     def read_twice(self, tag: str) -> int | str | None: ...
         # two reads second_reading_s apart that must agree (BadReply otherwise)
-    def command(self, cmd: Command) -> None: ...
-        # one write, never repeated. Raises ForbiddenCommand unless cmd.tag in ALLOWED_WRITE_TAGS.
+    def command(self, cmd: Command, *, deadline: float | None = None) -> None: ...
+        # deadline as query; one write, never repeated.
+        # Raises ForbiddenCommand unless cmd.tag in ALLOWED_WRITE_TAGS.
         # After idle_warmup_s of quiet, sends a warm-up read (HXUI, checked) first. "0" -> returns;
         # another code -> CommandRefused; no reply -> NoReply (the write may or may not have happened)
     def check_uid(self) -> None: ...                # raises WrongPrinter
@@ -1384,9 +1418,11 @@ class TimeSource:
         # never queries and never blocks: the cached server offset (send.md §9.2), else the PC's time
     offset_fn: Callable[[float], float]   # the offset function given; the poller's DST rules use it
 
-class DstWatcher:
-    def __init__(self, *, clock: Clock = SYSTEM_CLOCK, offset_fn=local_utc_offset) -> None: ...
-    def changed(self) -> bool: ...   # True once, on the first call after this PC's UTC offset changed
+def recent_dst_change(utc: float, *, within_s: float = 86_400.0,
+                      offset_fn=local_utc_offset) -> tuple[float, float, float] | None
+    # (old offset, new offset, the UTC second of the change) when the offset changed within within_s
+    # (send.md §9.3 item 5); the poller's daylight-saving clock set uses it (states.md §6.11). There is
+    # no DstWatcher class: a change is found from the time alone, so a PC started after it still sees it
 ```
 
 Thread notes: `TimeSource` is thread-safe (a lock around its cache); `now()` can block for up to
@@ -1444,6 +1480,9 @@ class ShareStore:
     last_reached: float | None   # clock.time() of the last successful operation
     watch: CounterWatch          # shared by everything reading status files through this store
     local_locks: dict[str, str]  # printer_id -> run_id of in-process locks (§7.2)
+    def local_lock_info(self, printer_id: str) -> LockInfo | None: ...
+        # a copy of the LockInfo registered with local_locks (with the latest update() note), or None;
+        # no share access (storage.md §11.2 step 2); the standalone status watcher shows it as blue
     # generic
     def read_json(self, rel: str) -> dict | None: ...       # None if missing; FormatTooNew; ShareUnavailable
     def write_json(self, rel: str, data: dict) -> None: ...
@@ -1626,7 +1665,10 @@ class FakePrinter:
                  fonts: tuple = STANDARD_FONTS, firmware: str = "69.75.10", clock: Clock = SYSTEM_CLOCK,
                  latency_s: float = 0.0, mixup: bool = False, busy_on_overlap: bool = True,
                  drop_after_idle_s: float | None = None, editor_page_bytes: int = 2_300_000,
-                 editor_stall_s: float = 5.0, seed: int = 0) -> None: ...
+                 editor_stall_s: float = 5.0, seed: int = 0,
+                 offset_fn: Callable[[float], float] = local_utc_offset) -> None: ...
+        # offset_fn (hx_time's by default) fixes the printer clock's offset at construction; the clock
+        # never follows daylight saving or the host's zone (protocol.md §1.2, §15.3)
     host: str                    # "127.0.0.1"
     port: int                    # chosen at start()
     def start(self) -> "FakePrinter": ...
@@ -1640,7 +1682,7 @@ class FakePrinter:
     current_slot: int
     counters: dict[str, int]     # "PMCNT", "MSCNT"
     ink_name: str; ink_level: int; head_temp_c: int
-    clock_offset_s: float        # printer clock minus real time
+    clock_offset_s: float        # printer clock minus (real time + base_offset_s); TD sets it
     encoder: dict                # {"ENCST": 1, "ENWHD": 56, "ENPPR": 5000, "ENTPM": 1}
     # control
     def print_bags(self, n: int) -> None: ...      # as if the bagger triggered n prints (only while printing)
@@ -1849,7 +1891,9 @@ Rules:
 2. Waiting for a gate is bounded by `gate_wait_s`; a timeout raises `PrinterBusy`.
 3. `ShareStore.local_locks` records every `PrinterLock` this process holds, including `local_only`
    ones when the share is down. The in-process poller checks it before every request, so a Send or
-   test on this PC is never interleaved with this PC's polling, share or no share.
+   test on this PC is never interleaved with this PC's polling, share or no share. A poller request
+   already waiting for the gate when the lock is taken may still go out first, within its deadline
+   (protocol.md §9 item 2); the holder's own requests then wait for it at the gate.
 4. A test asserts `FakePrinter.max_in_flight == 1` with many threads using one `ClientPool`.
 
 ### 7.3 One request at a time: across PCs
@@ -1864,7 +1908,10 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
 2. **Handover.** A poller that is polling a printer but is no longer rank 0, while rank 0 is live,
    finishes its current request, writes `yielded_to = <rank 0 key>` and stops. Rank 0 starts only when
    `poll.json` names itself as writer, names it in `yielded_to`, is missing, or has been stale for
-   `stale_s`. A cleanly stopping poller yields each printer to its next-ranked live poller.
+   `stale_s`. A cleanly stopping poller yields each printer to its next-ranked live poller. Rank 0 and
+   rank 1 can start in the same moment (both wait 15 s), so every start re-checks its rank from fresh
+   heartbeats after the settle and before its first request, and a non-rank-0 starter yields there
+   (storage.md §12.6 rule 3, states.md §6.3 step 2).
    The invariant behind rules 1 and 2: **no PC starts polling a printer whose `poll.json` is fresh and
    written by another PC, unless that writer has yielded to it.** So two pollers never overlap, even
    while PCs briefly disagree about who is live.
@@ -1897,7 +1944,9 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
    running when another PC may judge its lock stale: `PrinterLock.check(budget_s)` before every call,
    with the call's worst case from `hx_protocol.worst_case_s` (storage.md §11.3, protocol.md §8.3).
    The same applies to the poller and its own `poll.json`: it never starts a request that could still
-   be running `stale_s / 2` after its last successful `poll.json` write (states.md §6.4).
+   be running `stale_s / 2 + http_timeout_s` (9.5 s) after the start of its last successful `poll.json`
+   write (states.md §6.4 step 7), and every poller request carries that time as its deadline, so it
+   never waits for this PC's gate past it either (protocol.md §9 item 2).
 
 Sequence of a Send's first request to a printer:
 
@@ -1990,11 +2039,11 @@ and logic tests use `FakeClock`.
 | File | Covers |
 |---|---|
 | `test_hx_core.py` | `FakeClock` both modes, `CancelToken`, `EventBus` order, subscriber errors, unsubscribe during pump |
-| `test_hx_model.py` | `to_json`/`from_json` round trip of every dataclass, unknown keys ignored, bad types rejected, `Identity.key` and roles, `Timings.scaled` |
+| `test_hx_model.py` | `to_json`/`from_json` round trip of every dataclass, unknown keys ignored, the §5.3 type rules one by one (an int for a float field, a bool refused, lists back to tuples, None only for optional fields), `Identity.key` and roles, `Timings.scaled` |
 | `test_hx_message.py` | Origin phrase and origin-word refusal (case, punctuation, aliases); validation; `merge_plan`; print position incl. the wrap example (610, 150, 412 → 348) and the film-stop warning; delay in µs; message name length and check letter; golden `build_commands` output for encoder and delay machines; `compare` (size one lower, defaults Autopilot can't set, date text ignored); fingerprint stability; test steps and labels; head distance |
 | `test_hx_state.py` | The state table from states.md row by row; second readings; line worst colour; NOT MONITORED after 30 s; alert recipients and acks; floor-board rows; which alerts sound for whom |
 | `test_hx_protocol.py` | Parser on every fixture (CRLF, the 0xFF byte); login and re-login after 401; repeat until its own TN/XID, stale buffer from another client and from SAVEMSG; give-up after 5 repeats or 3 s; idle drop retried for reads; warm-up read before a write; a write never retried; whitelist and forbidden queries raise `ForbiddenCommand`; error codes never pass as values; `max_in_flight == 1` with 8 threads; the editor page is never requested; token scramble round trip and wrong key |
-| `test_hx_time.py` | SNTP against `FakeSntp`; fallback to PC time; cache; `DstWatcher` with an injected offset function; the TD command |
+| `test_hx_time.py` | SNTP against `FakeSntp`; fallback to PC time; cache; `recent_dst_change` with an injected offset function; the TD command |
 | `test_hx_share.py` | Whole-file write and swap; add-only logs with the completion marker, readers skip unfinished files; lock create, refuse, refresh, stale takeover after 60 s (`FakeClock`), lost lock; heartbeats and the live set; `assign` stable, balanced and in takeover order; local copy and the 24-hour rule; the send-log queue and upload markers; share timeout with `FlakyFileOps(down=True)`; `FormatTooNew` |
 | `test_hx_share_windows.py` | `skipUnless(sys.platform == "win32")`: a reader holding a file open during a swap; add-only folders; `open_for_read` |
 | `test_hx_send.py` | Full Send on a delay and an encoder fake: commands, three read-backs, expected states, log; failure injected at every step → the result and expected state in §8; Try again; Leave it; confirm by someone else refused; Stop, Resume (refused after a rejection or a changed message), Set clocks; test print with counted and timed steps, the 60 s no-print stop, the end procedure; calibration; `writes ⊆ ALLOWED_WRITE_TAGS`; never SAVEMSG to the printing slot while printing; never `SETPPARAM` |
@@ -2026,7 +2075,8 @@ and logic tests use `FakeClock`.
 
 This is the complete list of changes to `stripes.py` and `i18n.py`, including the three key hooks
 deploy.md §1.3 specifies (§10.6 item 5). ui.md describes what appears inside the MapleJet tab; it
-doesn't add hooks.
+doesn't add hooks. Every `stripes.py` change here is written by WP9 and every `i18n.py` change by WP1
+(README.md "Work packages").
 
 ### 10.1 Start-up order in `App.__init__`
 
@@ -2093,7 +2143,7 @@ def _zebra_shortcut(self, event, action):
 | MapleJet per-user settings | none | `%APPDATA%\Stripes\v2\maplejet.json` | via `STRIPES_V2_ROAMING` |
 | Zebra config cache | `%LOCALAPPDATA%\Stripes\config-cache` | `%LOCALAPPDATA%\Stripes\v2\config-cache` | `STRIPES_CACHE` |
 | Single-instance file | `%LOCALAPPDATA%\Stripes\instance.txt` | `%LOCALAPPDATA%\Stripes\v2\instance.txt` (follows `cache_folder()`) | via `STRIPES_CACHE` |
-| Local copy, previews, poller memory | none | `%LOCALAPPDATA%\Stripes\v2\hx\` | `STRIPES_V2_LOCAL` |
+| Local copy, previews, reach memory | none | `%LOCALAPPDATA%\Stripes\v2\hx\` | `STRIPES_V2_LOCAL` |
 | Send-log queue (all the PC's users) | none | `%PROGRAMDATA%\Stripes\v2\send-queue\` | `STRIPES_V2_MACHINE` |
 
 `hx_share.roaming_dir()` is `STRIPES_V2_ROAMING` or `%APPDATA%\Stripes\v2` (`~/.config/Stripes/v2`
@@ -2153,7 +2203,7 @@ Changes in `stripes.py`:
 
 | Item | Interface | Safe default built now |
 |---|---|---|
-| Encoder calibration (head distance; a print only shows it within one bag) | `Calibration` record, `CalibrationWindow`, `TestPrintRun(kind="spacing" / "head_distance")`, `head_distance_from_print(sent, measured, length, rough)` picking the multiple of the film length nearest the tape measurement | An encoder machine with `head_distance_mm is None` can't be sent to (`PlanError` "Machine not calibrated"); the spacing check only reports the measured gap, and the wheel size is corrected on the printer, never by Stripes |
+| Encoder calibration (head distance; a print only shows it within one bag) | `Calibration` record, `CalibrationWindow`, `TestPrintRun(kind="spacing" / "head_distance")`, `head_distance_from_print(sent, measured, length, rough)` picking the multiple of the film length nearest the tape measurement | An encoder machine with `head_distance_mm is None` can't be sent to (`PlanError` "Machine not calibrated") but can be calibrated (send.md §15.2 item 6); the spacing check only reports the measured gap and a whole-mm wheel size, which is corrected on the printer (never by Stripes) and on the machine record; the head distance is worked out from the run that printed the mark (ui.md §13) |
 | Which counter counts bags | `Company.bag_counter` = `"PMCNT"`, `"MSCNT"` or `"none"`; `PollStatus.bag_count` | `"PMCNT"`; `"none"` makes test steps timed (`Machine.seconds_per_bag × bags_per_step`, with the 60 s no-print stop replaced by the whole test time plus a margin) |
 | Speed units and range | `Machine.print_speed` sent as PRNSPD | cm/min; no default value (an administrator must enter it); accepted range 1–2500; a refused value fails the build step and the read-back check |
 | Beacon | none: `BEACON_SUPPORTED = False` | Never queried or switched; a future command would have to be added to `ALLOWED_WRITE_TAGS` deliberately |
@@ -2240,7 +2290,8 @@ Changes in `stripes.py`:
 32. **Two small web GETs** (`/sfl.xml`, `/idn.xml`) are the only additions to the web requests (§6.4),
     because the plan requires the font list and no Autopilot query returns it. Listed in §12.1.
 33. **Time-bounded holding.** Lock holders pass each call's worst case to `PrinterLock.check`, and
-    `load_slot` takes a deadline, so no request can outlive a lock or a `poll.json` that another PC is
+    `load_slot`, `fonts`, `firmware`, `query`, `read` and `command` take a deadline that also bounds
+    the wait for this PC's gate, so no request can outlive a lock or a `poll.json` that another PC is
     about to judge stale (§7.3 rule 8). The poller never waits on the time server (`TimeSource.cached()`
     and the `hx-time` thread).
 34. **The UI makes the `action_id`** of a Stop, Resume or Set clocks and passes it in, so its thread

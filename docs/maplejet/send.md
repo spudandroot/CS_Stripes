@@ -127,7 +127,8 @@ def resume_mismatch(expected: ExpectedState, design: MessageDesign, machine: Mac
 def result_colour(confirmed: bool, notes: list[str]) -> str                # §14: GREEN, or AMBER with notes
 def test_bag_estimate(plan: TestPlan) -> int                               # §15.2
 def spacing_gap_mm(first_mm: float, second_mm: float, film_length_mm: float) -> float   # §16
-def wheel_suggestion_mm(wheel_mm: float, sent_gap_mm: float, measured_gap_mm: float) -> float
+def wheel_suggestion_mm(wheel_mm: float, sent_gap_mm: float, measured_gap_mm: float) -> int | None
+    # §16.3: whole mm (ENWHD is an int 20..150); None when the result is outside 20..150
 ```
 
 ### 1.2 hx_time
@@ -148,11 +149,10 @@ class TimeSource:                                 # additions to architecture §
     def now_from(self, reading: TimeReading) -> TimeReading: ...
         # the same source, server and offset_s, at clock.time() now; no request
     def cached(self) -> TimeReading: ...          # architecture §6.5; §9.2 item 8
-
-class DstWatcher:                                 # additions
-    offset_s: float                               # this PC's UTC offset at the last call
-    previous_s: float | None                      # the offset before the last change, None until one
 ```
+
+There is no `DstWatcher`: a daylight-saving change is found from the time alone with
+`recent_dst_change` (§9.3), so a process started after a change still sees it (architecture §6.5).
 
 ### 1.3 hx_send
 
@@ -1020,14 +1020,10 @@ relates the answer to its injected clock.
    (Eastern with daylight saving at the plant). Python 3.12 provides `tm_gmtoff` on Windows too.
 2. `to_local(utc, *, offset_fn)` is `datetime(1970, 1, 1) + timedelta(seconds=utc + offset_fn(utc))`,
    naive. Tests pass an `offset_fn` instead of changing the PC's time zone.
-3. `DstWatcher(clock=, offset_fn=)` records `offset_s = offset_fn(clock.time())` and `previous_s = None`.
-   Each `changed()` computes the offset now; when it differs from `offset_s`, it sets `previous_s =
-   offset_s`, `offset_s = <new>` and returns True; otherwise False. So it is True exactly once per
-   change, on the first call after it. A process started after a change never reports it; for that case
-   `recent_dst_change` (item 5) exists.
-4. With an offset function that returns −14,400 (EDT) before 1 Nov 2026 06:00 UTC and −18,000 (EST)
-   after, a watcher called every 5 s returns True once, on the first call at or after 06:00:00 UTC, with
-   `previous_s == -14400.0` and `offset_s == -18000.0`.
+3. There is no watcher class. A change is found from the time alone, with `recent_dst_change` (item
+   5), so a process started after the change sees it as well as one that was running at the time.
+4. The test offset function returns −14,400 (EDT) before 1 Nov 2026 06:00 UTC and −18,000 (EST)
+   after it.
 5. `recent_dst_change(utc, *, within_s=86_400.0, offset_fn=local_utc_offset) -> tuple[float, float,
    float] | None`: with `old = offset_fn(utc - within_s)` and `new = offset_fn(utc)`, None when they are
    equal. Otherwise it finds the change by bisection: `lo, hi = utc - within_s, utc`; while `hi - lo >
@@ -1068,7 +1064,9 @@ mapping in `clock_command` change. If it accepts them but treats them differentl
 
 The same procedure serves a Send's clock step and Set clocks; states.md §6.11 runs the same steps for
 the daylight-saving clock set inside `hx_poller` (which can't import `hx_send`), with the same
-functions and tolerance. `reading` is a `TimeReading` from `TimeSource.now(fresh=True)`.
+functions and tolerance. For a Send and Set clocks, `reading` is a `TimeReading` from
+`TimeSource.now(fresh=True)`; the poller uses `TimeSource.cached()` instead (states.md §6.11 item 3),
+because a poller worker never waits on the time server.
 
 1. Set clocks and the daylight-saving set only: read DATE and TIME first (`client.read`) and keep them
    as "before" for the log. A Send skips this (the poll status already shows the clock offset).
@@ -1437,14 +1435,18 @@ Blocking; worker thread.
    add-only file (queued on this PC if the share is down). In the fallback its `machines` come from
    the expected states (their `message_name` and `fingerprint`).
 5. For each machine, one at a time: `with store.lock(printer_id, purpose="send", run_id=send_id,
-   line_id=..., machine_id=...)` (no poller handshake: no printer request is made), read the expected
-   state, and only if `send_id` still matches, `mode == "running"`, it isn't confirmed or rejected and
-   has no failure, write the row "Confirmed" or "Rejected" of §14. Otherwise leave it: a later Send,
-   Stop or test has replaced it (architecture decision 24). `LockHeld` (someone is working on that
-   printer now) or a `local_only` lock or a share error: the machine isn't updated.
+   line_id=..., machine_id=...)` (the line from the entry's machine; in the fallback,
+   `data.current.machines[machine_id].line_id`), with no poller handshake (no printer request is
+   made), read the expected state, and only if `send_id` still matches, `mode == "running"`, it
+   isn't confirmed or rejected and has no failure, write the row "Confirmed" or "Rejected" of §14.
+   Otherwise leave it: a later Send, Stop or test has replaced it (architecture decision 24).
+   `LockHeld` (someone is working on that printer now) or a `local_only` lock or a share error: the
+   machine isn't updated.
 6. For each line whose `LineStatus.send_id == send_id`: set the machines' colours, and `confirmed =
    True`, `confirmed_by = identity.user` when the answer was "Everything is right" and every machine of
-   that line in the Send that went live is now confirmed. A line without such a status (the fallback)
+   that line in the Send that went live is now confirmed. In the fallback, the machines of a line that
+   went live are those in its `LineStatus.machines` whose colour isn't RED (§10.11 writes the line
+   status before the `send` entry, so a crash between them leaves one); a line without such a status
    is skipped.
 7. If any machine wasn't updated because of step 5's lock or share cases, raise
    `ShareError(Msg(N_("Your answer was logged, but Stripes couldn't update the monitor for
@@ -1456,11 +1458,17 @@ Blocking; worker thread.
 ### 11.3 pending_confirmation(send_id)
 
 Blocking. The candidates are the machines of `data.find_send(send_id)` that went live; when there is
-no entry (§11.2 step 1), every active machine of `data.current`. For each candidate:
+no entry (§11.2 step 1), the machines named by this Send's `send_switch` entries (§17.3:
+`store.list_logs("hx-sends", since=<now − 400 days>, entry_type="send_switch", ref=send_id)`, each
+read with `read_log`), or, when there are none (they may still be queued on the sending PC), every
+active machine of `data.current`. For each candidate:
 `store.read_expected(machine_id)`; the machine is pending when `send_id` matches, `mode == "running"`,
-it isn't confirmed or rejected and has no failure. Share errors are raised. So a Send whose PC crashed
-after its machines went live (states.md §3.6, `interrupted_new`) can still be confirmed by its sender
-from the monitor card.
+it isn't confirmed or rejected and has no failure. With an entry, share errors are raised. In the
+fallback, a candidate whose read returns None or raises a `ShareError` other than `ShareUnavailable`
+(`FormatTooNew` from a machine whose file a newer Stripes wrote, storage.md's `ShareDenied`) is not
+pending and is skipped, so an unrelated machine can't stop the confirmation; only `ShareUnavailable` is
+raised. So a Send whose PC crashed after its machines went live (states.md §3.6, `interrupted_new`) can
+still be confirmed by its sender from the monitor card.
 
 ## 12. When a step fails
 
@@ -1518,8 +1526,9 @@ the red card shows what's really printing.
 ### 12.5 A PC that crashes mid-Send
 
 Its locks go stale after 60 s and the poller checks what's running (states.md). What the pipeline
-leaves for it: the expected state's "switch pending" row (written before PRINTMSG, with the new and the
-previous message names and the previous fingerprint), and the `send_switch` log entry. Before that row
+leaves for it: the expected state's "switch pending" row (written before PRINTMSG, with the new
+message's name, slot and fingerprint (§10.8's idle-slot read-back) and the previous message's name and
+fingerprint), and the `send_switch` log entry. Before that row
 is written, only the idle slot and the clock have changed, and the printer is still printing its
 previous message.
 
@@ -1551,8 +1560,10 @@ and ends (`ok`, `failed` or `warning`), then `ActionFinished`.
    filled in: `nav.open_send(prefill=request)` with the plan's request, or `request_from_log(entry)`
    when the window was reopened from the log. The Send window gives the prefill a new `send_id`.
 5. Closing instead leaves the line red as "Stopped, needs a Send", and the line's notify user is
-   alerted: states.md C7b raises the `send_rejected` alert from `E.rejected` alone, in every mode, so
-   the alert that started at "Something's wrong" simply continues (states.md §15 decision 13).
+   alerted: states.md C7b raises the `send_rejected` alert from `E.rejected` in every mode while E has
+   no failure, so the alert that started at "Something's wrong" simply continues (states.md §15
+   decision 13). A later Send that fails before the switch clears `rejected` (§14), so it raises only
+   `send_failed`.
 6. A machine that couldn't be stopped is red with "Stripes couldn't stop printing on {machine}. Stop it
    at the printer with its Print On/Off button now.", and the window offers Try again, which calls
    `stop` again for those machines.
@@ -1654,7 +1665,7 @@ or when the share fails, nothing is written. Fields not named in a row keep thei
 
 | Row | When | Fields set |
 |---|---|---|
-| Failed before the switch | Send: a failure in wait_poller, check_machine, set_clock, build, verify_idle, or in switch before PRINTMSG | `send_id` = this Send; `sender` = this Send's sender; `result` RED; `failure = FailureInfo(step, msg, after_switch=False, at)`; `notes` = this Send's notes |
+| Failed before the switch | Send: a failure in wait_poller, check_machine, set_clock, build, verify_idle, or in switch before PRINTMSG | `send_id` = this Send; `sender` = this Send's sender; `result` RED; `failure = FailureInfo(step, msg, after_switch=False, at)`; `notes` = this Send's notes; `rejected` False (an earlier rejection stays blocked through `resume_blocked`, which is kept, and through this `failure`) |
 | Switch pending | Send, §10.9 step 2 | `mode "switch_pending"`; `printing_expected` True; `send_id`; `sender` = this Send's sender (`identity.user`); `message_name`, `content_code`, `slot` and `origin_line` of the new message; `fingerprint = hx_message.fingerprint(d)` of §10.8's idle-slot read-back (it leaves out the slot and the date text, so it equals the fingerprint of the running reads that follow); `previous_message_name` and `previous_fingerprint` from the slot 0 read of §10.5; `result ""`; `failure` None; `notes`; `confirmed` False, `confirmed_by ""`, `confirmed_at` None; `rejected` False; `resume_blocked` False; `left_by ""`, `left_at` None; `test` None; `stop_reason ""`, `stopped_by ""`, `stopped_at` None |
 | Failed after the switch | Send: a failure in switch after PRINTMSG was sent, confirm_1 or confirm_2 | `mode` stays `"switch_pending"`; `result` RED; `failure = FailureInfo(step, msg, after_switch=True, at)` |
 | Live, not yet confirmed | Send, §10.10 | `mode "running"`; `fingerprint` of the confirm_2 read-back; `result` AMBER; `failure` None; `previous_message_name ""`, `previous_fingerprint ""` |
@@ -1758,7 +1769,10 @@ afterwards: a normal admin edit, and the film's status doesn't change.
    `ranges.resolution` isn't, joined with `" | "`: `P150 | B1`, `D480 | B1`, `P152.5`.
 6. `base`: a `MachinePlan` of the machine and film with no product, print text or adjustment (the
    machine + film adjustment is ignored in a test), `settings` as §6.1, `position =
-   explain_position(machine, film, None, override=v0, test=True)`, `origin_line ""`.
+   explain_position(machine, film, None, override=v0, test=True)`, `origin_line ""`. For kinds
+   `spacing` and `head_distance`, use the §16.2 machine copy (`head_distance_mm = 0.0`) both as
+   `base.machine` and in this `explain_position` call, with `v0` = the first step's position, so a
+   machine that has never been calibrated (`head_distance_mm` None) can be calibrated.
 7. `TestPlan(run_id=new_id("tp"), kind, base, steps, bags_per_step=5, timed=(company.bag_counter ==
    "none"))`.
 
@@ -1892,9 +1906,12 @@ one bag length:
    (300 mm) apart in print position. The admin measures each mark's distance from the bag's bottom edge
    (A, then B); `spacing_gap_mm(a, b, length)` is the measured gap. If it differs from 300 mm by more
    than `SPACING_TOLERANCE_MM`, the installer corrects the wheel size on the printer: the window
-   suggests `wheel_suggestion_mm(<current wheel>, 300, gap)`. Stripes never changes it (ENC is
-   printer-wide and not whitelisted); the admin updates `Machine.encoder_wheel_mm` to match, and runs the
-   check again. Saved: `spacing_measured_mm`, `spacing_by`, `spacing_at`.
+   suggests `wheel_suggestion_mm(<current wheel>, 300, gap)`, in whole mm because ENWHD is an int.
+   Stripes never changes it (ENC is printer-wide and not whitelisted); the admin updates
+   `Machine.encoder_wheel_mm` to the same value on the Machines page, and runs the check again. Without
+   that, the next print fails the machine check (§10.5 item 3, used by test runs through §15.4 item 3:
+   "{machine}'s encoder settings changed...") and the poller raises `encoder_changed` (states.md C24).
+   Saved: `spacing_measured_mm`, `spacing_by`, `spacing_at`.
 3. **Head distance.** `plan_test(kind="head_distance")` and a run: one print at a known position. The
    admin measures where it landed from the bag's bottom edge; `head_distance_from_print(sent,
    measured, length, rough)` gives the head distance. Saved: `head_print_sent_mm`,
@@ -1911,14 +1928,17 @@ Until a machine has a head distance it can't be sent to ("isn't calibrated").
 when `L < spacing_sent_mm + 50`, "This film is too short for the {mm} mm spacing check." `ranges` is
 ignored; no fonts are sampled.
 
-The base plan's machine copy gets `head_distance_mm = 0.0`, so each step's position is sent as it is
-(`(v − 0 + 0) mod L = v`). Positions are chosen so the marks land near the middle of a bag if `R` is
-right (`half_up` is `math.floor(x + 0.5)`):
+The base plan's machine copy gets `head_distance_mm = 0.0` (§15.2 item 6 uses it for `base.machine`
+and for the base position), so each step's position is sent as it is (`(v − 0 + 0) mod L = v`).
+Positions are chosen so the marks land near the middle of a bag if `R` is right. Each is worked out
+with `print_position_mm(x, 0.0, L)` (§5.1: `x mod L` rounded half up, and a result equal to `L` sent as
+0), so a step's `position_mm` is always a whole number in `[0, L)` and equals the DLYMM that
+`test_step_plan` sends:
 
 | Kind | Steps (label, position sent) |
 |---|---|
-| `spacing` | `SPACE A`, `half_up((L/2 − S/2 − R) mod L)`; `SPACE B`, `half_up((L/2 + S/2 − R) mod L)`, with `S = spacing_sent_mm` |
-| `head_distance` | `HEAD`, `half_up((L/2 − R) mod L)` |
+| `spacing` | `SPACE A`, `print_position_mm(L/2 − S/2 − R, 0.0, L)`; `SPACE B`, `print_position_mm(L/2 + S/2 − R, 0.0, L)`, with `S = spacing_sent_mm` |
+| `head_distance` | `HEAD`, `print_position_mm(L/2 − R, 0.0, L)` |
 
 Both use `bags_per_step` 5 and the film's font, size, bold, width and resolution, and run exactly like
 a test print (§15.4 to §15.6) with the lock purpose `calibration`.
@@ -1928,7 +1948,7 @@ a test print (§15.4 to §15.6) with the lock purpose `calibration`.
 | Function | Result |
 |---|---|
 | `spacing_gap_mm(a, b, L)` | `(b − a) mod L` |
-| `wheel_suggestion_mm(wheel, sent_gap, measured_gap)` | `round(wheel × measured_gap / sent_gap, 1)`: the printer's wheel setting is too small by the factor the gap is too long |
+| `wheel_suggestion_mm(wheel, sent_gap, measured_gap)` | `w = math.floor(wheel × measured_gap / sent_gap + 0.5)` (half up, whole mm, because ENWHD is an int, protocol.md §5.2): the printer's wheel setting is too small by the factor the gap is too long. `w` outside 20..150 (ENWHD's range) returns None |
 | `head_distance_from_print(sent, measured, L, rough)` | `base = (measured − sent) mod L`; `k = max(0, round((rough − base) / L))`; `H = base + k × L`. If `abs(H − rough) > 0.25 × L`, raise `PlanError` "The tape measurement is too far from the print to be sure. Measure the head distance again." Else return `round(H, 1)` |
 
 The mark lands at `(sent + H) mod L` from the bag's bottom edge, the inverse of §5.1, so `H ≡ measured
@@ -1963,7 +1983,7 @@ it raises.
 | `time_source`, `time_server`, `time_offset_s` | the reading (`"server"` or `"pc"`) |
 | `from_local_copy`, `data_as_of` | the plan's |
 | `request` | `to_json(SendRequest)` |
-| `lines` | per line: `line_id`, `line_name`, `line_code`, `product` {`id`, `name`, `customer`, `revision`}, `film` {`id`, `code`, `artwork_revision`, `revision`}, `print_text` {`id`, `code`, `name`, `revision`}, `lot`, `countries`, `origin_line`, `unticked` (`[{machine_id, origin_line, printing}]`: the line's other active machines and what their poll status said they were printing, `origin_line` `""` and `printing` None when unknown, §10.11; ui.md §5.4 makes the sender acknowledge a line that will print two origins) |
+| `lines` | per line: `line_id`, `line_name`, `line_code`, `product` {`id`, `name`, `customer`, `revision`}, `film` {`id`, `code`, `artwork_revision`, `revision`}, `print_text` {`id`, `code`, `name`, `revision`}, `lot`, `countries`, `origin_line`, `unticked` (`[{machine_id, origin_line, printing}]`: the line's other active machines and what their poll status said they were printing (`poll.running.origin_line`, but `""` when `poll.running_unchecked` is True or `poll.state.code` is `message_unchecked`), `origin_line` `""` and `printing` None when unknown, §10.11; ui.md §5.4 makes the sender acknowledge a line that will print two origins) |
 | `machines` | per machine, in plan order: `machine_id`, `machine_name`, `machine_code`, `line_id`, `printer` {`id`, `name`, `host`, `uid`}, `placement`, `bag_text` (the exact text), `position` (`PositionWorking`: the print position and how it was worked out), `settings` (`PrintSettings`), `slot`, `message_name`, `content_code`, `commands` (each command's `xml`, in order), `expected_items` (`[[tag, [[child, value], ...]], ...]`), `expected_settings`, `clock` (the §9.5 record or None), `warnings` (Msgs), `differences` (`[[where, field, sent, read], ...]` of the failing check, or `[]`), `expected_before` (`{"send_id", "counter"}` or None, §10.3 step 3), `result` |
 | `machines[i].result` | `to_json(MachineResult)` with `readbacks` as `design_to_log` dicts (the printer's pictures) and `previous_preview` as `previous_preview_b64`; it holds the print counts before and after and the result |
 
@@ -1983,7 +2003,8 @@ switch.
 
 ### 17.4 send_confirm (hx-sends): the sender's answer
 
-`send_id`, `sender` (from the `send` entry), `everything_right` (bool), `machine_ids`, `machines`
+`send_id`, `sender` (from the `send` entry; in the §11.2 fallback, the pending expected states'
+`sender`), `everything_right` (bool), `machine_ids`, `machines`
 (`[{machine_id, message_name, fingerprint}]` as the Send left them), `at`. The envelope's `logged_by` is
 who answered, always the sender.
 
@@ -2270,7 +2291,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | ResumeTests | rules | one case per row of §13.3's table; `resume_mismatch` for a changed name, slot or fingerprint |
 | TestPlanTests | steps | encoder, film position 150, range 140 to 160 step 5, bold [1, 2]: 7 steps labelled `P140 \| B1`, `P145 \| B1`, `P150 \| B1`, `P155 \| B1`, `P160 \| B1`, `P150 \| B1`, `P150 \| B2`; delay labels start with `D`; a vary/placement mismatch, a range giving 101 steps and a bold of 11 are refused; `test_bag_estimate` of 7 steps is 42 |
 | | step plan | `test_step_plan` of `P150` sends DLYMM 348 with the adjustment ignored; fonts `[(2, 3), (2, 4)]` give the label item, then `Arial 3` and `Arial 4` placed right with MARG `8,0`; the name uses `TST` and the step index |
-| | calibration | film length 610, rough 400, spacing 300: steps `SPACE A` at 365 and `SPACE B` at 55, `HEAD` at 515, each sent as is; `spacing_gap_mm(167, 467, 610) == 300`; `wheel_suggestion_mm(56, 300, 306) == 57.1`; the §16.3 head-distance examples, including `(515, 317, 610, 400) == 412.0` |
+| | calibration | film length 610, rough 400, spacing 300: steps `SPACE A` at 365 and `SPACE B` at 55, `HEAD` at 515, each sent as is; `spacing_gap_mm(167, 467, 610) == 300`; `wheel_suggestion_mm(56, 300, 306) == 57` (an int), `wheel_suggestion_mm(56, 300, 3000)` is None; the §16.3 head-distance examples, including `(515, 317, 610, 400) == 412.0`; film length 611, rough 306: `HEAD` at 0, never 611; an encoder machine with `head_distance_mm` None plans both kinds without a problem |
 
 ### 20.2 test_hx_time.py
 
@@ -2281,7 +2302,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | TimeSourceTests | hosts | a `query` stub where the first host raises and the second answers: `source "server"`, `server` the second host, `offset_s` the answer minus `clock.time()`; the stub receives `port` and `timeout_s` keywords; `parse_host` of `time.example.local`, `192.0.2.123` and `127.0.0.1:4123` |
 | | cache | `FakeClock`: a second `now()` within `cache_s` makes no query; after `advance(600)` it queries; `fresh=True` always queries; no hosts or every host failing gives `source "pc"`, `offset_s 0.0`, and clears the cache; `now_from` keeps the offset and moves with the clock |
 | | local | `to_local(1793275200.0, offset_fn=lambda u: -14400.0)` is 29 Oct 2026 08:00 |
-| DstTests | change | §9.3 item 4 with `FakeClock`; a constant offset never fires; `previous_s` and `offset_s` after the change |
+| DstTests | constant | a constant offset function: `recent_dst_change` is None at any time |
 | | recent change | with the §9.3 item 4 offset function: `recent_dst_change` at 06:00:00 + 1 s, + 2 h and + 23 h UTC all return `(-14400.0, -18000.0, 1793512800.0)` (1 Nov 2026 06:00:00 UTC); at + 25 h and before the change, None |
 | TimeSourceTests | failure memory, cached | `FakeClock`, a `query` stub that always fails: `now()` queries once, then not again for `cache_s`; `now(fresh=True)` queries every time; `cached()` never calls the stub, gives `source "pc"` before any answer and the server reading after one, until `2 × cache_s` |
 
@@ -2313,10 +2334,11 @@ purpose. No test waits more than about 0.5 s of real time.
 | | lock budget | the keeper's refreshes made to fail (`fail_replace=10**6` on the sender's view) from the start of check_machine: the machine is red with `LockLost` before 30 s minus the next call's `worst_case_s`, and the fake receives no request after that |
 | | offline, then back | share down (`fs.view(down=True)` for the sender's store after a first good Send, so `cached_expected` is known): AMBER, `no_lock`, `log_queued`; share back: `record_offline(find_send(...))` writes the "Recorded after an outage" row (mode `running`, AMBER, notes `no_lock`), and a poller then judges `unconfirmed`, not `drift`; with another Send's E written meanwhile, it writes nothing |
 | ConfirmTests | right | the sender confirms: the expected state is confirmed and GREEN; a `send_confirm` entry; the line status confirmed |
-| | no send entry | the `send` entry deleted from the share and the queue after a Send (as after a crash): `pending_confirmation` still lists the live machine from its expected state; `confirm(..., True)` by the sender confirms it and logs `send_confirm` with the machine from E; by `akim` it raises `NotAllowed` |
+| | no send entry | the `send` entry deleted from the share and the queue after a Send (as after a crash): `pending_confirmation` still lists the live machine from its expected state; `confirm(..., True)` by the sender confirms it and logs `send_confirm` with the machine from E and `sender` from E; by `akim` it raises `NotAllowed`; the candidates are the machine of the `send_switch` entry, and with that entry removed too, every active machine, where a second machine not in the Send whose expected.json has a newer `format_version` is skipped, not raised |
 | | sender kept | `akim` runs Set clocks on the machine of `jsmith`'s unconfirmed Send: `E.sender` stays `jsmith`, `written_by` is `akim`, and `jsmith` can still confirm |
 | | someone else | `akim` confirming `jsmith`'s Send: `NotAllowed`; nothing written |
 | | wrong, then stop | `confirm(..., False)` then `stop(reason="rejected")`: PRINT 0 sent and PRIN read twice; the rows Rejected (with `failure` None) and Stopped; `stopped_needs_send`; `check_resume` refuses with the rejected message; `resume` refuses with no write to the fake |
+| | wrong, then a failed Send | `confirm(..., False)`, then a Send with `override("HXUI", "1110")`: the row Failed before the switch has `rejected` False, `resume_blocked` True and the new `failure`; a poller then judges `failed_before_switch` with `send_failed` only (no `send_rejected`) |
 | | superseded | confirming an older Send after a newer one: no expected-state change; the log entry is still written |
 | | pending | `pending_confirmation` lists the live machines, and `[]` after the confirmation |
 | FailureTests | rows | `failure_rows` after a verify_idle failure holds the hooked difference; after an after-switch failure it has `after_switch_text` and the previous picture |
@@ -2332,7 +2354,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | | timed | `bag_counter "none"`: no counter is read; each step lasts `seconds_per_bag × 5` |
 | | stop test | cancel after step 1: the end procedure still runs |
 | | needs the server | the share down: refused before any request |
-| | calibration | kind `spacing`, length 610, rough 400: DLYMM 365 then 55 |
+| | calibration | kind `spacing`, length 610, rough 400: DLYMM 365 then 55; the same on an encoder machine with `head_distance_mm` None: `plan_test` raises nothing and the run sends DLYMM 365 then 55 |
 | SafetyTests | whitelist | across the whole file: every fake's `writes` within `ALLOWED_WRITE_TAGS`; never SETPPARAM; never "SAVEMSG to the printing slot" |
 
 Failure injections ("each failure"):
@@ -2414,6 +2436,8 @@ Failure injections ("each failure"):
 17. **The poller handshake gives up after `2 × stale_s`** (30 s), checking every 0.25 s.
 18. **A failure before the switch keeps the old expectation** (message, fingerprint, confirmation) and
     adds the Send's id, its sender, the failure and red, so Leave it and the alerts can refer to it.
+    It clears an earlier `rejected`, so the failed Send raises only `send_failed`; `resume_blocked` is
+    kept.
 19. (Withdrawn.) "Something's wrong" is recorded only as `rejected` and `resume_blocked`, never as a
     failure: states.md judges it from `rejected` (`rejected`, then `stopped_needs_send`, one
     `send_rejected` alert), and a failure would have hidden both behind `failed_after_switch`.

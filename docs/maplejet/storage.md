@@ -101,7 +101,6 @@ the `logs\<kind>\<YYYY-MM>\` month folders. Every other missing folder is a set-
     local-copy.json                   the local copy, §7.2
     previews\<sha256>.png             photo previews for the local copy, §7.3
     reach.json                        when this user's Stripes last reached a printer, §12.3
-    poller-<name>.json                poller memory; states.md owns the names and contents
     send-queue\                       fallback upload queue, used only if the PC queue can't be written, §7.5
 %PROGRAMDATA%\Stripes\v2\             HxPaths.machine: shared by every user of this PC
   send-queue\<kind>~<log name>        a log entry waiting to upload, §7.5
@@ -206,7 +205,9 @@ dataclass.
    order. The dict is empty while FORMAT is 1.
 6. Return the dict, envelope keys included.
 
-Typed readers then call `from_json(cls, d)`. A `ValueError` there also means "damaged". What
+Typed readers then call `from_json(cls, d)`, with architecture.md §5.3's type rules (an int is a
+valid float, lists come back as tuples where the hint says so, a bool is never a number). A
+`ValueError` there also means "damaged". What
 happens with a damaged file depends on what it is: see §5 for status files, §6.6 for logs and §13.2
 for records.
 
@@ -465,8 +466,8 @@ How the head distance is worked out is OPEN (architecture.md §11). Saving a cal
  "spacing_by": "EXAMPLE\\jsmith",
  "spacing_at": 1793268000.0,
  "rough_head_distance_mm": 400.0,
- "head_print_sent_mm": 348,
- "head_print_measured_mm": 136.0,
+ "head_print_sent_mm": 515,
+ "head_print_measured_mm": 317.0,
  "head_distance_mm": 412.0,
  "head_by": "EXAMPLE\\jsmith",
  "head_at": 1793271600.0
@@ -1052,12 +1053,12 @@ keeps the set consistent. `prune_previews(keep)` deletes every PNG whose sha256 
 runs after each local-copy write. Previews exist only for image formats Stripes already handles
 (the plan). Other originals open in the PC's default viewer.
 
-### 7.4 Reach memory and poller memory: `<local>/hx/reach.json`, `<local>/hx/poller-*.json`
+### 7.4 Reach memory: `<local>/hx/reach.json`
 
 `reach.json` (`file_type` `local_state`) is `{"last_printer_reach": <float or null>}`, kept by
-`ReachMemory` (§12.3). states.md stores the poller's own memory, such as daily checks and the last
-daylight-saving clock set, in `poller-<name>.json` files through `read_local_json` and
-`write_local_json`. Each file has a single writer.
+`ReachMemory` (§12.3) through `read_local_json` and `write_local_json`. It has a single writer. The
+poller keeps no memory file: its daily checks are poll.json's `daily` and the daylight-saving clock
+set is poll.json's `dst` (states.md §6.10, §6.11), so a PC that takes a printer over sees both.
 
 ### 7.5 The upload queue: `<machine>/send-queue/`
 
@@ -1259,7 +1260,8 @@ No share operation runs while holding it, so `check()` never blocks on the share
    holder's `LockInfo`. Another Send or test in this process holds it. Every `LockHeld` raised in
    §11.2 and §11.4 carries this same `Msg`, filled from its own `info`.
 2. Register `store.local_locks[printer_id] = run_id`, together with the `LockInfo` kept privately in
-   the store. This comes before any share access, so this PC's poller steps aside at once.
+   the store (a copy is returned by `store.local_lock_info(printer_id)`, §15, for the standalone
+   status watcher). This comes before any share access, so this PC's poller steps aside at once.
 3. Build a `LockInfo` with a new `token`, our `user`, `computer` and `pid`, the purpose and ids,
    `counter` 1, `acquired_at = clock.time()` and an empty `note`.
 4. `create_exclusive("status/locks/<printer_id>.lock", encode_json("lock", ...))`. On success, the
@@ -1533,7 +1535,11 @@ These are the file-level rules behind architecture.md §7.3. states.md builds th
 2. Rank 0 starts when `poll.json` names itself as `poller`, names it in `yielded_to`, has been
    missing for `stale_s`, or has been stale for `stale_s`. Rank r ≥ 1 starts at
    `takeover_after_s(r)`.
-3. Every start follows the settle rule of §11.6.
+3. Every start follows the settle rule of §11.6, and then re-checks its rank from a fresh
+   `live_heartbeats()` right before its first request: a poller that isn't rank 0 while rank 0 is
+   live yields (rule 4) without making a request (states.md §6.3 step 2). Rank 0 and rank 1 can both
+   start at 15 s (a missing file, or a rank-0 PC whose heartbeat and `poll.json` went stale together),
+   and this check is what keeps them from both sending.
 4. Handover: a poller that is no longer rank 0 while rank 0 is live finishes its request in flight,
    writes `poll.json` with `yielded_to = <rank 0 key>` (counter + 1), and stops polling that printer.
 5. A cleanly stopping poller does the same towards its next-ranked live poller.
@@ -1917,6 +1923,9 @@ class ShareStore:
         # "paused" | "stale" | "missing" | "polling" (§11.6)
     def cached_expected(self, machine_id: str) -> ExpectedState | None: ...
         # the last ExpectedState this store read or wrote for that machine; no share access (§5.4 rule 4)
+    def local_lock_info(self, printer_id: str) -> LockInfo | None: ...
+        # a copy of the LockInfo acquire() registered with local_locks (§11.2 step 2), with the latest
+        # update() note; None when printer_id isn't in local_locks; no share access; thread-safe
 
 # PrinterLock (thread-safe, §11.1)
 class PrinterLock:
@@ -1936,7 +1945,8 @@ class ReachMemory:
 
 # LocalStore
 class LocalStore:
-    def read_local_json(self, name: str) -> dict: ...         # <local>/hx/<name>; {} if missing/damaged/newer
+    def read_local_json(self, name: str) -> dict: ...         # <local>/hx/<name>; {} if missing/damaged/newer;
+                                                              # only ReachMemory's reach.json uses it (§7.4)
     def write_local_json(self, name: str, data: dict) -> None: ...
     def has_preview(self, sha256: str) -> bool: ...
     def write_preview(self, sha256: str, png: bytes) -> None: ...
@@ -2056,7 +2066,10 @@ sleeps more than 0.5 s in real time.
       `release()` leaves the new file alone.
     - A store that first sees a stale lock gets `LockHeld`.
     - `release` removes the file and the `local_locks` entry, and is idempotent.
-    - With the share down: `"local_only"`, and `local_locks` set.
+    - With the share down: `"local_only"`, and `local_locks` set; `local_lock_info(printer_id)`
+      returns the holder's `LockInfo` (user, computer, purpose `send`) with the latest `update()`
+      note, a copy that changing doesn't affect the store; after `release`, None, as for a printer
+      that was never locked.
     - A second acquire in the same process: `LockHeld`.
     - A damaged lock is held, then taken over after 60 s. A format-2 lock is held.
     - Refreshes failing for 30 s: `lost`, and no write after that.
@@ -2126,7 +2139,8 @@ sleeps more than 0.5 s in real time.
 - Use `poll_age`/`lock_age` for views.
 - Treat `FormatTooNew` from `read_poll` as a fresh, unreadable poll file ("Update Stripes" on that
   machine), never as missing.
-- Keep poller memory in `poller-<name>.json` through `read_local_json`/`write_local_json`.
+- Keep no poller memory file: daily checks go in P.daily and the daylight-saving clock set in P.dst
+  (states.md §6.10, §6.11).
 
 **send.md**
 

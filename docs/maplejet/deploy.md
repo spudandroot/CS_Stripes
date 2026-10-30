@@ -25,8 +25,9 @@ Contents: 0 Scope and conventions · 1 Interfaces added here · 2 What goes into
    and the new `test_deploy.py`. Delivered after development, it also owns
    `tools/New-StripesV2Folders.ps1`, `test_folder_script.py` and `docs/maplejet/test-pc.md` (§8, §9).
    It lists the checks of `hx_ui.self_check(root)` (architecture §6.10: "deploy.md lists the
-   checks"; ui.md's builder writes the code in `hx_ui`) and adds three small hooks to `stripes.py`
-   (§1.3).
+   checks"; the code in `hx_ui` is written by WP7, README.md "Work packages") and specifies three small
+   hooks in `stripes.py` (§1.3), which WP9 writes together with every other `stripes.py` change. In
+   build terms, WP9 writes every file listed in this item; this file specifies them.
 3. No new runtime or build dependency. `requirements.txt` and the `pip install` line don't change.
 4. Public repo: examples use `\\SERVER\Share\Stripes`, 192.0.2.x, UID 1109 with password 123321,
    `EXAMPLE\jsmith`, `time.example.local` and "Example Co". The key is never written into the
@@ -75,8 +76,9 @@ built (§3.2).
 ### 1.3 stripes.py hooks (additions to architecture §10)
 
 architecture §10 lists every `stripes.py` change. These three come from the key injection and are
-added to that list. `stripes.py` may import `hx_key` (layer "build", no imports of its own), as it
-already imports the generated `stripes_version`.
+added to that list. They are specified here and written by WP9, the one package that edits
+`stripes.py` (README.md "Work packages"). `stripes.py` may import `hx_key` (layer "build", no
+imports of its own), as it already imports the generated `stripes_version`.
 
 1. Right after the `VERSION` import block:
 
@@ -124,7 +126,8 @@ this file and adds no check of its own; §5.2 is the complete, ordered list. It 
 
 ### 1.5 i18n.ES
 
-One new `stripes.py` text, added to `i18n.ES` directly (architecture §10.6 item 4):
+One new `stripes.py` text, added to `i18n.ES` directly (architecture §10.6 item 4). It is specified
+here and written by WP1, the one package that edits `i18n.py` (README.md "Work packages"):
 
 | English | Spanish |
 |---|---|
