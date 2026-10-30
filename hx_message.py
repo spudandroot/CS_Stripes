@@ -2016,11 +2016,15 @@ def plan_test(machine_id, film_id, ranges, data, identity, *, kind="test"):
         steps = [step(i, label(*s), s[0], *s[1:]) for i, s in enumerate(settings, start=1)]
     else:
         # The marks land near the middle of a bag if the rough distance is right; each position is
-        # sent as it is, so the machine copy gets head distance 0
+        # sent as it is, so the machine copy gets head distance 0. SPACE B is never sent before
+        # SPACE A: a wrapped pair is S - L apart, not S, and the wheel suggestion would go the wrong way
         half = length / 2
         if kind == "spacing":
-            steps = [step(1, "SPACE A", print_position_mm(half - spacing / 2 - rough, 0.0, length)),
-                     step(2, "SPACE B", print_position_mm(half + spacing / 2 - rough, 0.0, length))]
+            a = print_position_mm(half - spacing / 2 - rough, 0.0, length)
+            b = print_position_mm(half + spacing / 2 - rough, 0.0, length)
+            if spacing > 0 and b <= a:
+                a, b = _unwrapped_spacing_pair(length, spacing, rough)
+            steps = [step(1, "SPACE A", a), step(2, "SPACE B", b)]
         else:
             steps = [step(1, "HEAD", print_position_mm(half - rough, 0.0, length))]
         base_machine.head_distance_mm = 0.0
@@ -2034,6 +2038,19 @@ def plan_test(machine_id, film_id, ranges, data, identity, *, kind="test"):
                        position=position, origin_line="", test_step=None)
     return TestPlan(run_id=new_id("tp"), kind=kind, base=base, steps=steps, bags_per_step=5,
                     timed=(company.bag_counter == "none"))
+
+
+def _unwrapped_spacing_pair(length_mm, spacing_mm, rough_mm):
+    """SPACE A and SPACE B when the pair centred on the bag wraps (B sent before A, S - L after it, so
+    the measured gap would turn the wheel suggestion the wrong way): B is sent spacing mm after A, both
+    in [0, L), and of those pairs the one whose marks land furthest from a bag edge if the rough
+    distance is right (the first such A)."""
+    def room(a):
+        return min(min(p, length_mm - p) for p in ((a + rough_mm) % length_mm,
+                                                    (a + spacing_mm + rough_mm) % length_mm))
+    fits = [a for a in range(math.ceil(length_mm)) if print_position_mm(a + spacing_mm, 0.0, length_mm) > a]
+    a = max(fits, key=room)
+    return a, print_position_mm(a + spacing_mm, 0.0, length_mm)
 
 
 def test_step_plan(base, step):

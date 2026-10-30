@@ -1815,7 +1815,8 @@ class TestPlanTests(unittest.TestCase):
         data.calibrations[M2] = Calibration(id=M2, machine_id=M2, rough_head_distance_mm=400.0)
         spacing = hm.plan_test(M2, FILM, TestRanges(vary="position", start=0, stop=0, step=1), data, ADMIN,
                                kind="spacing")
-        self.assertEqual([(s.label, s.position_mm) for s in spacing.steps], [("SPACE A", 365), ("SPACE B", 55)])
+        # Centred on the bag, B (55) would be sent before A (365): the pair is sent 300 apart instead
+        self.assertEqual([(s.label, s.position_mm) for s in spacing.steps], [("SPACE A", 60), ("SPACE B", 360)])
         self.assertEqual(spacing.base.machine.head_distance_mm, 0.0)
         self.assertEqual(data.machines[M2].head_distance_mm, 412.0)          # the record isn't changed
         head = hm.plan_test(M2, FILM, TestRanges(vary="delay", start=5, stop=1, step=0), data, ADMIN,
@@ -1868,6 +1869,34 @@ class TestPlanTests(unittest.TestCase):
         self.assertEqual(len(hm.plan_test(M2, FILM, ok, data, ADMIN, kind="spacing").steps), 2)
         with self.assertRaises(ValueError):
             hm.plan_test(M2, FILM, ok, data, ADMIN, kind="other")
+
+    def test_spacing_marks_never_wrap(self):
+        # Review finding: SPACE A and B were each reduced mod L, so when only one wrapped (rough 400 on
+        # 610 mm: 365 then 55) they were S - L apart and the wheel suggestion went the wrong way. A
+        # print sent at d lands at (d x f + H) mod L, f = real wheel / printer wheel (send.md §16.3)
+        ok = TestRanges(vary="position", start=0, stop=0, step=1)
+
+        def marks(length, rough):
+            data = seed()
+            data.films[FILM].length_mm = length
+            data.calibrations[M2] = Calibration(id=M2, machine_id=M2, rough_head_distance_mm=rough)
+            return [s.position_mm for s in hm.plan_test(M2, FILM, ok, data, ADMIN, kind="spacing").steps]
+
+        self.assertEqual(marks(610.0, 100.0), [55, 355])        # no wrap: as before
+        self.assertEqual(marks(610.0, 412.0), [48, 348])        # the plan's head distance: was 353, 43
+        self.assertEqual(marks(400.0, 100.0), [99, 399])        # a film shorter than twice the spacing
+        for length in (350.0, 400.0, 610.0, 611.0, 1000.0):
+            for rough in range(0, 2 * int(length), 11):
+                a, b = marks(length, float(rough))
+                self.assertTrue(0 <= a < b < length and b - a == 300, (length, rough, a, b))
+                for real in (54.0, 57.1):
+                    f = real / 56.0
+                    gap = hm.spacing_gap_mm((a * f + rough) % length, (b * f + rough) % length, length)
+                    self.assertEqual(hm.wheel_suggestion_mm(56.0, 300, gap), round(real), (length, rough, real))
+        # Where the marks land, if the rough distance is right: never right on a bag edge
+        for rough in (400.0, 412.0):
+            a, b = marks(610.0, rough)
+            self.assertTrue(all(100 <= (p + rough) % 610 <= 510 for p in (a, b)))
 
 
 if __name__ == "__main__":

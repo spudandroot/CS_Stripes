@@ -2110,6 +2110,13 @@ class PrinterLock:
                 return False
             info.counter += 1
             info.note.update(note)
+            with self._lock:
+                if self.state == "held" and store.clock.monotonic() - self._last_ok >= store.timings.lock_stale_s / 2:
+                    # We stalled (PC asleep, process suspended): another PC may judge the lock stale or
+                    # have taken it over, so never write again, as for a failing share below
+                    self.state = "lost"
+                if self.state != "held":
+                    return False
             store.write_bytes(rel, encode_json("lock", to_json(info)))
         except ShareError:
             with self._lock:

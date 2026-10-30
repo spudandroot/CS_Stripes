@@ -9,6 +9,7 @@ their real windows.
 
 import contextlib
 import dataclasses
+import functools
 import gc
 import importlib.util
 import io
@@ -1800,8 +1801,13 @@ class ServiceTests(UiCase):
         self.addCleanup(gc.disable)
         gc.collect()
         gc.enable()
-        with mock.patch.dict(os.environ, env), mock.patch.object(hx_win, "stop_alert") as stop_alert:
+        # The real start_services wiring and threads, at scaled timings (architecture §9) so the first
+        # board doesn't take a real watch_s
+        scaled = functools.partial(hx_ui.make_services, timings=SCALED)
+        with mock.patch.dict(os.environ, env), mock.patch.object(hx_win, "stop_alert") as stop_alert, \
+                mock.patch.object(hx_ui, "make_services", scaled):
             services = hx_ui.start_services(self.root, config_path=None, bg=SyncBackground(), version="test")
+            self.assertIs(services.timings, SCALED)
             self.services = services
             self.assertTrue(services.started)
             self.assertFalse(gc.isenabled())
@@ -1908,6 +1914,42 @@ class SelfCheckTests(UiCase):
             with mock.patch.object(importlib.util, "find_spec",
                                    side_effect=lambda name, *a: None if name == "hx_fake" else real(name, *a)):
                 hx_ui._check_modules(self.root)
+
+    def windows_rename(self, refuse_always=False):
+        """open_for_read and os.replace as on Windows, where os.replace (MoveFileExW) refuses a target that
+        a reader still holds open, even one that shares delete. Returns the patches and the refusals."""
+        held, refused = [], []
+        real_open, real_replace = hx_win.open_for_read, os.replace
+
+        def open_for_read(path):
+            f, key = real_open(path), os.path.abspath(path)
+            held.append(key)
+
+            def close():
+                held.remove(key)
+                f.close()
+            return mock.Mock(read=f.read, close=close)
+
+        def replace(src, dst):
+            if os.path.abspath(dst) in held or (refuse_always and "stripes-hx-swap-" in dst):
+                refused.append(dst)
+                raise PermissionError(13, "Access is denied", dst)
+            return real_replace(src, dst)
+        patches = contextlib.ExitStack()
+        patches.enter_context(mock.patch.object(hx_win, "open_for_read", open_for_read))
+        patches.enter_context(mock.patch.object(os, "replace", replace))
+        return patches, held, refused
+
+    def test_swap_check_on_windows_rename_rules(self):
+        # deploy.md §5.6: a refused replace while the reader holds the file is fine, once it lets go the
+        # replace must work
+        patches, held, refused = self.windows_rename()
+        with patches:
+            hx_ui._check_files(self.root)
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(held, [])
+        with self.assertRaises(PermissionError), self.windows_rename(refuse_always=True)[0]:
+            hx_ui._check_files(self.root)
 
     def test_self_check_names_the_failure(self):
         with mock.patch.object(hx_ui, "_CHECKS", (("sntp", hx_ui._check_sntp),)), \

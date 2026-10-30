@@ -1013,10 +1013,16 @@ def _check_files(root):
         try:
             with open(b, "wb") as f:
                 f.write(b"new")
-            os.replace(b, a)            # must work while a reader holds the file open
+            try:
+                os.replace(b, a)        # POSIX lets this through while a reader holds the file
+                swapped = True
+            except PermissionError:     # Windows' os.replace (MoveFileExW) refuses a target still open
+                swapped = False
             _need(h.read() == b"old", "the open reader didn't keep the old file")
         finally:
             h.close()
+        if not swapped:
+            os.replace(b, a)            # must work once the reader has let go
         with open(a, "rb") as f:
             _need(f.read() == b"new", "the swap didn't replace the file")
     finally:

@@ -1681,9 +1681,9 @@ class CalibrationTests(UiCase):
         self.assertEqual(w.rough_status.cget("text"), "Saved: 400 mm.")
         self.assertTrue(enabled(w.print_spacing_button) and enabled(w.print_head_button))
         self.assertEqual(w.spacing_text.cget("text"),
-                         "Stripes prints two marks 300 mm apart, at 365 mm and 55 mm after the trigger.")
+                         "Stripes prints two marks 300 mm apart, at 60 mm and 360 mm after the trigger.")
         self.assertEqual(w.head_text.cget("text"), "Stripes prints one mark 515 mm after the trigger.")
-        self.assertEqual([s.position_mm for s in w.spacing_plan.steps], [365.0, 55.0])
+        self.assertEqual([s.position_mm for s in w.spacing_plan.steps], [60.0, 360.0])
         self.assertFalse(enabled(w.head_entry) or enabled(w.mark_entries[0]) or enabled(w.mark_entries[1]))
         # The head mark
         seen = []
@@ -1704,7 +1704,7 @@ class CalibrationTests(UiCase):
         printed = len(fake.printed)
         self.print_marks(w, w.print_spacing_button)
         self.assertEqual(w.run_label.cget("text"), "Finished: 2 of 2 steps.")
-        self.assertEqual({p["position_mm"] for p in fake.printed[printed:]}, {365, 55})
+        self.assertEqual({p["position_mm"] for p in fake.printed[printed:]}, {60, 360})
         self.assertTrue(enabled(w.mark_entries[0]) and enabled(w.mark_entries[1]))
         w.mark_a_var.set("167")
         w.mark_b_var.set("467.5")

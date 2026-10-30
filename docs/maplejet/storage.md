@@ -1249,7 +1249,7 @@ No share operation runs while holding it, so `check()` never blocks on the share
 | `unheld` | Not acquired yet, or released |
 | `held` | Our lock file is on the share, with our token |
 | `local_only` | The share was unreachable at acquire time. Only `store.local_locks` protects the printer, against this PC's own poller. Results are amber |
-| `lost` | Our file is gone or names another token, or refreshing has failed for `lock_stale_s / 2` (30 s). `check()` raises `LockLost` |
+| `lost` | Our file is gone or names another token, or there has been no good refresh for `lock_stale_s / 2` (30 s). `check()` raises `LockLost` |
 
 ### 11.2 Acquire
 
@@ -1286,7 +1286,11 @@ retries, the age is known.
 2. If the file is missing, or holds another token: the state becomes `lost`, and the keeper stops
    without writing.
 3. Otherwise set `counter += 1`, merge any note given to `update(**note)` since the last refresh, and
-   `write_bytes` the whole file. On success, record `last_ok = clock.monotonic()`.
+   `write_bytes` the whole file. On success, record `last_ok = clock.monotonic()`. Just before writing,
+   if `clock.monotonic() − last_ok >= lock_stale_s / 2`, the state becomes `lost` and the keeper never
+   writes again, as in step 4. A holder that stalled that long (the PC slept, the process was
+   suspended) may already be judged stale or taken over elsewhere, so it must not revive its lock or
+   write over a new holder's file.
 4. On `ShareError` or `ShareUnavailable`: if `clock.monotonic() − last_ok >= lock_stale_s / 2`, the
    state becomes `lost` and the keeper never writes again. Another PC can only take over after 60 s
    without change on its own clock, and this rule stops a holder that lost the share from ever

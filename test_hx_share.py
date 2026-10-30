@@ -1629,6 +1629,49 @@ class LockTests(ShareCase):
         self.assertFalse(lk._keep_once())
         self.assertEqual(view.calls[writes:], [])
 
+    def test_a_stalled_holder_never_revives_its_lock(self):
+        # The PC slept with the lock held, and its keeper runs before its work thread on waking
+        view = self.fs.view()
+        st = self.store(identity(sender=True), view=view)
+        lk = self.lock(st)
+        lk.acquire()
+        self.clock.advance(29)
+        self.assertTrue(lk._keep_once())                        # late, but nobody may judge it stale yet
+        lk.check()
+        self.watch_until_stale(self.b, 65)
+        self.assertGreaterEqual(self.b.lock_age(PRINTER_ID), TIMINGS.lock_stale_s)
+        writes = len(view.calls)
+        self.assertFalse(lk._keep_once())
+        self.assertEqual(lk.state, "lost")
+        self.assertNotIn("write_whole", [op for op, _ in view.calls[writes:]])
+        self.assertEqual(self.lock_file()["counter"], 2)
+        with self.assertRaises(LockLost):
+            lk.check(budget_s=7.5)
+        self.assertFalse(lk._keep_once())                       # and it never writes again
+        self.assertNotIn("write_whole", [op for op, _ in view.calls[writes:]])
+
+    def test_a_stalled_keeper_never_overwrites_a_takeover(self):
+        held = self.lock(self.a)
+        held.acquire()
+        self.watch_until_stale(self.b, 65)
+        taker = self.lock(self.b)
+        rel = self.a._lock_rel(PRINTER_ID)
+        read_bytes = self.a.read_bytes
+
+        def read_then_takeover(path):
+            raw = read_bytes(path)
+            if path == rel and taker.state == "unheld":
+                self.assertEqual(taker.acquire(), "held")       # between the keeper's read and its write
+            return raw
+        with mock.patch.object(self.a, "read_bytes", read_then_takeover):
+            self.assertFalse(held._keep_once())
+        self.assertEqual(held.state, "lost")
+        d = self.lock_file()
+        self.assertEqual((d["token"], d["user"], d["counter"]), (taker.token, "EXAMPLE\\akim", 1))
+        with self.assertRaises(LockLost):
+            held.check()
+        taker.check(budget_s=7.5)
+
     def test_check_with_a_budget(self):
         view = self.fs.view()
         st = self.store(identity(sender=True), view=view)

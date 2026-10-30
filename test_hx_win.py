@@ -130,15 +130,24 @@ class OpenForReadTests(unittest.TestCase):
             hx_win.open_for_read(self.folder)
 
     def test_swap_while_open(self):
-        # The property every status file relies on: a reader never blocks another writer's os.replace
+        # A reader keeps the old file to the end of its read. Elsewhere os.replace goes through while it
+        # holds the file; Windows' os.replace (MoveFileExW) can refuse a target that is still open, even
+        # one that shares delete (storage.md §8.2 item 3), and must work once the reader lets go
         a = self.write("a", b"old")
         f = hx_win.open_for_read(a)
         try:
             b = self.write("b", b"new")
-            os.replace(b, a)
+            try:
+                os.replace(b, a)
+                swapped = True
+            except PermissionError:
+                self.assertTrue(hx_win.is_windows())
+                swapped = False
             self.assertEqual(f.read(), b"old")
         finally:
             f.close()
+        if not swapped:
+            os.replace(b, a)
         with hx_win.open_for_read(a) as g:
             self.assertEqual(g.read(), b"new")
 

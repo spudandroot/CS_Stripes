@@ -1737,11 +1737,11 @@ class TestPrintTests(Base):
                 admin.data.current = data
                 plan = self.plan(admin, TestRanges(vary="position", start=0, stop=0, step=1), kind="spacing",
                                  data=data)
-                self.assertEqual([(s.label, s.position_mm) for s in plan.steps], [("SPACE A", 365.0),
-                                                                                  ("SPACE B", 55.0)])
+                self.assertEqual([(s.label, s.position_mm) for s in plan.steps], [("SPACE A", 60.0),
+                                                                                  ("SPACE B", 360.0)])
                 result = admin.print_run(plan).run(lambda e: None)
                 self.assertTrue(result.ok, result.msg)
-                self.assertEqual(dlymm(fake), [365, 55])
+                self.assertEqual(dlymm(fake), [60, 360])
                 self.assertClean(fake)
 
     # ---- runs that end before they send anything (review findings: printing_off True, not False,
