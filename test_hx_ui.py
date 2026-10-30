@@ -3,16 +3,19 @@ alert sound). Run: xvfb-run -a python -m unittest -v
 
 The Tk tests need a display; they skip themselves when Tk can't start. The hx_ui_common tests are
 in test_hx_ui_common.py; the Send and admin screens are tested in test_hx_ui_send.py and
-test_hx_ui_admin.py.
+test_hx_ui_admin.py with a stub Navigator, so RealWindowTests here checks the real Navigator with
+their real windows.
 """
 
 import contextlib
 import dataclasses
 import gc
+import importlib.util
 import io
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -23,17 +26,20 @@ from unittest import mock
 
 import hx_state
 import hx_ui
+import hx_ui_admin
 import hx_ui_common
 import hx_ui_monitor
+import hx_ui_send
 import hx_win
 import i18n
 from hx_core import FakeClock, Msg
 from hx_fake import FakeWorld
 from hx_message import merge_plan
-from hx_model import (AMBER, BLUE, GREEN, GREY, RED, TIMINGS, Alert, BoardUpdate, BoardView, LineChoice, LineView,
-                      MachineView, PollerUpdate, SendRequest, ShareHealth, ShareUnavailable, new_id)
+from hx_model import (ALLOWED_WRITE_TAGS, AMBER, BLUE, GREEN, GREY, RED, STEP_VERIFY_IDLE, TIMINGS, Alert,
+                      BoardUpdate, BoardView, LineChoice, LineView, MachineResult, MachineView, PollerUpdate,
+                      SendRequest, SendResult, ShareHealth, ShareUnavailable, new_id)
 from hx_protocol import GateRegistry, release_key
-from hx_ui_common import CARD_BG, COLOUR_HEX, DIM_FG, SyncBackground
+from hx_ui_common import CARD_BG, COLOUR_HEX, DIM_FG, SyncBackground, WorkFailed
 from hx_ui_monitor import FloorBoard, LineBoard, MonitorWindow, UserSettingsDialog, board_summary, floor_layout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1029,8 +1035,8 @@ class NavigatorTests(UiCase):
             nav.open_test_print(film_id=self.world.ids["film"], kind="spacing")
 
     def test_open_send_and_one_window_per_key(self):
-        # Stand-ins for hx_ui_send's windows (the real ones are tested in test_hx_ui_send.py), so the
-        # Navigator's own rules are checked here
+        # Stand-ins for hx_ui_send's windows, so the Navigator's own rules are checked on their own
+        # (RealWindowTests opens the real ones)
         made = []
 
         class SendWindow(hx_ui_common.HxWindow):
