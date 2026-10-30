@@ -1,5 +1,12 @@
-"""Tests for the non-UI parts of stripes. Run: python -m unittest -v"""
+"""Tests for stripes: the Zebra side, and how the window hosts the MapleJet tab (the v2 folders,
+the two tabs, the shortcuts, the language switch, the tray and quitting). Run: python -m unittest -v
 
+The window tests need a display (on Linux: xvfb-run -a python -m unittest -v); they skip
+themselves when Tk can't start.
+"""
+
+import gc
+import json
 import os
 import re
 import shutil
@@ -7,12 +14,27 @@ import tempfile
 import socket
 import sys
 import threading
+import time
+import tkinter as tk
 import types
 import unittest
+from dataclasses import asdict, replace
+from tkinter import ttk
 from unittest import mock
 
+import hx_ui
+import hx_ui_common
+import hx_ui_monitor
+import hx_ui_send
+import hx_win
+import i18n
 import label_design as ld
 import stripes as zl
+from hx_core import FakeClock, Msg
+from hx_fake import FakeWorld
+from hx_model import (AMBER, GREEN, STEP_CONFIRM_2, TIMINGS, BoardUpdate, BoardView, Identity, LineChoice, LineView,
+                      MachineResult, MachineView, SendRequest, SendResult, new_id)
+from hx_protocol import GateRegistry, release_key
 
 ZD420 = zl.Printer(name="Packing", host="127.0.0.1", model="ZD420", width_in=2, height_in=1, dpi=203)
 ZT410 = zl.Printer(name="Pallets", host="127.0.0.1", model="ZT410", width_in=3, height_in=3, dpi=300)
@@ -582,9 +604,11 @@ class DeploymentLogTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "missing")))
 
     def test_status_folder_sits_next_to_config(self):
+        # This version reports in under v2; the older versions' folder is only read (architecture §10.5)
         config = os.path.join(self.dir, "Stripes", "config")
-        with mock.patch.dict(os.environ, {"STRIPES_STATUS": "", "STRIPES_CONFIG": config}):
-            self.assertEqual(zl.status_folder(), os.path.join(self.dir, "Stripes", "status"))
+        with mock.patch.dict(os.environ, {"STRIPES_STATUS": "", "STRIPES_CONFIG": config, "STRIPES_V2": ""}):
+            self.assertEqual(zl.status_folder(), os.path.join(self.dir, "Stripes", "v2", "status", "deployment"))
+            self.assertEqual(zl.old_status_folder(), os.path.join(self.dir, "Stripes", "status"))
 
 
 if __name__ == "__main__":
