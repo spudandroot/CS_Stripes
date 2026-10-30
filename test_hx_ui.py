@@ -44,8 +44,11 @@ from hx_ui_monitor import FloorBoard, LineBoard, MonitorWindow, UserSettingsDial
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ui.md §17.1's scaled timings, with printer and share timeouts that leave room for a busy machine
-SCALED = dataclasses.replace(TIMINGS.scaled(0.05), http_timeout_s=0.5, web_repeat_window_s=0.5, share_timeout_s=1.0)
+# ui.md §17.1's scaled timings, with printer and share timeouts that leave room for a busy machine. The
+# lock's stale time stays well above twice the longest printer call, as the lock budget needs (storage.md
+# §11.3), so a Send in RealWindowTests never judges its lock lost on a slow machine
+SCALED = dataclasses.replace(TIMINGS.scaled(0.05), http_timeout_s=0.5, web_repeat_window_s=0.5, share_timeout_s=1.0,
+                             lock_stale_s=30.0)
 
 
 # --------------------------------------------------------------------------
