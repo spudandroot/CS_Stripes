@@ -1,5 +1,6 @@
 # PyInstaller recipe for Stripes.exe, used by the Actions build and build.bat:
-#     python make_version.py v1.2.0      (writes stripes_version.py and version_info.txt)
+#     python make_version.py v1.2.0      (writes stripes_version.py and version_info.txt, and
+#                                         hx_key.py when STRIPES_HX_KEY is set: see README)
 #     pyinstaller --noconfirm pyinstaller.spec
 # It leaves out parts of Python, Pillow and Tcl that Stripes never uses, so the exe is
 # smaller and starts faster. The build's self-check (Stripes.exe --self-check) loads
@@ -14,6 +15,8 @@ EXCLUDES = [
     "pydoc", "pydoc_data", "multiprocessing",
     # OpenSSL (2 MB): the exact preview uses Windows' own HTTPS (wininet_post)
     "ssl", "_ssl", "_hashlib",
+    # test-only: the fake printer must never ship (app code never imports it)
+    "hx_fake",
 ]
 
 # Tcl's time zones and month names (only its clock command uses them) and its East Asian
