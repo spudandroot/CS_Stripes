@@ -41,18 +41,15 @@ import urllib.parse
 from datetime import datetime, timedelta
 
 import hx_protocol
+import hx_share
+import hx_time
 from hx_core import SYSTEM_CLOCK
 from hx_model import (ALLOWED_WRITE_TAGS, FORBIDDEN_QUERY_TAGS, STANDARD_FONTS, TIMINGS, Company, Country,
                       DesignItem, Film, Identity, Ink, Line, Machine, MessageDesign, Printer, PrintText,
                       PrintTextItem, Product, new_id)
 from hx_protocol import (EDITOR_PATH, PRINTER_WIDE_WRITES, QUERY_SPECS, SME_PATH, SME_REPEAT_PATH, WEB_FILES,
                          decode_text, make_token, release_key, scramble)
-
-try:
-    from hx_time import local_utc_offset
-except ImportError:     # hx_time is built in parallel; until then the same rule (send.md §9.3 item 1)
-    def local_utc_offset(utc):
-        return float(time.localtime(utc).tm_gmtoff)
+from hx_time import local_utc_offset
 
 # What a message gets for every print setting not sent (seen), in the printer's order
 FAKE_DEFAULT_SETTINGS = (
@@ -1128,15 +1125,14 @@ class FakeWorld:
     Line 1 Bagger 1, ...) with hx_share.write_record plus a changes.json (protocol.md §16.2)."""
 
     def __init__(self, tmpdir, *, printers=(), clock=SYSTEM_CLOCK, timings=TIMINGS):
-        # FakePrinter works without them; only the world needs the share and time modules
-        import hx_share
-        self._share = hx_share
         self.tmpdir = tmpdir
         self.clock = clock
         self.timings = timings
         self.share_root = os.path.join(tmpdir, "share", "v2")
+        # A test world has no folder script, so it makes the script's folders itself
         for folder in _FOLDERS:
             os.makedirs(os.path.join(self.share_root, *folder.split("/")), exist_ok=True)
+        # The share's not-found cache and listing delay run on the world's clock, like everything else
         self.fs = hx_share.FlakyFileOps(clock=clock)
         self.printers = []
         self.sntp = None
@@ -1167,7 +1163,7 @@ class FakeWorld:
         store = self.store(self.identity("admin", admin=True, sender=False))
         now = self.clock.time()
         base = {"revision": 1, "updated_by": "EXAMPLE\\admin", "updated_at": now}
-        write = lambda record: self._share.write_record(store, record)
+        write = lambda record: hx_share.write_record(store, record)
         write(Company(id="company", **base, time_server=f"127.0.0.1:{self.sntp.port}",
                       countries=[Country(name="USA", aliases=["US", "U.S.A.", "United States"]),
                                  Country(name="Canada", aliases=["CAN"]), Country(name="Mexico", aliases=["MEX"])],
@@ -1217,21 +1213,20 @@ class FakeWorld:
 
     def store(self, identity):
         """Each simulated PC gets its own store, on its own fs.view() (its own caches and calls)."""
-        return self._share.ShareStore(self.share_root, identity=identity, clock=self.clock, fs=self.fs.view(),
-                                      timings=self.timings, version="test")
+        return hx_share.ShareStore(self.share_root, identity=identity, clock=self.clock, fs=self.fs.view(),
+                                   timings=self.timings, version="test")
 
     def paths(self, identity):
         pc = os.path.join(self.tmpdir, "pcs", identity.key)
         machine = os.path.join(self.tmpdir, "pcs", re.sub(r"[^A-Za-z0-9._-]+", "_", identity.computer), "machine")
-        paths = self._share.HxPaths(share_root=self.share_root, roaming=os.path.join(pc, "roaming"),
-                                    local=os.path.join(pc, "local"), machine=machine)
+        paths = hx_share.HxPaths(share_root=self.share_root, roaming=os.path.join(pc, "roaming"),
+                                 local=os.path.join(pc, "local"), machine=machine)
         for folder in (paths.roaming, paths.local, paths.machine):
             os.makedirs(folder, exist_ok=True)
         return paths
 
     def time_source(self):
         """A TimeSource asking the fake time server, the same host the seeded company names."""
-        import hx_time
         return hx_time.TimeSource([f"127.0.0.1:{self.sntp.port}"], clock=self.clock)
 
     def close(self):
@@ -1268,8 +1263,8 @@ def main(argv=None):
             else:
                 print(f"export {name}={shlex.quote(value)}")
         ports = ", ".join(str(p.port) for p in world.printers)
-        print(f"# Fake printers on 127.0.0.1 port {ports}; time server on UDP port {world.sntp.port}. "
-              "Ctrl+C stops.", flush=True)
+        print(f"# {len(world.printers)} {spec['placement']} fake printer(s) on 127.0.0.1 port {ports}; "
+              f"time server on UDP port {world.sntp.port}. Ctrl+C stops.", flush=True)
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:

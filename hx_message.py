@@ -26,7 +26,7 @@ import math
 import re
 import time
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 from hx_core import Msg
 from hx_model import (AMBER, BOLD_RANGE, CANVAS, CARTRIDGES, CODE_MAX, DEFAULT_IDLE_SLOT, DELAY_US_MAX, DLYMM_MAX,
@@ -107,7 +107,6 @@ _MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
 _ITEM_ID = re.compile(r"i[0-9]{1,3}")
 _FOUR_INTS = re.compile(r"(-?\d+),(-?\d+),(-?\d+),(-?\d+)")
 _DELAY_MS_MAX = DELAY_US_MAX / 1000              # 120000 ms
-_PRINTER_LINE = re.compile(r"[\r\n]")
 
 # --------------------------------------------------------------------------
 # Texts (send.md §19.1)
@@ -157,7 +156,8 @@ ES = {
         "La impresora de {machine} no está configurada: falta, no está activa o no tiene contraseña guardada.",
     "{machine} has no print speed. An administrator must set it.":
         "{machine} no tiene velocidad de impresión. Un administrador debe configurarla.",
-    "{machine} isn't calibrated: it has no head distance.": "{machine} no está calibrada: no tiene distancia del cabezal.",
+    "{machine} isn't calibrated: it has no head distance.":
+        "{machine} no está calibrada: no tiene distancia del cabezal.",
     "Film {film} has no length, which encoder machines need.":
         "La película {film} no tiene largo, y las máquinas con encoder lo necesitan.",
     "Film {film} has no print position, which encoder machines need.":
@@ -185,7 +185,8 @@ ES = {
     "Item {n} must be placed right of or below the previous item.":
         "El elemento {n} debe ir a la derecha o debajo del anterior.",
     "The gap before item {n} must be 0 to {max}.": "El espacio antes del elemento {n} debe ser de 0 a {max}.",
-    "The origin item can't have text before or after it.": "El elemento de origen no puede tener texto antes ni después.",
+    "The origin item can't have text before or after it.":
+        "El elemento de origen no puede tener texto antes ni después.",
     "Item {n} needs its fixed text.": "El elemento {n} necesita su texto fijo.",
     "Item {n} needs a date format.": "El elemento {n} necesita un formato de fecha.",
     "The packed-on date can't have an offset.": "La fecha de empaque no puede tener desfase.",
@@ -202,7 +203,8 @@ ES = {
         "El código de la película debe tener de 1 a 6 letras mayúsculas o dígitos.",
     "Another film already uses the code {code}.": "Otra película ya usa el código {code}.",
     "The film's product doesn't exist.": "El producto de la película no existe.",
-    "The side, cartridge type or ink colour isn't valid.": "El lado, el tipo de cartucho o el color de tinta no es válido.",
+    "The side, cartridge type or ink colour isn't valid.":
+        "El lado, el tipo de cartucho o el color de tinta no es válido.",
     "The film length must be more than 0 and at most {max} mm.":
         "El largo de la película debe ser mayor que 0 y como máximo {max} mm.",
     "The print position must be between 0 and the film length.":
@@ -213,7 +215,8 @@ ES = {
     "Font, size, resolution, bold or width is out of range.":
         "La fuente, el tamaño, la resolución, la negrita o el ancho están fuera de rango.",
     "Enter the pre-printed origin.": "Escriba el origen preimpreso.",
-    "A print text allowed with this film doesn't exist.": "Un texto de impresión permitido con esta película no existe.",
+    "A print text allowed with this film doesn't exist.":
+        "Un texto de impresión permitido con esta película no existe.",
     "Print text {print_text} has an origin item, but this film's origin is pre-printed.":
         "El texto de impresión {print_text} tiene un elemento de origen, pero el origen de esta película está "
         "preimpreso.",
@@ -223,7 +226,8 @@ ES = {
         "Una película activa necesita al menos un texto de impresión y uno predeterminado.",
     "The default print text must be one of the film's print texts.":
         "El texto de impresión predeterminado debe ser uno de los de la película.",
-    "The code must be 1 to 3 capital letters or digits.": "El código debe tener de 1 a 3 letras mayúsculas o dígitos.",
+    "The code must be 1 to 3 capital letters or digits.":
+        "El código debe tener de 1 a 3 letras mayúsculas o dígitos.",
     "The cartridge type isn't valid.": "El tipo de cartucho no es válido.",
     "The machine's line doesn't exist.": "La línea de la máquina no existe.",
     "The machine's printer doesn't exist.": "La impresora de la máquina no existe.",
@@ -265,7 +269,8 @@ ES = {
     "The tape measurement is too far from the print to be sure. Measure the head distance again.":
         "La medida con cinta está demasiado lejos de la impresión para estar seguros. Vuelva a medir la "
         "distancia del cabezal.",
-    "No Send is recorded for {machine}. Send instead.": "No hay ningún envío registrado para {machine}. Haga un envío.",
+    "No Send is recorded for {machine}. Send instead.":
+        "No hay ningún envío registrado para {machine}. Haga un envío.",
     "{machine} is in the middle of a Send or a test.": "{machine} está en medio de un envío o de una prueba.",
     "The last Send to {machine} was rejected. Send again instead.":
         "El último envío a {machine} fue rechazado. Haga un envío nuevo.",
@@ -518,6 +523,125 @@ def _text_problems(text, where, company):
     return problems
 
 
+# Origin words can also appear where checked pieces print together: "Grown " before a free text
+# "in Florida", a code "IN" after "Made ", or a fixed "Made" right of which prints "in Peru". The
+# plan says no other text can carry origin words, so what prints is checked as well as the pieces.
+
+def _origin_matcher(terms):
+    """found(text) -> the set of terms in text, by the §2.3 rules."""
+    tokens = [(term, origin_tokens(term)) for term in terms]
+
+    def found(text):
+        if not text:
+            return set()
+        t = origin_tokens(text)
+        return {term for term, tok in tokens if _term_matches(tok, t)}
+    return found
+
+
+def _separator(item):
+    # §3.5: what prints between an item and the one before it
+    if item.placement == "below":
+        return " / "
+    return " " if _is_int(item.gap) and item.gap > 0 else ""
+
+
+def _item_pieces(item, value):
+    """What an item prints, in order, with None where text on either side doesn't join: a date
+    (digits and month names), a value not known yet and an origin phrase whose countries aren't
+    known yet."""
+    if item.kind == "origin" and value is None:
+        return [None]
+    if item.kind in _DATE_KINDS or value is None:
+        return [item.before, None, item.after]
+    return [item.before + value + item.after]
+
+
+def _runs(entries):
+    """The texts that print next to each other: [[(n, text), ...], ...], in order."""
+    runs, run = [], []
+    for k, (n, item, value) in enumerate(entries):
+        sep = _separator(item) if k else ""
+        for piece in _item_pieces(item, value):
+            if piece is None:
+                if run:
+                    runs.append(run)
+                run, sep = [], ""
+                continue
+            run.append((n, sep + piece))
+            sep = ""
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _own_words(entries, found, reported):
+    """{n: words an item holds on its own}. The origin phrase is the origin, so its words are always
+    its own. With reported, so are the words of an item's text before, value and text after, because
+    each of those is reported by itself (a lot isn't)."""
+    own = {}
+    for n, item, value in entries:
+        pieces = []
+        if item.kind == "origin":
+            pieces = [value or ""]
+        elif reported:
+            pieces = [item.before, item.after]
+            if value is not None and item.kind != "lot":
+                pieces.append(value)
+        own[n] = set().union(*(found(p) for p in pieces))
+    return own
+
+
+def _joined_origin_words(entries, terms, *, countries=(), reported=True):
+    """Origin words found where texts print together: an item's text before, value and text after,
+    and items printed next to each other, also across lines. entries are (n, item, value) for the
+    items that print, in order, n the item's 1-based position and value None when it isn't known.
+    Returns [(n, words)], each word under the item that completes it. With reported, words a
+    piece holds on its own are left out, because that piece is reported by itself.
+
+    With countries (at Send), the origin item prints their phrase. Its own words are never reported,
+    but the text next to it may not make new ones with it: "Product of Niger" with "ia" right of it
+    prints "Product of Nigeria". The text right of it is also checked with the last country alone, so
+    a country already in the phrase is caught when made again ("Product of Nigeria and Niger", "ia")."""
+    found = _origin_matcher(terms)
+    passes = [(entries, None)]
+    if countries:
+        phrase = origin_phrase(countries)
+        passes = [([(n, it, phrase if it.kind == "origin" else v) for n, it, v in entries], None)]
+        start = next((k for k, (_, it, _) in enumerate(entries) if it.kind == "origin"), None)
+        if start is not None:
+            # only the run that starts with the last country
+            tail = [(n, it, countries[-1] if it.kind == "origin" else v) for n, it, v in entries[start:]]
+            passes.append((tail, 1))
+    out = {}
+    for pass_entries, keep in passes:
+        own = _own_words(pass_entries, found, reported)
+        for run in _runs(pass_entries)[:keep]:
+            skip = set().union(*(own[n] for n, _ in run))
+            if not found("".join(text for _, text in run)) - skip:
+                continue
+            # which item completes each word: the run grows piece by piece
+            text, seen = "", set()
+            for n, piece in run:
+                text += piece
+                words = found(text)
+                new = words - seen - own[n]
+                seen |= words
+                if new:
+                    out.setdefault(n, set()).update(new)
+    return [(n, [t for t in terms if t in out[n]]) for n in sorted(out)]
+
+
+def _saved_entries(pt):
+    """What a saved print text prints as far as is known before Send: fixed texts only. A second
+    list leaves out the optional free texts, which a Send may leave empty."""
+    entries = [(n, it, it.text if it.kind == "fixed" else None) for n, it in enumerate(pt.items, start=1)]
+    lists = [entries]
+    if any(it.kind == "free_text" and not it.required for _, it, _ in entries):
+        lists.append([e for e in entries if not (e[1].kind == "free_text" and not e[1].required)])
+    return lists
+
+
 def origin_change_text(old_origin_line, new_origin_line):
     """The Send window's highlight: "USA → USA and Canada"; "" when the origin doesn't change. Bag text."""
     def bare(s):
@@ -681,6 +805,15 @@ def validate_print_text(pt, company):
         longest = _longest_txt(it, company) if it.kind in ITEM_KINDS else None
         if longest is not None and longest > TXT_MAX:
             problems.append(_too_long(Msg(N_("Item {n}"), {"n": n}), TXT_MAX))
+
+    # The pieces as they print together: a fixed text with the text around it, and items next to
+    # each other ("Made" with "in Peru" right of it)
+    terms = _origin_terms(company)
+    for entries in _saved_entries(pt):
+        for n, words in _joined_origin_words(entries, terms):
+            msg = _origin_words_msg(Msg(N_("Item {n}"), {"n": n}), words)
+            if msg not in problems:
+                problems.append(msg)
     return problems
 
 
@@ -731,13 +864,19 @@ def origin_conflicts(data, company):
     """Warnings for a new country list: every print text, line and machine code that would now hold
     origin words. Those records can't be sent until fixed (Send checks them again)."""
     problems = []
+    terms = _origin_terms(company)
     for pt in _sorted(data.print_texts):
         texts = []
         for it in pt.items:
             texts += [it.before, it.after]
             if it.kind == "fixed":
                 texts.append(it.text)
-        words = _words_in(texts, company)
+        found = set(_words_in(texts, company))
+        # and as the pieces print together (validate_print_text checks the same)
+        for entries in _saved_entries(pt):
+            for _, joined in _joined_origin_words(entries, terms, reported=False):
+                found.update(joined)
+        words = [t for t in terms if t in found]
         if words:
             problems.append(Msg(N_("Print text {name} now contains words about origin: {words}."),
                                 {"name": pt.name, "words": ", ".join(words)}))
@@ -891,10 +1030,31 @@ def _free_value(choice_free_text, item):
     return value.strip() if isinstance(value, str) else ""
 
 
+def _left_out(item, free_text):
+    # an optional free text left empty is left out of the message
+    return item.kind == "free_text" and not item.required and not _free_value(free_text, item)
+
+
 def _present_items(pt, free_text):
     """The items that will be sent: an optional free text left empty is left out."""
-    return [it for it in pt.items
-            if not (it.kind == "free_text" and not it.required and not _free_value(free_text, it))]
+    return [it for it in pt.items if not _left_out(it, free_text)]
+
+
+def _choice_value(item, choice, line, machine):
+    """What a CTEXT item shows for this choice; None for a date, the origin, or a machine code
+    when no machine is known."""
+    kind = item.kind
+    if kind == "fixed":
+        return item.text
+    if kind == "lot":
+        return choice.lot.strip()
+    if kind == "free_text":
+        return _free_value(choice.free_text, item)
+    if kind == "line_code":
+        return line.code
+    if kind == "machine_code":
+        return machine.code if machine is not None else None
+    return None
 
 
 def validate_choice(choice, data, identity):
@@ -988,6 +1148,24 @@ def validate_choice(choice, data, identity):
                 problems.append(_too_long(where, TXT_MAX))
         if pt.items and not _present_items(pt, choice.free_text):
             problems.append(Msg(N_("The print text has no items.")))
+        # Free text, lot and codes as they print: with the text before and after them and the items
+        # next to them ("Grown " and "in Florida"), the origin phrase too ("Product of Niger" and
+        # "ia"). Each machine prints its own code.
+        terms = _origin_terms(company)
+        countries = []
+        if (film is not None and not film.origin_preprinted
+                and all(isinstance(c, str) for c in choice.countries)):
+            countries = list(choice.countries)
+        for machine in machines or [None]:
+            entries = [(n, it, _choice_value(it, choice, line, machine))
+                       for n, it in enumerate(pt.items, start=1) if not _left_out(it, choice.free_text)]
+            for n, words in _joined_origin_words(entries, terms, countries=countries):
+                it = pt.items[n - 1]
+                if it.kind == "free_text":
+                    where = Msg(N_('The free text "{label}"'), {"label": it.label})
+                else:
+                    where = Msg(N_("Item {n}"), {"n": n})
+                problems.append(_origin_words_msg(where, words))
 
     # 7. The records again
     if pt is not None:
@@ -1301,6 +1479,15 @@ def _text_items(plan):
             _need(_free_value(plan.free_text, it) != "", "a required free text")
         if it.kind == "origin":
             _need(plan.origin_line == origin_phrase(plan.countries), "the origin line")
+    # Only the origin item may carry origin words, alone or joined with the items next to it, and
+    # nothing next to it may make new ones with the phrase. merge_plan refuses this first, with the
+    # company's full list; a plan knows only the chosen countries, so this checks the fixed words and
+    # those.
+    terms = list(dict.fromkeys(list(ORIGIN_WORDS) + list(plan.countries)))
+    entries = [(k, it, None if it.kind in _DATE_KINDS or it.kind == "origin" else _item_value(plan, it))
+               for k, it in enumerate(present, start=1)]
+    if _joined_origin_words(entries, terms, countries=plan.countries, reported=False):
+        raise ValueError("build_message: words about origin outside the origin item")
     items = []
     prev = line_start = None
     for k, it in enumerate(present):

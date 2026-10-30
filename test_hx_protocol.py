@@ -2,7 +2,6 @@
 
 import base64
 import gzip
-import importlib.util
 import os
 import re
 import secrets
@@ -1600,21 +1599,18 @@ class FakeSntpTests(unittest.TestCase):
         self.assertEqual(server.requests, 1)
 
 
-def _have(name):
-    return importlib.util.find_spec(name) is not None
-
-
-@unittest.skipUnless(_have("hx_share"), "FakeWorld needs hx_share")
 class FakeWorldTests(unittest.TestCase):
-    @unittest.skipUnless(_have("hx_time"), "the time source needs hx_time")
+    def world(self, **kw):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        world = hx_fake.FakeWorld(tmp.name, **kw)
+        self.addCleanup(world.close)
+        return tmp.name, world
+
     def test_time_source(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            world = hx_fake.FakeWorld(tmp)
-            try:
-                self.assertEqual(world.time_source().now(fresh=True).source, "server")
-                self.assertGreaterEqual(world.sntp.requests, 1)
-            finally:
-                world.close()
+        _, world = self.world()
+        self.assertEqual(world.time_source().now(fresh=True).source, "server")
+        self.assertGreaterEqual(world.sntp.requests, 1)
 
     def test_unknown_printer_setting(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1629,60 +1625,196 @@ class FakeWorldTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 socket.create_connection(("127.0.0.1", world.printers[0].port), timeout=0.5).close()
 
+    def test_close(self):
+        _, world = self.world()
+        world.close()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sock.close)
+        sock.settimeout(0.2)
+        sock.sendto(b"\x23" + bytes(47), ("127.0.0.1", world.sntp.port))
+        with self.assertRaises(OSError):        # a timeout, or refused: either way nobody answers
+            sock.recvfrom(1024)
+        world.close()                           # twice is harmless
+
+    def test_default_offset(self):
+        import hx_time
+        fake = FakePrinter()
+        self.assertIs(fake.offset_fn, hx_time.local_utc_offset)
+        clock = FakeClock()                                     # 29 Oct 2026 12:00 UTC
+        fake = FakePrinter(clock=clock, offset_fn=EDT)
+        self.assertEqual(fake.base_offset_s, -4 * 3600.0)
+        self.assertEqual(fake.printer_clock(), datetime(2026, 10, 29, 8, 0))
+        # The fake's clock starts at the local time a TimeSource with the same offset function gives
+        self.assertEqual(hx_time.TimeSource([], clock=clock, offset_fn=EDT).now().local, fake.printer_clock())
+
     def test_seed(self):
         import hx_share
+        import hx_time
         from hx_model import Company, Film, Line, Machine, PrintText, Product, from_json
-        with tempfile.TemporaryDirectory() as tmp:
-            world = hx_fake.FakeWorld(tmp, printers=[{}, {"placement": "encoder", "name": "Printer B"}])
-            try:
-                self.assertEqual(world.share_root, os.path.join(tmp, "share", "v2"))
-                store = world.store(world.identity("jsmith"))
+        tmp, world = self.world(printers=[{}, {"placement": "encoder", "name": "Printer B"}])
+        self.assertEqual(world.share_root, os.path.join(tmp, "share", "v2"))
+        store = world.store(world.identity("jsmith"))
 
-                def load(cls, record_id):
-                    data = store.read_json(hx_share.record_rel_for(cls, record_id))
-                    self.assertIsNotNone(data, (cls, record_id))
-                    return from_json(cls, data)
-                company = load(Company, "company")
-                self.assertEqual(company.time_server, f"127.0.0.1:{world.sntp.port}")
-                self.assertEqual([c.name for c in company.countries], ["USA", "Canada", "Mexico"])
-                self.assertEqual((company.revision, company.updated_by), (1, "EXAMPLE\\admin"))
-                self.assertEqual(load(Line, world.ids["line"]).name, "Line 1")
-                first = load(Machine, world.ids["machine1"])
-                second = load(Machine, world.ids["machine2"])
-                self.assertEqual((first.name, first.code, first.placement, first.print_speed),
-                                 ("Line 1 Bagger 1", "B1", "delay", 2400))
-                self.assertEqual((second.placement, second.head_distance_mm, second.encoder_ppr),
-                                 ("encoder", 412.0, 5000))
-                printer = load(Printer, world.ids["printer2"])
-                self.assertEqual((printer.name, printer.port), ("Printer B", world.printers[1].port))
-                self.assertEqual(hp.unscramble(printer.token, hp.release_key()), TOKEN)
-                film = load(Film, world.ids["film"])
-                self.assertEqual((film.code, film.default_print_text_id), ("EXCO1", world.ids["print_text"]))
-                self.assertEqual(load(PrintText, world.ids["print_text"]).code, "PKO")
-                self.assertEqual(load(Product, world.ids["product"]).customer, "Example Co")
-                self.assertEqual(store.read_json("config/hx/changes.json")["counter"], 1)
-                views = []
-                real_view = world.fs.view
+        def load(cls, record_id):
+            data = store.read_json(hx_share.record_rel_for(cls, record_id))
+            self.assertIsNotNone(data, (cls, record_id))
+            return from_json(cls, data)
+        company = load(Company, "company")
+        self.assertEqual(company.time_server, f"127.0.0.1:{world.sntp.port}")
+        self.assertEqual([c.name for c in company.countries], ["USA", "Canada", "Mexico"])
+        self.assertEqual(company.countries[0].aliases, ["US", "U.S.A.", "United States"])
+        self.assertEqual([(i.name, i.cartridge, i.colour) for i in company.inks],
+                         [("Example Black", "plastic", "black"), ("Example White", "plastic", "white"),
+                          ("Example Paper Black", "paper", "black")])
+        self.assertEqual((company.admin_group_sid, company.sender_group_sid),
+                         ("S-1-5-21-1000-2000-3000-1101", "S-1-5-21-1000-2000-3000-1102"))
+        self.assertEqual((company.revision, company.updated_by), (1, "EXAMPLE\\admin"))
+        self.assertEqual(world.ids["company"], "company")
+        line = load(Line, world.ids["line"])
+        self.assertEqual((line.name, line.code, line.cartridge, line.notify_user),
+                         ("Line 1", "L1", "plastic", "EXAMPLE\\jsmith"))
+        first = load(Machine, world.ids["machine1"])
+        second = load(Machine, world.ids["machine2"])
+        self.assertEqual((first.name, first.code, first.placement, first.print_speed, first.head_distance_mm),
+                         ("Line 1 Bagger 1", "B1", "delay", 2400, None))
+        self.assertEqual((second.name, second.placement, second.head_distance_mm, second.encoder_wheel_mm,
+                          second.encoder_ppr), ("Line 1 Bagger 2", "encoder", 412.0, 56.0, 5000))
+        self.assertEqual((first.line_id, first.printer_id, second.printer_id),
+                         (line.id, world.ids["printer1"], world.ids["printer2"]))
+        self.assertEqual(load(Printer, world.ids["printer1"]).name, "Printer 1")
+        printer = load(Printer, world.ids["printer2"])
+        self.assertEqual((printer.name, printer.host, printer.port, printer.uid, printer.revision),
+                         ("Printer B", "127.0.0.1", world.printers[1].port, 1109, 1))
+        self.assertEqual(hp.unscramble(printer.token, hp.release_key()), TOKEN)
+        film = load(Film, world.ids["film"])
+        self.assertEqual((film.code, film.artwork_revision, film.status, film.side, film.cartridge, film.ink_colour),
+                         ("EXCO1", "Rev C", "active", "back", "plastic", "black"))
+        self.assertEqual((film.length_mm, film.position_mm, film.delay_ms), (610.0, 150.0, 480.0))
+        self.assertEqual((film.font, film.size, film.resolution, film.bold, film.width), (2, 4, 0, 1, 1))
+        self.assertEqual((film.print_text_ids, film.default_print_text_id),
+                         ([world.ids["print_text"]], world.ids["print_text"]))
+        print_text = load(PrintText, world.ids["print_text"])
+        self.assertEqual((print_text.name, print_text.code, print_text.status),
+                         ("Packed on + origin", "PKO", "active"))
+        self.assertEqual([(i.id, i.kind, i.before, i.placement) for i in print_text.items],
+                         [("i1", "packed_date", "Packed on ", "right"), ("i2", "origin", "", "below"),
+                          ("i3", "lot", "Lot ", "right")])
+        self.assertEqual(print_text.items[0].date_format, "MM/DD/YY")
+        product = load(Product, world.ids["product"])
+        self.assertEqual((product.name, product.customer, film.product_id),
+                         ("Example Co 2lb Onion", "Example Co", product.id))
+        changes = store.read_json("config/hx/changes.json")
+        self.assertEqual((changes["file_type"], changes["counter"], changes["written_by"]),
+                         ("changes", 1, "EXAMPLE\\admin"))
+        # The company's time server is the fake one, port included, as make_services reads it
+        self.assertEqual(hx_time.TimeSource([company.time_server]).now(fresh=True).source, "server")
+        views = []
+        real_view = world.fs.view
 
-                def view(**kw):
-                    views.append(real_view(**kw))
-                    return views[-1]
-                with mock.patch.object(world.fs, "view", view):
-                    world.store(world.identity("a"))
-                    world.store(world.identity("b"))
-                self.assertEqual(len(views), 2)
-                self.assertIsNot(views[0], views[1])
-                token = world.printers[0].printer_record().token
-                self.assertEqual(hp.unscramble(token, hp.release_key()), TOKEN)
-                ident = world.identity("akim", admin=True)
-                self.assertEqual((ident.user, ident.computer), ("EXAMPLE\\akim", "PC-AKIM"))
-                self.assertTrue(ident.is_admin(company) and ident.is_sender(company))
-                self.assertFalse(world.identity("x", sender=False).is_sender(company))
-                paths = world.paths(ident)
-                self.assertTrue(paths.roaming.startswith(os.path.join(tmp, "pcs", ident.key)))
-                self.assertTrue(os.path.isdir(paths.machine))
-            finally:
-                world.close()
+        def view(**kw):
+            views.append(real_view(**kw))
+            return views[-1]
+        with mock.patch.object(world.fs, "view", view):
+            a = world.store(world.identity("a"))
+            b = world.store(world.identity("b"))
+        self.assertEqual(len(views), 2)
+        self.assertIsNot(views[0], views[1])
+        self.assertIsNot(a.fs, b.fs)
+        token = world.printers[0].printer_record().token
+        self.assertEqual(hp.unscramble(token, hp.release_key()), TOKEN)
+        ident = world.identity("akim", admin=True)
+        self.assertEqual((ident.user, ident.computer, ident.pid), ("EXAMPLE\\akim", "PC-AKIM", 1))
+        self.assertTrue(ident.is_admin(company) and ident.is_sender(company))
+        self.assertFalse(world.identity("x", sender=False).is_sender(company))
+        self.assertFalse(world.identity("x").is_admin(company))
+        paths = world.paths(ident)
+        self.assertEqual(paths.share_root, world.share_root)
+        self.assertTrue(paths.roaming.startswith(os.path.join(tmp, "pcs", ident.key)))
+        self.assertTrue(paths.local.startswith(os.path.join(tmp, "pcs", ident.key)))
+        self.assertNotEqual(paths.roaming, paths.local)
+        self.assertEqual(paths.machine, os.path.join(tmp, "pcs", "PC-AKIM", "machine"))
+        self.assertTrue(os.path.isdir(paths.machine))
+        # Two users of one PC share its machine folder, not their own folders
+        other = world.paths(world.identity("akim", pid=2))
+        self.assertEqual(other.machine, paths.machine)
+        self.assertNotEqual(other.local, paths.local)
+
+    def test_first_cycle_loads_fully(self):
+        import hx_share
+        from hx_core import EventBus
+        _, world = self.world(printers=[{}, {"placement": "encoder"}])
+        ident = world.identity("jsmith")
+        store = world.store(ident)
+        data = hx_share.DataService(store=store, local=hx_share.LocalStore(world.paths(ident)), bus=EventBus(),
+                                    identity=ident, clock=world.clock, timings=world.timings)
+        data.run_once()
+        self.assertEqual(data.problems, [])
+        current = data.current
+        self.assertEqual(current.source, "share")
+        self.assertEqual(current.company.time_server, f"127.0.0.1:{world.sntp.port}")
+        self.assertEqual(set(current.machines), {world.ids["machine1"], world.ids["machine2"]})
+        self.assertEqual(set(current.printers), {world.ids["printer1"], world.ids["printer2"]})
+        self.assertEqual((set(current.lines), set(current.products), set(current.films), set(current.print_texts)),
+                         ({world.ids["line"]}, {world.ids["product"]}, {world.ids["film"]},
+                          {world.ids["print_text"]}))
+        self.assertEqual([m.name for m in current.line_machines(world.ids["line"])],
+                         ["Line 1 Bagger 1", "Line 1 Bagger 2"])
+        # The next cycle sees counter 1 again and reads only changes.json
+        before = len(store.fs.calls)
+        data.run_once()
+        read = [path for _, path in store.fs.calls[before:]]
+        self.assertTrue(read)
+        self.assertTrue(all(path.endswith("changes.json") for path in read), read)
+        self.assertIs(data.current.machines, current.machines)
+
+    def test_seed_can_be_sent(self):
+        import hx_message
+        import hx_share
+        from hx_core import EventBus
+        _, world = self.world(printers=[{}, {"placement": "encoder"}])
+        ident = world.identity("jsmith")
+        data = hx_share.DataService(store=world.store(ident), local=hx_share.LocalStore(world.paths(ident)),
+                                    bus=EventBus(), identity=ident)
+        data.run_once()
+        d = data.current
+        company = d.company
+        self.assertEqual(hx_message.validate_company(company), [])
+        self.assertEqual(hx_message.validate_line(d.lines[world.ids["line"]], d), [])
+        for n in (1, 2):
+            self.assertEqual(hx_message.validate_machine(d.machines[world.ids[f"machine{n}"]], d), [], n)
+        film = d.films[world.ids["film"]]
+        self.assertEqual(hx_message.validate_film(film, d), [])
+        self.assertEqual(hx_message.validate_print_text(d.print_texts[world.ids["print_text"]], company), [])
+        self.assertEqual(hx_message.origin_conflicts(d, company), [])
+        line = d.lines[world.ids["line"]]
+        self.assertEqual([f.id for f in hx_message.films_for_line(line, world.ids["product"], d)], [film.id])
+        self.assertEqual([p.id for p in hx_message.print_texts_for_film(film, d)], [world.ids["print_text"]])
+        self.assertTrue(ident.is_sender(company))
+
+    def test_script(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        stop = mock.Mock(side_effect=KeyboardInterrupt)     # Ctrl+C at the script's first wait
+        patched = types.SimpleNamespace(sleep=stop, time=time.time, monotonic=time.monotonic)
+        with mock.patch.object(hx_fake, "time", patched), contextlib.redirect_stdout(out):
+            hx_fake.main(["--printers", "2", "--encoder"])
+        lines = [line for line in out.getvalue().splitlines() if not line.startswith("#")]
+        values = {}
+        for line in lines:
+            word, rest = line.split(" ", 1)
+            self.assertEqual(word, "set" if sys.platform == "win32" else "export")
+            name, value = rest.split("=", 1)
+            values[name] = value if sys.platform == "win32" else hx_fake.shlex.split(value)[0]
+        self.assertEqual(list(values), ["STRIPES_V2", "STRIPES_V2_ROAMING", "STRIPES_V2_LOCAL", "STRIPES_V2_MACHINE",
+                                        "STRIPES_HX_USER", "STRIPES_HX_COMPUTER", "STRIPES_HX_SIDS"])
+        self.assertEqual((values["STRIPES_HX_USER"], values["STRIPES_HX_COMPUTER"]), ("EXAMPLE\\jsmith", "PC-JSMITH"))
+        self.assertEqual(values["STRIPES_HX_SIDS"], f"{hx_fake.SENDER_SID},{hx_fake.ADMIN_SID}")
+        self.assertTrue(values["STRIPES_V2"].endswith(os.path.join("share", "v2")))
+        self.assertIn("2 encoder", out.getvalue())
+        # Ctrl+C stopped the fakes and removed the temp folder
+        self.assertFalse(os.path.exists(values["STRIPES_V2"]))
+        stop.assert_called_once()
 
 
 if __name__ == "__main__":
