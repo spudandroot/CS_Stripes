@@ -36,7 +36,7 @@ from hx_core import FakeClock, Msg
 from hx_fake import FakeWorld
 from hx_message import merge_plan
 from hx_model import (ALLOWED_WRITE_TAGS, AMBER, BLUE, GREEN, GREY, RED, STEP_VERIFY_IDLE, TIMINGS, Alert,
-                      BoardUpdate, BoardView, LineChoice, LineView, MachineResult, MachineView, PollerUpdate,
+                      BoardUpdate, BoardView, LineChoice, LineView, MachineResult, MachineView, PollerUpdate, PollStatus,
                       SendRequest, SendResult, ShareHealth, ShareUnavailable, new_id)
 from hx_protocol import GateRegistry, release_key
 from hx_ui_common import CARD_BG, COLOUR_HEX, DIM_FG, SyncBackground, WorkFailed
@@ -1208,6 +1208,285 @@ class NavigatorTests(UiCase):
         self.assertEqual((nav.offline_sends, nav.offline_answers), ([], {}))
 
 
+class RealWindowTests(UiCase):
+    """The Navigator with hx_ui_send's and hx_ui_admin's own windows (ui.md §15.3). Their tests use a
+    stub Navigator, so this is where the two halves of the UI meet."""
+
+    def setUp(self):
+        super().setUp()
+        # As in the app (architecture §7.1 rule 3): garbage is collected on the Tk thread only, so a
+        # Send's worker thread never frees a Tk object
+        enabled = gc.isenabled()
+        gc.disable()
+        self.addCleanup(lambda: gc.enable() if enabled else None)
+
+    def tearDown(self):
+        super().tearDown()
+        gc.collect()
+        for fake in self.world.printers:
+            self.assertLessEqual(set(fake.writes), set(ALLOWED_WRITE_TAGS))
+            self.assertLessEqual(fake.max_in_flight, 1)
+            self.assertEqual(fake.violations, [])
+
+    def request(self, lot="4417"):
+        ids, identity = self.world.ids, self.services.identity
+        choice = LineChoice(line_id=ids["line"], machine_ids=[ids["machine1"]], product_id=ids["product"],
+                            film_id=ids["film"], print_text_id=ids["print_text"], lot=lot, countries=["USA", "Canada"])
+        return SendRequest(send_id=new_id("sd"), sender=identity.user, computer=identity.computer,
+                           created_at=time.time(), lines=[choice])
+
+    def only(self, cls):
+        """The one open window of that class."""
+        found = [w for w in hx_ui_common.open_windows() if isinstance(w, cls)]
+        self.assertEqual(len(found), 1, found)
+        return found[0]
+
+    def test_send_window(self):
+        services = self.make()
+        nav, lid = services.nav, self.world.ids["line"]
+        nav.open_send(line_ids=[lid])
+        send = nav.window("send")
+        self.assertIsInstance(send, hx_ui_send.SendWindow)
+        self.assertEqual((list(send.blocks), send.has_choices()), ([lid], False))
+        nav.open_send()                                             # open: shown, nothing asked
+        self.assertIs(self.only(hx_ui_send.SendWindow), send)
+        # No product chosen yet: the prefill goes in without a question (ui.md §5.1 item 2)
+        request = self.request()
+        nav.open_send(prefill=request)
+        self.ask.assert_not_called()
+        self.assertTrue(send.has_choices())
+        self.assertEqual(send.blocks[lid].lot_entry.get(), "4417")
+        # A product chosen: "Keep them", then "Replace them"
+        self.ask.return_value = False
+        nav.open_send(line_ids=[lid])
+        self.assertEqual(self.ask.call_args[0][1].text, "Replace the choices in the Send window?")
+        self.assertEqual(self.ask.call_args[1], {"yes": "Replace them", "no": "Keep them"})
+        self.assertEqual(send.blocks[lid].lot_entry.get(), "4417")
+        self.ask.return_value = True
+        nav.open_send(line_ids=[lid])
+        self.assertEqual((list(send.blocks), send.has_choices()), ([lid], False))
+        self.assertIs(self.only(hx_ui_send.SendWindow), send)
+        # A Send running (a pipeline held in its countdown): the window is only shown (item 3) ...
+        nav.open_send(prefill=request)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Held:
+            def run(self, plan, on_event, cancel=None):
+                release.wait(10)
+        self.patch(services, "pipeline", return_value=Held())
+        self.assertTrue(send.send_button.instate(["!disabled"]))
+        send.send_button.invoke()
+        self.assertEqual(send.page, "countdown")
+        self.ask.reset_mock()
+        nav.open_send(line_ids=[lid])
+        self.assertEqual(self.tell.call_args[0][1].text, "A Send is running. Wait for it to finish.")
+        self.ask.assert_not_called()
+        self.assertEqual(send.blocks[lid].lot_entry.get(), "4417")
+        # ... and quitting asks, naming it (ui.md §15.4 item 1)
+        self.ask.return_value = False
+        self.assertFalse(hx_ui.can_quit(self.root, services))
+        self.assertEqual(hx_ui_common.text(self.ask.call_args[0][1]),
+                         "A Send to Line 1 Bagger 1 is still running. If you quit now, a printer may be left halfway "
+                         "through. Quit anyway?")
+        # Refused before any printer request: back to the choices, and nothing left to ask about
+        release.set()
+        services.bus.post(WorkFailed(ref=send.plan.send_id, msg=Msg("The templates changed since you checked them. "
+                                                                    "Look at the Send window again.")))
+        self.pump(lambda: send.page == "choose" and not hx_ui_common.running())
+        self.ask.reset_mock()
+        self.assertTrue(hx_ui.can_quit(self.root, services))
+        self.ask.assert_not_called()
+        self.assertEqual(self.world.printers[0].writes, [])
+
+    def test_result_and_failure_windows(self):
+        services = self.make()
+        nav, mid = services.nav, self.world.ids["machine1"]
+        # Reopened from a card: ResultWindow.from_log, one window per Send
+        nav.open_result("sd_unknown")
+        result_window = nav.window("result:sd_unknown")
+        self.assertIsInstance(result_window, hx_ui_send.ResultWindow)
+        self.assertEqual(result_window.pending, [])
+        nav.open_result("sd_unknown")
+        self.assertIs(self.only(hx_ui_send.ResultWindow), result_window)
+        # The red window: one per Send
+        plan = merge_plan(self.request(), services.data.current, services.identity)
+        now = time.time()
+        failed = SendResult(send_id=plan.send_id, sender=services.identity.user, computer=services.identity.computer,
+                            started_at=now, finished_at=now, time_source="server",
+                            machines=[MachineResult(machine_id=mid, colour=RED, ok=False, step=STEP_VERIFY_IDLE,
+                                                    msg=Msg("The new message didn't read back right."))])
+        nav.open_failure(failed, plan)
+        red = nav.window(f"failure:{plan.send_id}")
+        self.assertIsInstance(red, hx_ui_send.FailureWindow)
+        self.assertEqual([row.machine_id for row in red.rows], [mid])
+        nav.open_failure(failed, plan)
+        self.assertIs(self.only(hx_ui_send.FailureWindow), red)
+
+    def test_action_dialogs(self):
+        services = self.make()
+        nav, ids = services.nav, self.world.ids
+        mid, lid = ids["machine1"], ids["line"]
+        nav.stop([mid])
+        stop = nav.window(f"stop:{mid}")
+        self.assertIsInstance(stop, hx_ui_send.StopDialog)
+        self.assertEqual((stop.machine_ids, stop.reason, stop.send_id, stop.state), ([mid], "user", "", "ask"))
+        nav.stop([mid], reason="rejected", send_id="sd_1")          # open: shown as it is
+        self.assertIs(self.only(hx_ui_send.StopDialog), stop)
+        self.assertEqual(stop.reason, "user")
+        nav.resume([mid])
+        resume = nav.window(f"resume:{mid}")
+        self.assertIsInstance(resume, hx_ui_send.ResumeDialog)
+        self.assertEqual(resume.machine_ids, [mid])
+        nav.resume([mid])
+        self.assertIs(self.only(hx_ui_send.ResumeDialog), resume)
+        nav.set_clocks([lid])
+        clocks = nav.window(f"clocks:{lid}")
+        self.assertIsInstance(clocks, hx_ui_send.SetClocksDialog)
+        self.assertEqual((clocks.line_ids, clocks.machine_ids, clocks.state), ([lid], [mid], "ask"))
+        nav.set_clocks([lid])
+        self.assertIs(self.only(hx_ui_send.SetClocksDialog), clocks)
+        # Without the sender role nothing opens
+        plain = self.make("akim", sender=False, admin=True)
+        for call in (lambda: plain.nav.stop([mid]), lambda: plain.nav.resume([mid]),
+                     lambda: plain.nav.set_clocks([lid]), lambda: plain.nav.open_send()):
+            call()
+        self.assertEqual(len(hx_ui_common.open_windows()), 3)
+        self.assertEqual([c[0][1].text for c in self.tell.call_args_list[-4:]],
+                         ["Only Stripes MapleJet Senders can do this."] * 4)
+
+    def test_admin_and_test_print_windows(self):
+        services = self.make()
+        nav, ids = services.nav, self.world.ids
+        nav.open_admin(page="machines", record_id=ids["machine1"])
+        admin = nav.window("admin")
+        self.assertIsInstance(admin, hx_ui_admin.AdminWindow)
+        self.assertIs(admin.current_page(), admin.pages["machines"])
+        self.assertEqual(admin.pages["machines"].working.id, ids["machine1"])
+        nav.open_admin(page="lines", record_id=ids["line"])        # open: shown, then select(page, record_id)
+        self.assertIs(self.only(hx_ui_admin.AdminWindow), admin)
+        self.assertIs(admin.current_page(), admin.pages["lines"])
+        self.assertEqual(admin.pages["lines"].working.id, ids["line"])
+        nav.open_admin()                                            # no page: stays where it is
+        self.assertIs(admin.current_page(), admin.pages["lines"])
+        nav.open_test_print(film_id=ids["film"], machine_id=ids["machine1"])
+        test = nav.window(f"test:{ids['film']}")
+        self.assertIsInstance(test, hx_ui_admin.TestPrintWindow)
+        self.assertEqual(test.machine_box.record_id(), ids["machine1"])
+        nav.open_test_print(film_id=ids["film"])
+        self.assertIs(self.only(hx_ui_admin.TestPrintWindow), test)
+        with self.assertRaises(ValueError):                         # calibration prints run from CalibrationWindow
+            nav.open_test_print(film_id=ids["film"], kind="head_distance")
+        self.assertIs(self.only(hx_ui_admin.TestPrintWindow), test)
+
+    def test_tab_and_card_buttons(self):
+        services = self.make()
+        nav, ids = services.nav, self.world.ids
+        mid, lid = ids["machine1"], ids["line"]
+        tab = hx_ui.MapleJetTab(self.root, services)
+        tab.send_button.invoke()
+        send = nav.window("send")
+        self.assertIsInstance(send, hx_ui_send.SendWindow)
+        tab.clocks_button.invoke()
+        self.assertEqual(nav.window(f"clocks:{lid}").line_ids, [lid])
+        tab.admin_button.invoke()
+        admin = nav.window("admin")
+        self.assertIsInstance(admin, hx_ui_admin.AdminWindow)
+        # A card's buttons open the same windows: one per key
+        services.bus.post(BoardUpdate(board=board(line(lid, "Line 1", [view(mid, line=lid, can_stop=True)]))))
+        services.bus.pump()
+        card = tab.board.cards[lid]
+        card.rows[mid].stop_button.invoke()
+        self.assertIsInstance(nav.window(f"stop:{mid}"), hx_ui_send.StopDialog)
+        card.send_button.invoke()
+        self.assertIs(self.only(hx_ui_send.SendWindow), send)
+        self.assertEqual(list(send.blocks), [lid])
+        card.clocks_button.invoke()
+        self.assertEqual(len([w for w in hx_ui_common.open_windows() if isinstance(w, hx_ui_send.SetClocksDialog)]), 1)
+        # "Set up..." on a machine without a printer: that machine on the admin window's Machines page
+        services.bus.post(BoardUpdate(board=board(line(lid, "Line 1", [
+            view(mid, line=lid, colour=GREY, code="not_set_up", headline="No printer set up", monitored=False,
+                 age=None, origin="")]))))
+        services.bus.pump()
+        tab.board.cards[lid].rows[mid].setup_button.invoke()
+        self.assertIs(self.only(hx_ui_admin.AdminWindow), admin)
+        self.assertIs(admin.current_page(), admin.pages["machines"])
+        self.assertEqual(admin.pages["machines"].working.id, mid)
+        # Every open window follows the language; the tab's too
+        titles = {hx_ui_send.SendWindow: "MapleJet Send", hx_ui_send.SetClocksDialog: "Set clocks",
+                  hx_ui_send.StopDialog: "Stop printing", hx_ui_admin.AdminWindow: "MapleJet admin"}
+        windows = [(w, titles[type(w)]) for w in hx_ui_common.open_windows()]
+        self.assertEqual(len(windows), 4)
+        i18n.set_language("es")
+        hx_ui.language_changed(services)
+        for window, english in windows:
+            self.assertNotEqual(i18n.tr(english), english)
+            self.assertEqual(window.title(), i18n.tr(english))
+        self.assertEqual(tab.send_button.cget("text"), "Enviar...")
+        i18n.set_language("en")
+        hx_ui.language_changed(services)
+        self.assertEqual([w.title() for w, _ in windows], [english for _, english in windows])
+
+    def send_and_wait(self, request):
+        """A Send through the Navigator's Send window; returns its result window."""
+        nav = self.services.nav
+        nav.open_send(prefill=request)
+        send = nav.window("send")
+        self.assertTrue(send.send_button.instate(["!disabled"]))
+        send.send_button.invoke()
+        send_id = send.plan.send_id
+        self.pump(lambda: nav.window(f"result:{send_id}") is not None)
+        return nav.window(f"result:{send_id}")
+
+    def test_offline_send_recorded_through_the_windows(self):
+        # ui.md §15.3 item 3 end to end: the Send window notes the Send, the result window hands over
+        # the answer it couldn't save, and the share's return records both with the real pipeline
+        services = self.make()
+        nav, ids = services.nav, self.world.ids
+        mid, lid = ids["machine1"], ids["line"]
+        # A first Send with the share up, so this PC knows the machine's state before the next one
+        # (send.md §10.3 step 3; without it record_offline can't tell that nobody changed it, §14.1)
+        services.store.write_poll(PollStatus(machine_id=mid, printer_id=ids["printer1"],
+                                             poller=services.identity.key, counter=1))     # no handshake wait
+        first = self.send_and_wait(self.request(lot="4416"))
+        first.right_buttons[lid].invoke()
+        self.assertTrue(services.store.read_expected(mid).confirmed)
+        self.assertEqual(nav.offline_sends, [])
+        first.close()
+        # The next one with the share down
+        nav.open_send(prefill=self.request())
+        send = nav.window("send")
+        services.store.fs.down = True
+        with contextlib.redirect_stderr(io.StringIO()):          # hx_send says what it couldn't write
+            send.send_button.invoke()
+            send_id = send.plan.send_id
+            self.pump(lambda: nav.window(f"result:{send_id}") is not None)
+        self.assertEqual(nav.offline_sends, [send_id])
+        result_window = nav.window(f"result:{send_id}")
+        self.assertIn("no_lock", result_window.result.machines[0].notes)
+        self.assertEqual(result_window.pending, [mid])
+        with contextlib.redirect_stderr(io.StringIO()):
+            result_window.right_buttons[lid].invoke()
+        self.assertEqual(result_window.line_state[lid], "pending")         # not saved ...
+        self.assertEqual(nav.offline_answers, {send_id: ([mid], True)})    # ... but kept for the share's return
+        self.assertEqual(nav.offline_sends, [send_id])
+        services.store.fs.down = False
+        services.store.probe_now()
+        self.pump(lambda: services.store.available)
+        services.bus.post(ShareHealth(ok=True, last_reached=time.time()))
+        services.bus.pump()
+        self.assertEqual((nav.offline_sends, nav.offline_answers), ([], {}))
+        state = services.store.read_expected(mid)
+        self.assertEqual((state.send_id, state.mode, state.result, state.notes), (send_id, "running", AMBER, ["no_lock"]))
+        self.assertEqual(state.origin_line, "Product of USA and Canada")
+        self.assertEqual((state.confirmed, state.confirmed_by), (True, services.identity.user))
+        # Once recorded, another ShareHealth does nothing
+        with mock.patch.object(services, "pipeline") as pipeline:
+            services.bus.post(ShareHealth(ok=True, last_reached=time.time()))
+            services.bus.pump()
+        pipeline.assert_not_called()
+
+
 class ServiceTests(UiCase):
     def test_make_services(self):
         services = self.make()
@@ -1312,16 +1591,37 @@ class ServiceTests(UiCase):
 
 
 class SelfCheckTests(UiCase):
-    """The checks of deploy.md §5.2 that don't need the send and admin screens (check 1 imports
-    them; test_deploy.py runs the whole self-check)."""
+    """deploy.md §5: the MapleJet part of --self-check, run from source (test_deploy.py also runs it
+    through stripes.self_check)."""
 
     def test_self_check_parts(self):
+        self.assertEqual([name for name, _ in hx_ui._CHECKS],
+                         ["modules", "hashes", "key", "http", "sntp", "files", "windows", "sound", "pictures", "tab"])
         for name, check in hx_ui._CHECKS:
-            if name == "modules":
-                continue
             with self.subTest(check=name):
                 check(self.root)
         self.assertEqual(hx_ui_common.open_windows(), [])
+
+    def test_self_check_from_source(self):
+        before = {t for t in threading.enumerate() if t.is_alive()}
+        started = time.monotonic()
+        hx_ui.self_check(self.root)
+        self.assertLess(time.monotonic() - started, 15.0)
+        self.assertEqual(hx_ui_common.open_windows(), [])
+        left = [t.name for t in threading.enumerate() if t.is_alive() and t not in before
+                and t.name.startswith("hx-selfcheck")]
+        self.assertEqual(left, [])
+
+    def test_frozen_exe_must_not_hold_the_fake(self):
+        # Check 1, frozen: the fake printer isn't in the exe (pyinstaller.spec excludes it)
+        real = importlib.util.find_spec
+        with mock.patch.object(sys, "frozen", True, create=True):
+            with self.assertRaises(RuntimeError) as caught:
+                hx_ui._check_modules(self.root)
+            self.assertIn("the fake printer is in the exe", str(caught.exception))
+            with mock.patch.object(importlib.util, "find_spec",
+                                   side_effect=lambda name, *a: None if name == "hx_fake" else real(name, *a)):
+                hx_ui._check_modules(self.root)
 
     def test_self_check_names_the_failure(self):
         with mock.patch.object(hx_ui, "_CHECKS", (("sntp", hx_ui._check_sntp),)), \
