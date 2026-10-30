@@ -7,6 +7,7 @@ tests don't depend on hx_ui. The Tk tests need a display; they skip themselves w
 """
 
 import dataclasses
+import gc
 import itertools
 import json
 import os
@@ -29,9 +30,9 @@ import hx_ui_send
 import i18n
 from hx_core import EventBus, Msg
 from hx_fake import FakeWorld
-from hx_model import (ALLOWED_WRITE_TAGS, GREEN, GREY, STEP_CHECK_MACHINE, STEP_CONFIRM_2, STEP_LOCK,
+from hx_model import (ALLOWED_WRITE_TAGS, AMBER, GREEN, GREY, STEP_CHECK_MACHINE, STEP_CONFIRM_2, STEP_LOCK,
                       STEP_VERIFY_IDLE, STEP_WAIT_POLLER, TIMINGS, ActionEvent, ActionFinished, ActionResult,
-                      BoardUpdate, BoardView, Film, LineChoice, LineView, MachineResult, MachineView, PollStatus,
+                      BoardUpdate, BoardView, Film, Line, LineChoice, LineView, MachineResult, MachineView, PollStatus,
                       PrintText, PrintTextItem, ResumeCheck, SendEvent, SendFinished, SendRequest, ShareHealth,
                       new_id)
 from hx_protocol import ClientPool, GateRegistry, release_key
@@ -39,9 +40,10 @@ from hx_ui_common import HIGHLIGHT_BG, BagText, SyncBackground, WorkFailed
 from hx_ui_send import FailureWindow, ResultWindow, ResumeDialog, SendWindow, SetClocksDialog, StopDialog
 
 # ui.md §17.1's scaled timings, with printer and share timeouts that leave room for a busy machine. The
-# lock's stale time stays above twice the longest printer call, as the lock budget needs (storage.md §11.3)
+# lock's stale time stays well above twice the longest printer call, as the lock budget needs (storage.md
+# §11.3), so a slow test machine never judges a lock lost
 SCALED = dataclasses.replace(TIMINGS.scaled(0.05), http_timeout_s=0.5, web_repeat_window_s=0.5, share_timeout_s=1.0,
-                             lock_stale_s=10.0)
+                             lock_stale_s=30.0)
 
 
 # --------------------------------------------------------------------------
@@ -253,6 +255,10 @@ class UiCase(unittest.TestCase):
         self.world = FakeWorld(self.tmp, printers=self.printers, timings=SCALED)
         self.addCleanup(self.world.close)
         hx_ui_common.STRICT_THREADS = True
+        # As in the app (architecture §7.1 rule 3): garbage is collected on the Tk thread only, so a
+        # worker thread never frees a Tk object
+        gc.disable()
+        self.addCleanup(gc.enable)
         self.tell = self.patch(hx_ui_common, "tell")
         self.ask = self.patch(hx_ui_common, "ask", return_value=True)
         self.services = self.make()
@@ -264,6 +270,7 @@ class UiCase(unittest.TestCase):
             window.destroy()
         for child in self.root.winfo_children():
             child.destroy()
+        gc.collect()
         for fake in self.world.printers:
             self.assertLessEqual(set(fake.writes), set(ALLOWED_WRITE_TAGS))
             self.assertLessEqual(fake.max_in_flight, 1)
@@ -375,7 +382,8 @@ class PureTests(unittest.TestCase):
                               PrintTextItem(id="i2", kind="lot", before="Lot ", placement="below")])
         pre = dataclasses.replace(film, id=new_id("fm"), code="EXCO2", origin_preprinted=True,
                                   preprinted_origin="USA", print_text_ids=[pt.id], default_print_text_id=pt.id)
-        data2 = dataclasses.replace(data, films={**data.films, pre.id: pre}, print_texts={**data.print_texts, pt.id: pt})
+        data2 = dataclasses.replace(data, films={**data.films, pre.id: pre},
+                                    print_texts={**data.print_texts, pt.id: pt})
         plan = plan_of(data2, pre.id, pt.id, [])
         self.assertEqual(plan.machines[0].origin_line, "USA (pre-printed)")
         self.assertEqual(hx_ui_send.origin_preview(pre, []), plan.machines[0].origin_line)
@@ -717,6 +725,99 @@ class SendWindowTests(UiCase):
 # Result, red window, Try again
 # --------------------------------------------------------------------------
 
+class DataChangeTests(UiCase):
+    """The Send window while an administrator changes the templates on another PC (ui.md §5.2, §5.9)."""
+
+    def publish(self, *records):
+        store = self.world.store(self.world.identity("admin", admin=True, sender=False))
+        for record in records:
+            hx_share.write_record(store, record)
+        raw = store.read_json("config/hx/changes.json")
+        store.write_json("config/hx/changes.json", {"file_type": "changes", "counter": raw["counter"] + 1,
+                                                    "written_at": time.time(), "written_by": "EXAMPLE\\admin",
+                                                    "last": None})
+        self.services.data.run_once()
+        self.settle()
+
+    def company_with(self, change):
+        company = self.services.data.current.company
+        countries = [change(c) if c.name == "Canada" else c for c in company.countries]
+        return dataclasses.replace(company, countries=countries, revision=company.revision + 1)
+
+    def test_country_taken_off_the_list_stays_and_blocks(self):
+        # A chosen country that is no longer offered is never dropped without a word: it stays in the
+        # list and problems() names it until the sender removes it
+        w = self.send_window()
+        block = w.blocks[self.line_id]
+        self.assertEqual(block.origin_text.get(), "Product of USA and Canada")
+        self.publish(self.company_with(lambda c: dataclasses.replace(c, active=False)))
+        block = w.blocks[self.line_id]
+        self.assertEqual(block.countries, ["USA", "Canada"])
+        self.assertEqual(list(block.country_list.get(0, "end")), ["USA", "Canada"])
+        self.assertNotIn("Canada", block.country_box.cget("values"))
+        self.assertIn("Canada isn't on the country list.", block.problems_label.cget("text"))
+        self.assertFalse(w.send_button.instate(["!disabled"]))
+        # The sender takes it out and checks the new origin
+        block.country_list.selection_set(1)
+        block.remove_country_button.invoke()
+        self.assertEqual(block.countries, ["USA"])
+        self.assertEqual(block.origin_text.get(), "Product of USA")
+        self.assertEqual(block.problems_label.cget("text"), "")
+        self.assertTrue(w.send_button.instate(["!disabled"]))
+
+    def test_country_renamed_stays_and_blocks(self):
+        w = self.send_window()
+        self.publish(self.company_with(lambda c: dataclasses.replace(c, name="Canada (CA)")))
+        block = w.blocks[self.line_id]
+        self.assertEqual(block.countries, ["USA", "Canada"])
+        self.assertIn("Canada isn't on the country list.", block.problems_label.cget("text"))
+        self.assertFalse(w.send_button.instate(["!disabled"]))
+
+    def test_prefill_keeps_a_country_no_longer_offered(self):
+        # Fix and send again, Try again: the old choice's country shows and is named, not dropped
+        self.publish(self.company_with(lambda c: dataclasses.replace(c, active=False)))
+        w = SendWindow(self.root, self.services, prefill=self.request(self.choice()))
+        block = w.blocks[self.line_id]
+        self.assertEqual(block.countries, ["USA", "Canada"])
+        self.assertIn("Canada isn't on the country list.", block.problems_label.cget("text"))
+        self.assertFalse(w.send_button.instate(["!disabled"]))
+
+    def test_line_made_inactive_while_open(self):
+        # A ticked line made inactive loses its check and its block, is noted, and doesn't block the
+        # Send to the other lines; made active again, ticking it brings its choice back
+        self.world.close()
+        self.world = FakeWorld(tempfile.mkdtemp(dir=self.tmp), printers=[{}, {}], timings=SCALED)
+        self.addCleanup(self.world.close)
+        self.services = services = self.make()
+        data = services.data.current
+        ids = self.world.ids
+        line2 = Line(id="ln_0000000099", revision=1, name="Line 2", code="L2", cartridge="plastic")
+        machine2 = data.machines[self.mid(2)]
+        self.publish(line2, dataclasses.replace(machine2, line_id=line2.id, revision=machine2.revision + 1))
+        self.assertIn(line2.id, services.data.current.lines)
+        c2 = LineChoice(line_id=line2.id, machine_ids=[self.mid(2)], product_id=ids["product"], film_id=ids["film"],
+                        print_text_id=ids["print_text"], lot="4417", countries=["USA"])
+        w = SendWindow(self.root, services, prefill=self.request(self.choice(machines=(1,)), c2))
+        self.assertEqual(set(w.blocks), {self.line_id, line2.id})
+        self.assertTrue(w.send_button.instate(["!disabled"]), label_texts(w))
+        self.publish(dataclasses.replace(line2, active=False, revision=2))
+        self.assertNotIn(line2.id, w.line_checks)
+        self.assertEqual(list(w.blocks), [self.line_id])
+        self.assertIn("Line 2 isn't active any more.", w.problems_label.cget("text"))
+        self.assertTrue(w.send_button.instate(["!disabled"]), label_texts(w))
+        self.assertEqual(w.send_button.cget("text"), "Send to 1 machine")
+        self.assertEqual([ln.line_id for ln in w.request().lines], [self.line_id])
+        # Active again: the check is back, unticked, and the note goes
+        self.publish(dataclasses.replace(line2, active=True, revision=3))
+        self.assertIn(line2.id, w.line_checks)
+        self.assertFalse(w.line_vars[line2.id].get())
+        self.assertNotIn(line2.id, w.blocks)
+        self.assertNotIn("isn't active any more", w.problems_label.cget("text"))
+        w.line_checks[line2.id].invoke()
+        self.assertEqual(w.blocks[line2.id].countries, ["USA"])
+        self.assertEqual(w.blocks[line2.id].lot_entry.get(), "4417")
+
+
 class ResultTests(UiCase):
     def failed_send(self):
         """A Send whose idle-slot read-back differs: the red window opens."""
@@ -933,18 +1034,28 @@ class ResultTests(UiCase):
 class NoEntryTests(UiCase):
     printers = [{}, {}]
 
-    def test_result_from_log_no_entry(self):
-        services, mid1, mid2 = self.services, self.mid(1), self.mid(2)
+    def sent_without_entry(self):
+        """A good Send whose log entries never reached the share (the PC that sent it crashed); its
+        send_id."""
         rw = self.good_send(machines=(1,))
         send_id = rw.result.send_id
         rw.destroy()
-        # The PC that sent it never got its entries to the share: no send entry, no switch entry
+        # No send entry, no switch entry
         logs = os.path.join(self.world.share_root, "logs", "hx-sends")
         for folder, _, names in os.walk(logs):
             for name in names:
                 if send_id.split("_")[1] in name or ".send." in name:
                     os.remove(os.path.join(folder, name))
-        self.assertIsNone(services.data.find_send(send_id))
+        self.assertIsNone(self.services.data.find_send(send_id))
+        return send_id
+
+    def test_result_from_log_no_entry(self):
+        services, mid1, mid2 = self.services, self.mid(1), self.mid(2)
+        send_id = self.sent_without_entry()
+        # The board reads what the printer runs: the message the Send loaded
+        services.watcher.latest = board_of(self.line_id, mview(mid1, self.line_id, "Line 1 Bagger 1",
+                                                               origin="Product of USA and Canada", colour=AMBER,
+                                                               confirm_pending_by="EXAMPLE\\jsmith"))
         # A machine not in the Send whose expected state a newer Stripes wrote doesn't stop it
         rel = os.path.join(self.world.share_root, "status", "machines", f"{mid2}.expected.json")
         with open(rel, "w", encoding="utf-8") as f:
@@ -967,6 +1078,30 @@ class NoEntryTests(UiCase):
         w.right_buttons[self.line_id].invoke()
         self.assertEqual(w.line_state[self.line_id], "confirmed")
         self.assertTrue(services.store.read_expected(mid1).confirmed)
+
+    def test_no_entry_shows_what_the_printer_runs(self):
+        """ui.md §6.4 item 5: without the send entry the origin is the board's MachineView.origin_line (what
+        the printer runs now), never the expected state's; the sender check uses confirm_pending_by."""
+        services, mid1 = self.services, self.mid(1)
+        send_id = self.sent_without_entry()
+        self.assertEqual(services.store.read_expected(mid1).origin_line, "Product of USA and Canada")
+        # The printer now runs another message
+        services.watcher.latest = board_of(self.line_id, mview(mid1, self.line_id, "Line 1 Bagger 1",
+                                                               origin="Product of USA", colour=AMBER,
+                                                               message_name="EXCO1-PKO01-OTHER",
+                                                               confirm_pending_by="EXAMPLE\\jsmith"))
+        w = services.nav.open_result(send_id)
+        self.assertEqual(w.pending, [mid1])
+        self.assertEqual(w.origins[mid1].get(), "Product of USA")
+        self.assertIn("Message EXCO1-PKO01-OTHER in slot ?.", label_texts(w))
+        self.assertIn(self.line_id, w.right_buttons)
+        w.destroy()
+        # No board yet: the origin isn't known, rather than the one the Send meant to load
+        services.watcher.latest = None
+        w = services.nav.open_result(send_id)
+        self.assertEqual(w.origins[mid1].get(), "")
+        self.assertIn("(origin unknown)", label_texts(w))
+        self.assertIn(self.line_id, w.right_buttons)            # the sender from the expected state
 
 
 # --------------------------------------------------------------------------

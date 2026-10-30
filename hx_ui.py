@@ -268,12 +268,8 @@ def _send_has_choices(window) -> bool:
     has = getattr(window, "has_choices", None)
     if callable(has):
         return bool(has())
-    for block in getattr(window, "blocks", {}).values():
-        box = getattr(block, "product_box", None)
-        chosen = getattr(box, "record_id", None) or getattr(box, "key", None)
-        if callable(chosen) and chosen():
-            return True
-    return False
+    # The names ui.md §5.10 gives every Send window
+    return any(block.product_box.record_id() for block in getattr(window, "blocks", {}).values())
 
 
 class Navigator:

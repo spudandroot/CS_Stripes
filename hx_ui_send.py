@@ -29,7 +29,7 @@ from hx_model import (AMBER, RED, STEP_CHECK_MACHINE, STEP_CONFIRM_2, STEP_LOCK,
                       PlanError, SendEvent, SendFinished, SendRequest, SendResult, ShareError, ShareHealth,
                       new_id, same_user)
 from hx_ui_common import (COLOUR_HEX, HIGHLIGHT_BG, RED_BG, RED_FG, UI_FONT, BagText, HxWindow, PhotoWindow,
-                          PictureView, RecordBox, Scroller, WorkFailed, check_tk_thread, join_names, mark_done,
+                          PictureView, RecordBox, Scroller, WorkFailed, check_tk_thread, mark_done,
                           mark_running, photo_from_png, roles, start_thread, text, when)
 from i18n import N_, add_spanish
 
@@ -306,6 +306,17 @@ def _clear(frame, texts):
     for child in frame.winfo_children():
         forget(child)
         child.destroy()
+
+
+def _marked(key, work):
+    """A thread's work that also ends its running mark when the thread ends, even if its window has
+    gone by then (the window marks it done too, when the finishing event arrives)."""
+    def target():
+        try:
+            return work()
+        finally:
+            mark_done(key)
+    return target
 
 
 def _red_label(master, size=14, bold=False, wrap=1400):
@@ -761,12 +772,10 @@ class LineBlock(ttk.LabelFrame):
             offered = self._offer_print_texts(self._film())
             self.print_text_box.set_record_id(choice.print_text_id if choice.print_text_id in offered else "")
             self.lot_var.set(choice.lot or "")
-            active = {c.name for c in data.company.countries if c.active}
-            countries = []
-            for name in choice.countries:
-                if name in active and name not in countries:
-                    countries.append(name)
-            self.countries = countries
+            # Countries are kept as chosen, even one taken off the list or renamed: dropping it
+            # would change the origin without a word, while kept it shows in the list and
+            # problems() says "{country} isn't on the country list." until the sender removes it.
+            self.countries = list(choice.countries)
             for item_id, value in (choice.free_text or {}).items():
                 var = self._free_vars.get(item_id)
                 if var is None:
@@ -1014,7 +1023,8 @@ class SendWindow(HxWindow):
         self.progress_rows: dict[str, ProgressRow] = {}
         self.countdown_origins: dict[str, BagText] = {}
         self.board = services.watcher.latest
-        self._notes: list[Msg] = []         # the window's own problems (a plan error, inactive lines)
+        self._notes: list[Msg] = []         # the window's own problems (a plan error, a refused Send)
+        self._gone: dict[str, Msg] = {}     # line id -> "{line} isn't active any more."
         self._countdown_at = None
         self._countdown_timer = None
         self._work_failed = False
@@ -1221,23 +1231,24 @@ class SendWindow(HxWindow):
         for var in self.line_vars.values():
             var.set(False)
         self._notes = []
+        self._gone = {}
 
     def fill(self, request: SendRequest) -> None:
         """The request's choices, line by line; a line that isn't active any more is noted."""
         self._reset()
         data = self.services.data.current
-        notes = []
         for choice in request.lines:
             line = data.lines.get(choice.line_id) if data is not None else None
             if line is None or not line.active:
                 name = line.name if line is not None else choice.line_id
-                notes.append(Msg(N_("{line} isn't active any more."), {"line": name}))
+                self._gone[choice.line_id] = Msg(N_("{line} isn't active any more."), {"line": name})
+                # Kept, so ticking the line again once it is active brings the choice back
+                self.kept[choice.line_id] = copy.deepcopy(choice)
                 continue
             if choice.line_id not in self.line_vars:
                 self._build_line_checks()
             self.line_vars[choice.line_id].set(True)
             self._add_block(choice.line_id, copy.deepcopy(choice))
-        self._notes = notes
         self._show_problems()
         self.update_send_button()
 
@@ -1268,7 +1279,7 @@ class SendWindow(HxWindow):
 
     def _show_problems(self):
         data = self.services.data
-        self.problems_label.show(list(data.problems) + list(self._notes))
+        self.problems_label.show(list(data.problems) + list(self._notes) + list(self._gone.values()))
 
     def _show_banners(self):
         data = self.services.data
@@ -1338,10 +1349,33 @@ class SendWindow(HxWindow):
     def _on_data(self, event):
         if self.page == "choose":
             self._build_line_checks()
+            self._drop_gone_lines()
             for block in list(self.blocks.values()):
                 block.data_changed()
         self._show_banners()
         self._load_queue()
+
+    def _drop_gone_lines(self):
+        """A ticked line that was deleted or made inactive loses its check, so its block goes too
+        (nothing could untick it, and it would block the Send to every other line) and is noted,
+        as fill() does (ui.md §5.2 item 5, §5.9 item 1). Its choice is kept for when it comes back."""
+        data = self.services.data.current
+        if data is None:
+            return
+        for line_id in list(self.blocks):
+            line = data.lines.get(line_id)
+            if line is not None and line.active:
+                continue
+            name = line.name if line is not None else self.blocks[line_id].line.name
+            self._remove_block(line_id)
+            if line_id in self.line_vars:
+                self.line_vars[line_id].set(False)
+            self._gone[line_id] = Msg(N_("{line} isn't active any more."), {"line": name})
+        # A line that is active again has its check back: the note goes
+        for line_id in list(self._gone):
+            line = data.lines.get(line_id)
+            if line is not None and line.active:
+                del self._gone[line_id]
 
     def _on_board(self, event):
         self.board = event.board
@@ -1416,11 +1450,11 @@ class SendWindow(HxWindow):
             row.pack(fill="x", padx=4)
             self.progress_rows[mp.machine.id] = row
         names = [mp.machine.name for mp in plan.machines]
-        mark_running(f"send:{plan.send_id}", Msg(N_("A Send to {machines} is still running."),
-                                                 {"machines": _joined(names)}))
+        key = f"send:{plan.send_id}"
+        mark_running(key, Msg(N_("A Send to {machines} is still running."), {"machines": _joined(names)}))
         token = self.cancel_token
         start_thread(services, f"hx-send-{plan.send_id}", plan.send_id,
-                     lambda: services.pipeline().run(plan, services.bus.post, cancel=token))
+                     _marked(key, lambda: services.pipeline().run(plan, services.bus.post, cancel=token)))
         self.update_send_button()
 
     def _cancel(self):
@@ -2009,14 +2043,16 @@ class ResultWindow(HxWindow):
         for mid in pending:
             e = states.get(mid)
             view = _board_view(board, mid)
-            origin = (e.origin_line if e is not None else "") or (view.origin_line if view is not None else "")
-            name = (e.message_name if e is not None else "") or (view.message_name if view is not None else "")
-            slot = e.slot if e is not None else None
+            # What the printer runs now (the board's MachineView), never what the Send meant to load:
+            # the sender confirms against this picture and origin (ui.md §6.4 item 5)
+            origin = view.origin_line if view is not None else ""
+            name = view.message_name if view is not None else ""
+            slot = e.slot if e is not None and name and e.message_name == name else None
             design = MessageDesign(slot=slot or 0, name=name, empty=False, preview_bmp=pictures.get(mid) or b"")
             machines.append(MachineResult(machine_id=mid, colour=AMBER, ok=True, step=STEP_CONFIRM_2, slot=slot,
                                           message_name=name, origin_line=origin, readbacks=[design],
                                           notes=list(e.notes) if e is not None else []))
-            who = (e.sender if e is not None else "") or (view.confirm_pending_by if view is not None else "")
+            who = (view.confirm_pending_by if view is not None else "") or (e.sender if e is not None else "")
             if who and not sender:
                 sender = who
                 computer = e.computer if e is not None else ""
@@ -2276,7 +2312,7 @@ class _ActionDialog(HxWindow):
         mark_running(self._running_key, Msg(self.running_text, {"machines": _joined(self.names(machine_ids))}))
         ids = list(machine_ids)
         start_thread(services, f"hx-action-{action_id}", action_id,
-                     lambda: call(services.actions(), ids, services.bus.post, action_id))
+                     _marked(self._running_key, lambda: call(services.actions(), ids, services.bus.post, action_id)))
 
     def _done_running(self):
         if self._running_key:
