@@ -1285,6 +1285,42 @@ class MessageCheckTests(unittest.TestCase):
         j = commit_second(None, reading(running=None, printing=None, standalone=True), expected())
         self.assertEqual(j.state.code, "unknown_while_down")
 
+    def test_standalone_without_a_msgnam_reading(self):
+        # Standalone checks never load the message: a check that read no name (a busy or nonsense
+        # MSGNAM) has nothing behind green "Printing" or E's origin (C12), even when an earlier check
+        # read the right name
+        out = classify(facts(running=None, message_name=None), expected(), standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("unknown_while_down", []))
+        self.assertEqual(hs.STATE_CODES[out.code], AMBER)
+        # Share mode is unchanged (R decides), and so are no E and an untrusted printer
+        self.assertEqual(classify(facts(message_name=None), expected()).code, "running_confirmed")
+        self.assertEqual(classify(facts(running=None, message_name=None), None, standalone=True).code,
+                         "not_from_stripes")
+        self.assertEqual(classify(facts(running=None, message_name=None, reachable=False), expected(),
+                                  standalone=True).code, "off")
+        # facts_from keeps no name from an earlier standalone check while the printer answers
+        prev = poll(running=None, standalone=True)
+        unread = reading(running=None, message_name=None, standalone=True)
+        self.assertIsNone(hs.facts_from(prev, unread).message_name)
+        silent = dataclasses.replace(unread, reachable=False, failures=1, printing=None)
+        self.assertEqual(hs.facts_from(prev, silent).message_name, NEW.name)
+        self.assertEqual(hs.facts_from(poll(), reading(message_name=None)).message_name, NEW.name)
+        # A green check reads MSGNAM again a second later; two readings without a name commit
+        first = judge(prev, unread, expected())
+        self.assertFalse(first.committed)
+        self.assertIn("MSGNAM", first.recheck)
+        j = commit_second(prev, unread, expected())
+        self.assertEqual(j.state.code, "unknown_while_down")
+        self.assertIsNone(j.facts.message_name)
+        # The first check (no prev) reads it again too
+        self.assertIn("MSGNAM", judge(None, unread, expected()).recheck)
+        # The origin is unknown on the board; an off machine and a check that read E's name keep E's
+        p = poll("unknown_while_down", running=None, message_name=None, standalone=True)
+        self.assertEqual(hs.effective_origin(p, expected()), "")
+        off = poll("off", running=None, reachable=False, message_name=None, standalone=True)
+        self.assertEqual(hs.effective_origin(off, expected()), ORIGIN)
+        self.assertEqual(hs.effective_origin(prev, expected()), ORIGIN)
+
     def test_origin_unknown_while_unchecked(self):
         self.assertEqual(hs.effective_origin(poll("message_unchecked", running=None), expected()), "")
         self.assertEqual(hs.effective_origin(poll("message_unchecked"), expected()), "")

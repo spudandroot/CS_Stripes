@@ -1921,14 +1921,24 @@ class SelfCheckTests(UiCase):
         held, refused = [], []
         real_open, real_replace = hx_win.open_for_read, os.replace
 
-        def open_for_read(path):
-            f, key = real_open(path), os.path.abspath(path)
-            held.append(key)
+        class Reader:
+            """open_for_read's file, holding its path until closed."""
+            def __init__(self, path):
+                self.f, self.key = real_open(path), os.path.abspath(path)
+                held.append(self.key)
 
-            def close():
-                held.remove(key)
-                f.close()
-            return mock.Mock(read=f.read, close=close)
+            def read(self):
+                return self.f.read()
+
+            def close(self):
+                held.remove(self.key)
+                self.f.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.close()
 
         def replace(src, dst):
             if os.path.abspath(dst) in held or (refuse_always and "stripes-hx-swap-" in dst):
@@ -1936,7 +1946,7 @@ class SelfCheckTests(UiCase):
                 raise PermissionError(13, "Access is denied", dst)
             return real_replace(src, dst)
         patches = contextlib.ExitStack()
-        patches.enter_context(mock.patch.object(hx_win, "open_for_read", open_for_read))
+        patches.enter_context(mock.patch.object(hx_win, "open_for_read", Reader))
         patches.enter_context(mock.patch.object(os, "replace", replace))
         return patches, held, refused
 

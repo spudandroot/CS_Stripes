@@ -492,9 +492,13 @@ Add `hx_key.py` on the line after `version_info.txt`.
 ### 5.6 The swap test
 
 In a `tempfile.mkdtemp()` folder: write `a` = `b"old"`; `h = hx_win.open_for_read(a)`; write `b` =
-`b"new"`; `os.replace(b, a)` must succeed while `h` is open; `h.read() == b"old"`; close `h`; a new
-read of `a` gives `b"new"`. This is the property every status file relies on (storage §8.2 item 3),
-checked with the exe's own ctypes and `msvcrt` calls. Off Windows it passes trivially.
+`b"new"`; try `os.replace(b, a)` while `h` is open. It may succeed, or raise `PermissionError`:
+Windows' `os.replace` is `MoveFileExW`, whose rename rules refuse a target that still has an open
+handle, even one that shares delete. Any other error fails the check. Either way `h.read() == b"old"`;
+close `h`; if the first replace was refused, `os.replace(b, a)` must now succeed; a new read of `a`
+gives `b"new"`. This checks the exe's own ctypes and `msvcrt` calls, and that a writer's replace goes
+through once the reader lets go, which is what the writers' retries rely on (storage §8.2 item 3).
+Off Windows the first replace succeeds.
 
 ### 5.7 The test picture
 

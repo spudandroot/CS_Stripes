@@ -223,6 +223,37 @@ def cache_folder():
     return os.path.join(hx_share.local_dir(), "config-cache")
 
 
+def old_cache_folder():
+    """Where versions before the MapleJet one keep the copy of the company config. Only ever read."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "Stripes", "config-cache")
+
+
+def copy_old_cache():
+    """The first start of this version takes the older version's saved copy of the company config,
+    so its printers (and the one used last) are there before the server has been read. Only while
+    this version has no saved copy of its own; never overwrites; nothing when STRIPES_CACHE is set."""
+    if os.environ.get("STRIPES_CACHE"):
+        return False
+    old, new = old_cache_folder(), cache_folder()
+    if os.path.lexists(os.path.join(new, "printers.json")) or not os.path.isfile(os.path.join(old, "printers.json")):
+        return False
+    copied = False
+    for name in ("stock.json", "printers.json"):  # printers.json last: it is what makes a saved copy
+        src, dst = os.path.join(old, name), os.path.join(new, name)
+        try:
+            stamp = os.stat(src)
+        except OSError:
+            continue
+        if hx_share.copy_once(src, dst):
+            copied = True
+            try:  # load_cached_config shows the file's time as "saved {when}"
+                os.utime(dst, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            except OSError:
+                pass
+    return copied
+
+
 def zebra_config_folder():
     r"""Where printers.json and stock.json are read from: v2\config once the folder script has
     copied them there, else the configured folder (read-only). Looks at the share, so it's
@@ -1227,6 +1258,7 @@ class App(tk.Tk):
         except tk.TclError:
             pass  # .ico window icons only work on Windows
         copy_old_settings()  # the first start of this version brings the user's settings along
+        copy_old_cache()     # and the saved copy of the company config
         self.settings = load_settings()
         i18n.set_language(self.settings["language"])
         # Show the saved copy of the server's settings straight away; the server

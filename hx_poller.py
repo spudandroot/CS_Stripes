@@ -516,6 +516,8 @@ class _Worker:
             raise _NoMore()
         if self.wants_out():
             raise _Abandon()
+        if not self._still_alone():
+            raise _Abandon()
         self._lock_check()
         t = self.timings
         budget = t.http_timeout_s if kind == "web" else hx_protocol.worst_case_s(kind, t)
@@ -538,6 +540,15 @@ class _Worker:
         finally:
             self._note_events(client.nonsense - nonsense + client.busy_replies - busy)
             cyc.busy_rose = client.busy_replies > busy
+
+    def _still_alone(self):
+        """False when this worker must neither send nor write P. Once its last good P write is stale_s / 2
+        old (the PC slept or was paused mid-cycle), P no longer proves it alive and another PC may have
+        taken over meanwhile: it reads P first, as at the start of a cycle (_rival_check), so it never
+        writes over that PC's P or polls alongside it (§6.4 step 7.2)."""
+        if self.clock.monotonic() - self.p_ok < self.timings.stale_s / 2:
+            return True
+        return self._rival_check(self.poller.live)
 
     def _replied(self, cyc):
         cyc.failures = 0
@@ -794,6 +805,8 @@ class _Worker:
         # Record first: once a TD may have gone out, P already says so
         previous = self.dst
         first = dict(record, sent=True)
+        if not self._still_alone():
+            raise _Abandon()
         if not self._write_status(dst=first):
             raise _NoMore()
         self.dst = first
@@ -1024,11 +1037,11 @@ class _Worker:
         """True when this cycle may make requests (or, while settling, write P). Two PCs can both pass
         their rank check while they disagree about who is live (on a slow share each can see the
         other's heartbeat as stale), and architecture §7.3 rule 2 says two pollers never overlap even
-        then. So before every settle write, right before its first request, and at every cycle after
-        it, the worker reads P. Reading before each settle write matters: two starters a few seconds
-        apart would otherwise each overwrite the other's writes and find only their own at the rank
-        check. A write by another PC since this worker's own (and not a yield to this PC) means that PC
-        polls, or is starting, too:
+        then. So before every settle write, right before its first request, at every cycle after it,
+        and mid-cycle once its last P write is stale_s / 2 old (_still_alone), the worker reads P.
+        Reading before each settle write matters: two starters a few seconds apart would otherwise each
+        overwrite the other's writes and find only their own at the rank check. A write by another PC
+        since this worker's own (and not a yield to this PC) means that PC polls, or is starting, too:
         - one this PC doesn't see as live is yielded to at once, without a request;
         - a live one that ranks above this PC (possible while settling, before the rank check): this
           PC hands over to rank 0 at once, without a request;
@@ -1242,6 +1255,8 @@ class _Worker:
             expected_counter=(e.counter if e is not None else 0) if j.committed else p.expected_counter,
             reread_seen=self.reread_seen, unreachable_since=unreachable_since, running_ok_at=self.running_ok_at,
             running_unchecked=f.running_unchecked, dst=self.dst, standalone=False)
+        if not self._still_alone():
+            return
         sha = new.running.preview_sha256 if new.running is not None else ""
         old_sha = p.running.preview_sha256 if p.running is not None else ""
         if sha and sha != old_sha and sha in self.previews:

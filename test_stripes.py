@@ -703,6 +703,44 @@ class V2PathTests(unittest.TestCase):
             self.assertFalse(os.path.exists(mine))
         self.assertFalse(os.path.exists(zl.settings_path()))
 
+    def test_saved_config_copied_once(self):
+        # The older version's copy of the company printers and stock, so the first start of this
+        # version lists them (and can select the one used last) before the server has been read
+        old, new = zl.old_cache_folder(), zl.cache_folder()
+        self.assertEqual(old, os.path.join(self.local, "Stripes", "config-cache"))
+        self.assertFalse(zl.copy_old_cache())                    # nothing to bring along
+        self.assertFalse(os.path.exists(new))
+        shutil.copytree(EXAMPLE_CONFIG, old)
+        saved = 1_700_000_000
+        for name in os.listdir(old):
+            os.utime(os.path.join(old, name), (saved, saved))
+        before = snapshot(old)
+        self.assertTrue(zl.copy_old_cache())
+        self.assertEqual(snapshot(new), {k: v for k, v in before.items() if k in ("printers.json", "stock.json")})
+        cached = zl.load_cached_config("config")
+        self.assertEqual(([p.name for p in cached.printers], len(cached.stock)),
+                         (["Packing ZD420", "Pallets ZT410"], 3))
+        # "saved {when}" is when the older version saved it, not when it was copied
+        self.assertEqual([os.path.getmtime(os.path.join(new, n)) for n in ("printers.json", "stock.json")],
+                         [saved, saved])
+        # Only once: this version's own copy is never replaced, and the older one is never written
+        write_json(os.path.join(old, "printers.json"), {"printers": []})   # the older version, still in use, saves
+        self.assertFalse(zl.copy_old_cache())
+        self.assertEqual(len(zl.load_cached_config("config").printers), 2)
+        # A server without stock.json: this version's copy has none, and the old one doesn't come back
+        os.remove(os.path.join(new, "stock.json"))
+        self.assertFalse(zl.copy_old_cache())
+        self.assertFalse(os.path.exists(os.path.join(new, "stock.json")))
+        self.assertEqual(snapshot(old)["stock.json"], before["stock.json"])
+
+    def test_no_cache_copy_with_cache_override(self):
+        shutil.copytree(EXAMPLE_CONFIG, zl.old_cache_folder())
+        mine = os.path.join(self.tmp, "mine")
+        with mock.patch.dict(os.environ, {"STRIPES_CACHE": mine}):
+            self.assertFalse(zl.copy_old_cache())
+            self.assertFalse(os.path.exists(mine))
+        self.assertFalse(os.path.exists(zl.cache_folder()))
+
     def test_deployment_log_folders(self):
         share = os.path.join(self.tmp, "Share", "Stripes")
         new, old = os.path.join(share, "v2", "status", "deployment"), os.path.join(share, "status")
@@ -1226,6 +1264,41 @@ class AppTests(unittest.TestCase):
         self.assertEqual((app.config_folder, app.hx.paths.share_root), (self.config, os.path.join(share, "v2")))
         self.assertTrue(self.pump_until(lambda: app.cfg.printers))
         self.assertEqual(app.cfg.source, self.config)
+
+    def first_start_after_upgrade(self, own_printer=True):
+        """The profile as the older version leaves it: its saved copy of the company printers, and
+        settings whose printer used last is a company one (with a printer of the user's own or not)."""
+        self.close_app()
+        os.remove(zl.settings_path())       # brought along by setUp's window
+        self.assertFalse(os.path.exists(os.path.join(zl.cache_folder(), "printers.json")))
+        shutil.copytree(EXAMPLE_CONFIG, zl.old_cache_folder())
+        own = [asdict(zl.Printer(name="Packing", host="127.0.0.1", port=closed_port()))] if own_printer else []
+        write_json(self.old_settings, {"printers": own, "last_printer": "Pallets ZT410"})
+
+    def test_first_start_keeps_the_company_printer_used_last(self):
+        # architecture §10.5: the older version's saved copy comes along, so the printer used last is
+        # selected straight away and stays selected once the server has been read
+        self.first_start_after_upgrade()
+        self.with_config_folder()
+        app = self.app
+        self.assertEqual(app.printer_var.get(), "Pallets ZT410")
+        self.assertTrue(self.pump_until(lambda: app.cfg.cached_at is None))
+        self.assertEqual(app.cfg.source, self.config)
+        self.assertEqual(app.printer_var.get(), "Pallets ZT410")
+        self.assertIn("Packing", [p.name for p in app.all_printers()])
+
+    def test_first_start_with_the_server_down_lists_the_saved_printers(self):
+        self.first_start_after_upgrade(own_printer=False)
+        self.config = os.path.join(self.tmp, "Share", "Stripes", "config")   # unreachable
+        self.events, self.made = [], []
+        self.app = zl.App(start_hidden=True)
+        app = self.app
+        self.assertTrue(self.pump_until(lambda: app.cfg.problems))
+        self.assertIn("using the copy saved", app.cfg.problems[0])
+        self.assertEqual(([p.name for p in app.all_printers()], app.printer_var.get()),
+                         (["Packing ZD420", "Pallets ZT410"], "Pallets ZT410"))
+        app.update()
+        zl.App._first_run.assert_not_called()    # printers to list, so no Welcome box (_maybe_first_run)
 
     def test_deployment_status_lists_both_folders(self):
         # architecture §10.5 item 4: the rollout view reads this version's folder and the older versions' one

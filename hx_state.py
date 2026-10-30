@@ -586,6 +586,12 @@ def facts_from(prev: PollStatus | None, reading: Reading) -> Facts:
         running = None
     else:
         running = old.running
+    # A standalone check that got replies but no MSGNAM keeps no name from an earlier check: it never
+    # loads the message, so this check's name is all it knows about what prints (C12)
+    if reading.standalone and reading.reachable and reading.problem == "":
+        message_name = reading.message_name
+    else:
+        message_name = pick(reading.message_name, old.message_name)
     return Facts(
         reachable=bool(reading.reachable),
         problem=reading.problem if reading.reachable else old.problem,
@@ -597,7 +603,7 @@ def facts_from(prev: PollStatus | None, reading: Reading) -> Facts:
         foreign_client=pick(reading.foreign_client, old.foreign_client),
         running_unchecked=pick(reading.running_unchecked, old.running_unchecked),
         failures=reading.failures,
-        message_name=pick(reading.message_name, old.message_name),
+        message_name=message_name,
         bag_count=pick(reading.bag_count, old.bag_count),
         bags_recent=pick(reading.bags_recent, old.bags_recent),
         ink_name=pick(reading.ink_name, old.ink_name),
@@ -858,13 +864,16 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
             carry("message_unreadable")
 
     # C12: standalone, and the message on record can't be checked. Also while printing hasn't been
-    # read since the outage began (a busy or nonsense PRIN at every check): standalone checks never
-    # load the message, so without a PRIN reading nothing at all stands behind green "Printing"
+    # read since the outage began (a busy or nonsense PRIN at every check), and when this check read
+    # no message name (a busy or nonsense MSGNAM; facts_from keeps none from an earlier check):
+    # standalone checks never load the message, so without those readings nothing stands behind
+    # green "Printing" and E's origin
     if standalone:
         name_differs = (names_message and trusted and F.message_name is not None
                         and norm_name(F.message_name) != norm_name(e.message_name))
+        name_unread = names_message and trusted and F.message_name is None
         unread = trusted and mode == "running" and failure is None and not e.rejected and F.printing is None
-        if name_differs or unread or mode in ("switch_pending", "test_running"):
+        if name_differs or name_unread or unread or mode in ("switch_pending", "test_running"):
             codes.add("unknown_while_down")
 
     # C13 to C15: ink
@@ -1121,7 +1130,8 @@ def judge(prev: PollStatus | None, reading: Reading, expected: ExpectedState | N
             commit = True                       # each already sums many requests
         elif not reading.second:
             recheck = evidence(f_old, f_new, timings)
-            if reading.standalone and norm_name(f_old.message_name) != norm_name(f_new.message_name):
+            if reading.standalone and (f_new.message_name is None
+                                       or norm_name(f_old.message_name) != norm_name(f_new.message_name)):
                 recheck.append("MSGNAM")        # standalone checks judge the message by its name (C12)
             if not recheck:
                 commit = True
@@ -1308,6 +1318,9 @@ def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) ->
     if (expected is not None and poll is not None and poll.message_name is not None
             and norm_name(poll.message_name) != norm_name(expected.message_name)):
         return ""
+    if (expected is not None and poll is not None and poll.standalone and poll.reachable and poll.problem == ""
+            and poll.message_name is None):
+        return ""                              # a standalone check that couldn't read the message name
     return expected.origin_line if expected is not None else ""
 
 

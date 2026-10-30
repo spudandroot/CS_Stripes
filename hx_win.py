@@ -209,7 +209,8 @@ def lookup_group_sid(name):
 # --------------------------------------------------------------------------
 
 def open_for_read(path) -> BinaryIO:
-    """Open a file for reading without ever blocking another writer's os.replace.
+    """Open a file for reading, sharing read, write and delete. Windows' os.replace (MoveFileExW) can
+    still refuse to replace the file while it's open, so writers retry (storage.md §8.2 item 3).
     Raises FileNotFoundError, PermissionError or OSError like open()."""
     if not is_windows():
         return open(path, "rb")

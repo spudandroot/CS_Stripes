@@ -153,7 +153,10 @@ two-reading rule (§3.8).
 ### 3.2 Facts
 
 `Facts` (§11.1) holds what the printer showed. `facts_from(prev, reading)` merges them: each field takes
-the reading's value when it isn't None, else prev's. `prev_facts(prev)` builds the facts from P alone.
+the reading's value when it isn't None, else prev's. The exception is `message_name` in a standalone
+reading that is reachable with `problem == ""`: it is always the reading's own (None when MSGNAM gave no
+name this check), because standalone checks never load the message (C12). `prev_facts(prev)` builds the
+facts from P alone.
 
 | Fact | Kind | From | Notes |
 |---|---|---|---|
@@ -225,7 +228,7 @@ trusted and `F.printing is False`, "carried" = §3.7.
 | C10b | `off_read` and E.mode `running` and not E.rejected and no E.failure, and not C10 | `not_printing` | none |
 | C11 | not standalone, trusted, R is not None, E.mode `running`, not E.rejected, not (`E.failure` and `after_switch`), E names a message (`E.message_name` or `E.fingerprint` not empty), and R doesn't match E. Carried while not trusted | `drift` | `drift` |
 | C11b | not standalone, trusted, E.mode `running` or `switch_pending`, not E.rejected, and (R is None, or `F.running_unchecked`). Carried while not trusted | `message_unchecked` | `message_unreadable` only while `F.running_unchecked` |
-| C12 | standalone, E names a message, `reading.message_name` was read this cycle and `norm_name` differs from `E.message_name`; or standalone and E.mode in (`switch_pending`, `test_running`) | `unknown_while_down` | none |
+| C12 | standalone, E names a message, `reading.message_name` was read this cycle and `norm_name` differs from `E.message_name`; or standalone, trusted, E names a message and MSGNAM gave no name this check (`F.message_name` is None, §3.2); or standalone, trusted, E.mode `running`, no E.failure, not E.rejected and `F.printing` is None (PRIN not read since the outage began); or standalone and E.mode in (`switch_pending`, `test_running`) | `unknown_while_down` | none |
 | C13 | `on` and `F.ink_level == 4`. Carried while not trusted | `ink_out` | `ink_out` |
 | C14 | `on` and `F.ink_level == 0`. Carried while not trusted | `cartridge_error` | `cartridge_error` |
 | C15 | trusted and (`F.ink_level` in (2, 3), or (`F.ink_level` in (0, 4) and not `on`)). Carried while not trusted | none | `low_ink` (text by level, §10) |
@@ -665,6 +668,8 @@ def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) ->
     #    the card shows what is really printing
     # 3. If expected and poll and poll.message_name is not None and
     #    norm_name(poll.message_name) != norm_name(expected.message_name): ""  (unknown)
+    # 3b. If expected and poll and poll.standalone and poll.reachable and poll.problem == "" and
+    #    poll.message_name is None: ""  (unknown: the standalone check couldn't read the name, §3.2)
     # 4. expected.origin_line if expected, else ""
 ```
 
@@ -874,12 +879,21 @@ tick:
       `read` or `command` fits when `now + worst_case_s(call) <= end` (protocol.md §8.3); a web call
       (`load_slot`, `fonts`, `firmware`) fits when `now + http_timeout_s <= end`, because it gets
       `end` as its deadline. The worker never calls `check_uid()` or `read_twice()` (their worst case
-      is longer); it reads `read("HXUI")` and lets the two-reading rule confirm a mismatch (§3.8). If
+      is longer); it reads `read("HXUI")` and lets the two-reading rule confirm a mismatch (§3.8).
+      When `now − p_ok >= stale_s / 2` (7.5 s) already as this step 7 starts (the PC slept or was
+      paused in the middle of the cycle), P hasn't proved this worker alive meanwhile, and another PC
+      may have taken the printer over. So before step 7.1 (whose paused write is a P write too) the
+      worker reads P: when another PC has written it since this worker's last write and hasn't
+      yielded to it, the worker makes no request and no P write, ends the cycle without judging,
+      continues from that PC's P, and polls again only once that PC yields to it (§6.2 item 3.3) or P
+      has been quiet for `stale_s` (a live PC that ranks above this one is handed over to at once, and
+      one this PC doesn't see as live is yielded to). The same check comes before the cycle's own
+      write (step 11) and before a clock set records its TD (§6.11 item 3.3). Otherwise, if
       `now − p_ok >= poll_fast_s`, or the request doesn't fit, write P first (counter + 1, everything
-      else as last written), which moves `p_ok` and `end` on. If it still doesn't fit, make no further
-      request this cycle; and once `now − p_ok >= stale_s / 2` (7.5 s), apply §6.13: P can no longer
-      prove this worker is alive, so another PC may soon start polling the printer. Nothing (no share
-      operation, no sleep) runs between this check and the call.
+      else as last written), which moves `p_ok` and `end` on. If it still doesn't fit (a failed or
+      slow write), make no further request this cycle; and once `now − p_ok >= stale_s / 2`, apply §6.13:
+      P can no longer prove this worker is alive, so another PC may soon start polling the printer.
+      Nothing (no share operation, no sleep) runs between this check and the call.
    3. **Send it** at once. Every call gets `deadline=end`: `read(tag, deadline=end)`, `command(cmd,
       deadline=end)`, `load_slot(0, deadline=end)`, `fonts(deadline=end)`, `firmware(deadline=end)`.
       A call that has to wait for this PC's gate (a Stop, Resume or clock set on this PC took it
@@ -1957,7 +1971,8 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
     records it (`sent` True) before it is sent, so a takeover after a crash or a failed write can't
     send a second one.
 25. **Standalone mode** judges with the cached E and no locks, skips crash recovery and drift, shows
-    `unknown_while_down` when the message name differs from the last Send on record, logs with
+    `unknown_while_down` when the message name differs from the last Send on record or can't be read
+    (and while printing hasn't been read), logs with
     `"standalone": true`, and keeps acks local.
 26. **Acknowledging** is per alert; the card buttons acknowledge every active alert of the machine or
     line. The acknowledging PC goes quiet at once; the others within one `watch_s`.

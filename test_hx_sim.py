@@ -573,6 +573,7 @@ class PlantTests(unittest.TestCase):
                 return
             # The machine is checked and its clock set; nothing is built yet
             held["lock"], held["p"] = plant.observer.read_lock(pid), plant.p(0)
+            held["starts"] = len(second.entries("polling_started"))     # log entries carry no time
             first.store.fs.down = True
             held["t0"] = time.monotonic()
             held["ok"] = wait(lambda: took_over(held["lock"].token), t.takeover_s[1] + 3 * t.heartbeat_s + 2)
@@ -585,7 +586,9 @@ class PlantTests(unittest.TestCase):
         took = held["t1"] - held["t0"]
         self.assertGreaterEqual(took, t.takeover_s[0] * 0.8)
         self.assertLess(took, t.takeover_s[1] + 3 * t.heartbeat_s + settle_s(t) + 1.0)
-        self.assertEqual(second.entries("polling_started")[-1]["reason"], "takeover")
+        # Its first start after the cut is the takeover. On a busy machine it may hand back to the cut-off
+        # PC once (its last heartbeat seen a pass late) and start again with reason "restart" (§6.3)
+        self.assertEqual(second.entries("polling_started")[held["starts"]]["reason"], "takeover")
         # The Send went on after the hold (a timing hiccup at the printer may make it red)
         (r,) = result.machines
         self.assertGreaterEqual(STEPS.index(r.step), STEPS.index(STEP_BUILD), (r.step, r.msg))

@@ -1281,8 +1281,9 @@ def lookup_group_sid(name: str) -> str | None
 
 def open_for_read(path: str) -> BinaryIO
     # Windows: CreateFileW(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    #   OPEN_EXISTING) -> msvcrt.open_osfhandle -> os.fdopen(fd, "rb"), so a reader never blocks
-    #   another writer's os.replace. Raises FileNotFoundError / PermissionError / OSError like open().
+    #   OPEN_EXISTING) -> msvcrt.open_osfhandle -> os.fdopen(fd, "rb"). Windows' os.replace (MoveFileExW)
+    #   can still refuse to replace a file a reader holds open, so writers retry (storage §8.2 item 3).
+    #   Raises FileNotFoundError / PermissionError / OSError like open().
     # Elsewhere: open(path, "rb").
 
 @dataclass(frozen=True)
@@ -2141,7 +2142,7 @@ def _zebra_shortcut(self, event, action):
 | Deployment log | `<parent of ConfigPath>\status\*.json` | `v2\status\deployment\` (written); the Deployment status window also reads today's folder, read-only | `STRIPES_STATUS` |
 | Zebra per-user settings | `%APPDATA%\Stripes\settings.json` | `%APPDATA%\Stripes\v2\settings.json`, copied once from the old file when missing | `STRIPES_SETTINGS` |
 | MapleJet per-user settings | none | `%APPDATA%\Stripes\v2\maplejet.json` | via `STRIPES_V2_ROAMING` |
-| Zebra config cache | `%LOCALAPPDATA%\Stripes\config-cache` | `%LOCALAPPDATA%\Stripes\v2\config-cache` | `STRIPES_CACHE` |
+| Zebra config cache | `%LOCALAPPDATA%\Stripes\config-cache` | `%LOCALAPPDATA%\Stripes\v2\config-cache`, copied once from the old folder (keeping each file's time) when it has no `printers.json` | `STRIPES_CACHE` |
 | Single-instance file | `%LOCALAPPDATA%\Stripes\instance.txt` | `%LOCALAPPDATA%\Stripes\v2\instance.txt` (follows `cache_folder()`) | via `STRIPES_CACHE` |
 | Local copy, previews, reach memory | none | `%LOCALAPPDATA%\Stripes\v2\hx\` | `STRIPES_V2_LOCAL` |
 | Send-log queue (all the PC's users) | none | `%PROGRAMDATA%\Stripes\v2\send-queue\` | `STRIPES_V2_MACHINE` |
@@ -2158,6 +2159,12 @@ Changes in `stripes.py`:
    `App.__init__` calls `hx_share.copy_once(<old settings path>, settings_path())` before
    `load_settings()`, only when `STRIPES_SETTINGS` isn't set.
 2. `cache_folder()`: `os.path.join(hx_share.local_dir(), "config-cache")` unless `STRIPES_CACHE`.
+   Right after the settings copy, `copy_old_cache()` copies today's `config-cache\stock.json` and then
+   `printers.json` into it with `hx_share.copy_once` and sets each copy's modified time to the old
+   file's (`load_cached_config()` shows it as "saved {when}"). Only when `STRIPES_CACHE` isn't set and
+   the new folder has no `printers.json`, so this version's own copy is never added to or replaced.
+   Without it the first start would have no saved copy: no company printers while the server is
+   unreachable, and the printer used last (a company one) not selectable before the server is read.
 3. New `zebra_config_folder()`: `v2\config` when `v2\config\printers.json` exists, else
    `configured_folder()`. It touches the share, so only `load_company_config()` (a background call)
    uses it; `App.config_folder` stays `configured_folder()`.
@@ -2248,7 +2255,8 @@ Changes in `stripes.py`:
     at Send stays on `Machine.head_distance_mm`.
 13. **v2 everywhere for the new version**, including the Zebra side: the Zebra config is read from
     `v2\config` (falling back to `ConfigPath`, read-only, until the folder script has run); Zebra
-    per-user settings and cache move under `v2` with a one-time copy of `settings.json`; the
+    per-user settings and cache move under `v2` with a one-time copy of `settings.json` and of the
+    saved config copy (§10.5); the
     deployment log is written to `v2\status\deployment\` (the folder script creates it with Domain Users
     Modify) and the Deployment status window also reads today's folder, so rollout stays visible.
 14. **MapleJet per-user settings in their own file** (`maplejet.json`), so `load_settings()` for Zebra

@@ -25,8 +25,8 @@ import hx_share
 import hx_state
 import hx_time
 from hx_core import SYSTEM_CLOCK, EventBus, FakeClock, Msg
-from hx_model import (AMBER, RED, TIMINGS, Ack, AuthFailed, BoardUpdate, DesignItem, ExpectedState, FailureInfo,
-                      HeartbeatInfo, MessageDesign, PollerUpdate, PollStatus)
+from hx_model import (ALLOWED_WRITE_TAGS, AMBER, RED, TIMINGS, Ack, AuthFailed, BoardUpdate, DesignItem,
+                      ExpectedState, FailureInfo, HeartbeatInfo, MessageDesign, PollerUpdate, PollStatus)
 
 EDT = lambda utc: -14400.0               # a fixed offset: the fake printer's clock doesn't follow the host
 # Logic tests: default timings on a FakeClock, with short real network and share limits
@@ -192,7 +192,19 @@ class Sim:
 
 class Base(unittest.TestCase):
     def sim(self, **kw):
-        return Sim(self, **kw)
+        sim = Sim(self, **kw)
+        self.addCleanup(self.check_fakes, sim)
+        return sim
+
+    def check_fakes(self, sim):
+        # protocol.md §15.8: every test that drives the poller against a fake ends with no violations,
+        # one request at a time and only whitelisted writes, on every fake of its world
+        for fake in sim.world.printers:
+            with fake.lock:
+                violations, in_flight, writes = list(fake.violations), fake.max_in_flight, set(fake.writes)
+            self.assertEqual(violations, [])
+            self.assertLessEqual(in_flight, 1)
+            self.assertLessEqual(writes, set(ALLOWED_WRITE_TAGS))
 
     def steady(self, sim, seconds=40):
         self.assertTrue(sim.run(seconds), "the run ended early")
@@ -1073,6 +1085,51 @@ class StandaloneTests(Base):
         self.assertTrue(sim.run(LOGIC.standalone_poll_s + 5,
                                 until=lambda: a.poller.local_statuses()[sim.mid].state.code == "running_confirmed"))
 
+    def floor_row(self, a, sim):
+        return next(r for r in hx_state.floor_board_rows(a.watcher.latest) if r.machine_id == sim.mid)
+
+    def test_message_name_never_read_in_standalone_is_not_green(self):
+        # MSGNAM answers busy at every check from the first one: standalone checks never load the
+        # message, so without a name the machine is amber with its origin unknown, also once the
+        # printer has been switched at its panel to another message with another origin
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        sim.fake.override("MSGNAM", "7")
+        a.poller.set_monitor_open(True, False)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        install(sim.fake, 10, "SOMETHING-ELSE", "Product of Mexico")
+        self.t0 = sim.clock.monotonic()
+        seen = self.board_samples(sim, a, 8, 10)
+        self.assertEqual([s for s in seen if s[2] == "green"], [], seen)
+        self.assertEqual(seen[-1][1:], ("unknown_while_down", "amber"))
+        self.assertEqual((self.floor_row(a, sim).origin_line, self.floor_row(a, sim).colour), ("", AMBER))
+        # MSGNAM answers again, with E's message back: green after the check and its second reading
+        install(sim.fake)
+        sim.fake.override("MSGNAM", None)
+        self.assertTrue(sim.run(LOGIC.standalone_poll_s + 5,
+                                until=lambda: a.poller.local_statuses()[sim.mid].state.code == "running_confirmed"))
+        a.watcher.run_once()
+        self.assertEqual(self.floor_row(a, sim).origin_line, ORIGIN)
+
+    def test_message_name_unreadable_after_a_good_check_is_not_green(self):
+        # After green checks the printer is switched at its panel to a message whose name fails MSGNAM's
+        # reply check (a name "3" reads as a reply code): the name an earlier check read doesn't keep
+        # the machine green with E's origin
+        sim = self.sim()
+        a = self.green_standalone(sim)
+        install(sim.fake, 10, "3", "Product of Mexico")
+        self.t0 = sim.clock.monotonic()
+        seen = self.board_samples(sim, a, 4, 10)
+        self.assertEqual(seen[-1][1:], ("unknown_while_down", "amber"), seen)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual((st.state.code, st.message_name), ("unknown_while_down", None))
+        self.assertEqual((self.floor_row(a, sim).origin_line, self.floor_row(a, sim).colour), ("", AMBER))
+        self.assertEqual(st.alerts, [])
+
     def test_a_client_that_cant_be_made_commits_at_once(self):
         # No client for the printer (a password that can't be unscrambled): nothing can be read again,
         # so login_failed commits at the check, as in share mode, instead of the old green never moving
@@ -1138,6 +1195,85 @@ class CoordinationTests(Base):
     def ranked(self, sim):
         a, b = sim.pc("akim"), sim.pc("bob")
         return (a, b) if assign_order(sim, a, b)[0] == a.key else (b, a)
+
+    def test_a_worker_frozen_mid_cycle_never_polls_over_a_takeover(self):
+        # Rank 0's PC freezes (sleep, a VM pause) in the middle of a cycle, for longer than stale_s, and
+        # rank 1 takes the printer over meanwhile. When rank 0 wakes, its last P write is stale_s / 2
+        # old: it reads P first, finds rank 1's, and neither sends nor writes P until rank 1 has handed
+        # the printer back. Frozen right after a reply; after the last request, before the cycle's own
+        # write at the end; and in a daylight-saving clock set, before it records the TD in P
+        real_judge = hx_state.judge
+        for where in ("PRIN", "judge", "clock set"):
+            with self.subTest(freeze=where):
+                if where == "clock set":
+                    sim = self.sim(clock=FakeClock(CHANGE - 120), printers=[{"offset_fn": DST}])
+                else:
+                    sim = self.sim()
+                sim.expect()
+                r0, r1 = self.ranked(sim)
+                sent = {r0.key: [], r1.key: []}
+                freeze = {}
+
+                def frozen():
+                    freeze.clear()
+                    sim.run(40.0, pcs=[r1])                 # only rank 1 runs meanwhile
+                    freeze["woke"] = sim.clock.monotonic()
+
+                def in_clock_set():
+                    w = r0.worker()
+                    return w is not None and w._dst_due(r0.poller._dst)
+                for pc in (r0, r1):
+                    real_client = pc.clients.client
+
+                    def client(printer, real_client=real_client, pc=pc):
+                        c = real_client(printer)
+                        if not getattr(c, "_recorded", False):
+                            for name in ("read", "command", "load_slot", "fonts", "firmware"):
+                                def call(*args, _fn=getattr(c, name), **kw):
+                                    sent[pc.key].append(sim.clock.monotonic())
+                                    out = _fn(*args, **kw)
+                                    if pc is r0 and ((freeze.get("at") == "PRIN" and args[:1] == ("PRIN",))
+                                                     or (freeze.get("at") == "clock set" and args[:1] == ("TIME",)
+                                                         and in_clock_set())):
+                                        frozen()
+                                    return out
+                                setattr(c, name, call)
+                            c._recorded = True
+                        return c
+                    pc.clients.client = client
+
+                def judge(prev, *args, **kw):
+                    out = real_judge(prev, *args, **kw)
+                    if freeze.get("at") == "judge" and prev is not None and prev.poller == r0.key:
+                        frozen()
+                    return out
+                self.steady(sim, 60)
+                self.assertEqual((sim.p().poller, r1.worker()), (r0.key, None))
+                if where == "clock set":
+                    self.assertTrue(sim.run(120, until=lambda: sim.clock.time() >= CHANGE - 3))
+                freeze["at"] = where
+                with mock.patch.object(hx_state, "judge", judge):
+                    self.assertTrue(sim.run(30, pcs=[r0], until=lambda: "woke" in freeze))
+                    woke = freeze["woke"]
+                    sim.run(LOGIC.poll_fast_s + 1, pcs=[r0])    # the rest of that cycle, and the next tick
+                took = r1.worker()
+                self.assertTrue(took is not None and took.rank_checked and not took.done)
+                self.assertEqual(r1.entries("polling_started")[-1]["reason"], "takeover")
+                self.assertEqual([t for t in sent[r0.key] if t >= woke], [])
+                self.assertEqual(sim.p().poller, r1.key)
+                # Both PCs run again: rank 1 sees rank 0's heartbeat and hands back; rank 0 polls on only then
+                self.assertTrue(sim.run(30, until=lambda: r1.worker() is None and sim.p().poller == r0.key))
+                last = r1.entries("polling_stopped")[-1]
+                self.assertEqual((last["reason"], last["yielded_to"]), ("handover", r0.key))
+                self.assertTrue(sim.run(10, until=lambda: any(t >= woke for t in sent[r0.key])))
+                self.assertLess(max(sent[r1.key]), min(t for t in sent[r0.key] if t >= woke))
+                self.assertTrue(sim.run(30, until=lambda: sim.code() == "running_confirmed"))
+                if where == "clock set":
+                    # One TD, by rank 1, which made the clock set while it polled; rank 0 continues from its P
+                    self.assertEqual(sim.fake.writes, ["TD"])
+                    self.assertEqual((len(r1.entries("dst_clock_set")), r0.entries("dst_clock_set")), (1, []))
+                    self.assertEqual(sim.p().dst["by"], r1.key)
+                self.no_violations(sim)
 
     def test_handover_and_stop(self):
         sim = self.sim()
@@ -1765,6 +1901,32 @@ class ConstantsTests(unittest.TestCase):
         spring = float(calendar.timegm((2026, 3, 8, 7, 0, 0)))
         self.assertEqual(hx_poller.dst_change_id(spring, -14400.0, offset_fn=lambda u: -14400.0), "20260308-14400")
         self.assertEqual(hx_poller.dst_change_id(spring, 3600.0, offset_fn=lambda u: 3600.0), "20260308+3600")
+
+
+class FakeCheckTests(unittest.TestCase):
+    def test_every_fake_is_checked_when_a_test_ends(self):
+        # A test that never looks at its fakes still fails when one saw a violation, two requests in
+        # flight or a write outside the whitelist, also on a fake other than the first
+        def spoil(fake, what):
+            with fake.lock:
+                if what == "violation":
+                    fake.violations.append("two requests in flight")
+                elif what == "in flight":
+                    fake.max_in_flight = 2
+                else:
+                    fake.writes.append("SETPPARAM")
+
+        for what in ("violation", "in flight", "write", None):
+            class Inner(Base):
+                def runTest(self):
+                    sim = self.sim(printers=[{"offset_fn": EDT}, {"offset_fn": EDT}])
+                    if what is not None:
+                        spoil(sim.world.printers[1], what)
+            with self.subTest(what=what):
+                result = unittest.TestResult()
+                Inner().run(result)
+                self.assertEqual(len(result.failures) + len(result.errors), 0 if what is None else 1,
+                                 result.failures + result.errors)
 
 
 if __name__ == "__main__":
