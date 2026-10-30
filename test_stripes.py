@@ -541,14 +541,14 @@ class DeploymentLogTests(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
 
-    def log(self, computer="ARROW01", user="John"):
+    def log(self, computer="FLOOR01", user="John"):
         return zl.DeploymentLog(self.dir, computer, user)
 
     def test_install_update_heartbeat_close(self):
         log = self.log()
         self.assertTrue(log.started("v1.2.0", r"C:\Users\John\AppData\Local\Programs\Stripes\Stripes.exe"))
         r = log.read()
-        self.assertEqual((r["computer"], r["user"], r["version"], r["running"]), ("ARROW01", "John", "v1.2.0", True))
+        self.assertEqual((r["computer"], r["user"], r["version"], r["running"]), ("FLOOR01", "John", "v1.2.0", True))
         self.assertEqual([e["event"] for e in r["events"]], ["Installed (v1.2.0)"])
         first_seen = r["first_seen"]
 
