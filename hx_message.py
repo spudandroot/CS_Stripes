@@ -52,6 +52,10 @@ COUNTRY_NAME_MAX = 30
 MAX_ITEMS = 99                                    # OBJIDs 10001..10099 (a technical limit only)
 FIRST_OBJID = 10001
 GAP_MAX = 50                                      # PrintTextItem.gap, canvas units (OPEN)
+# The least gap a right-placed item is sent with (§3.4): MARG x is measured from the previous item's
+# X-max, so with 0 the two texts print as one word ("CanadaLot"). About one word space at the plan's
+# Arial 4, and the same as TEST_SAMPLE_GAP (OPEN: the units, like GAP_MAX)
+SIDE_GAP_MIN = 8
 OFFSET_MAX = {"days": 999, "months": 999, "years": 99}   # CTDAT DAY, MON, YEAR (manual)
 FILM_LENGTH_MAX_MM = 5000.0
 HEAD_DISTANCE_MAX_MM = 20000.0
@@ -121,15 +125,19 @@ ES = {
     "A line in this Send no longer exists or isn't active.": "Una línea de este envío ya no existe o no está activa.",
     "Tick at least one machine on {line}.": "Marque al menos una máquina en {line}.",
     "{machine} isn't an active machine on {line}.": "{machine} no es una máquina activa de {line}.",
+    "A machine chosen for {line} no longer exists.": "Una máquina elegida para {line} ya no existe.",
+    "The machine chosen for this test no longer exists.": "La máquina elegida para esta prueba ya no existe.",
     "{machine} is in this Send twice.": "{machine} está dos veces en este envío.",
     "{machine} and {other} use the same printer.": "{machine} y {other} usan la misma impresora.",
     "Choose a product for {line}.": "Elija un producto para {line}.",
     "The product chosen for {line} isn't active.": "El producto elegido para {line} no está activo.",
     "Choose a film for {line}.": "Elija una película para {line}.",
+    "The film chosen for {line} no longer exists.": "La película elegida para {line} ya no existe.",
     "Film {film} can't be sent to {line}: it must be active, belong to the product and use the line's "
     "cartridge type.": "La película {film} no se puede enviar a {line}: debe estar activa, ser del producto y "
                        "usar el tipo de cartucho de la línea.",
     "Choose a print text for {line}.": "Elija un texto de impresión para {line}.",
+    "The print text chosen for {line} no longer exists.": "El texto de impresión elegido para {line} ya no existe.",
     "Print text {print_text} can't be used with film {film}.":
         "El texto de impresión {print_text} no se puede usar con la película {film}.",
     "Enter the lot for {line}.": "Escriba el lote para {line}.",
@@ -1074,13 +1082,18 @@ def validate_choice(choice, data, identity):
     seen = set()
     for machine_id in choice.machine_ids:
         machine = data.machines.get(machine_id)
-        name = machine.name if machine is not None else machine_id
         if machine_id in seen:
-            problems.append(Msg(N_("{machine} is in this Send twice."), {"machine": name}))
+            if machine is not None:         # a missing machine is told once, below
+                problems.append(Msg(N_("{machine} is in this Send twice."), {"machine": machine.name}))
             continue
         seen.add(machine_id)
+        if machine is None:
+            # Texts name records, never their ids (§19)
+            problems.append(Msg(N_("A machine chosen for {line} no longer exists."), on_line))
+            continue
         if machine_id not in active:
-            problems.append(Msg(N_("{machine} isn't an active machine on {line}."), {"machine": name, **on_line}))
+            problems.append(Msg(N_("{machine} isn't an active machine on {line}."),
+                                {"machine": machine.name, **on_line}))
             continue
         machines.append(machine)
 
@@ -1091,18 +1104,22 @@ def validate_choice(choice, data, identity):
     elif product is None or not product.active:
         problems.append(Msg(N_("The product chosen for {line} isn't active."), on_line))
     film = data.films.get(choice.film_id)
-    film_name = _film_name(film) if film is not None else choice.film_id
     if not choice.film_id:
         problems.append(Msg(N_("Choose a film for {line}."), on_line))
-    elif film is None or film.id not in [f.id for f in films_for_line(line, choice.product_id, data)]:
+    elif film is None:
+        problems.append(Msg(N_("The film chosen for {line} no longer exists."), on_line))
+    elif film.id not in [f.id for f in films_for_line(line, choice.product_id, data)]:
         problems.append(Msg(N_("Film {film} can't be sent to {line}: it must be active, belong to the product and "
-                               "use the line's cartridge type."), {"film": film_name, **on_line}))
+                               "use the line's cartridge type."), {"film": _film_name(film), **on_line}))
     pt = data.print_texts.get(choice.print_text_id)
     if not choice.print_text_id:
         problems.append(Msg(N_("Choose a print text for {line}."), on_line))
-    elif pt is None or film is None or pt.id not in [p.id for p in print_texts_for_film(film, data)]:
+    elif pt is None:
+        problems.append(Msg(N_("The print text chosen for {line} no longer exists."), on_line))
+    elif film is not None and pt.id not in [p.id for p in print_texts_for_film(film, data)]:
+        # Without a film the film's own problem above says what to fix
         problems.append(Msg(N_("Print text {print_text} can't be used with film {film}."),
-                            {"print_text": pt.name if pt is not None else choice.print_text_id, "film": film_name}))
+                            {"print_text": pt.name, "film": _film_name(film)}))
 
     if pt is not None:
         # 4. The lot
@@ -1186,7 +1203,7 @@ def validate_choice(choice, data, identity):
             problems.append(Msg(N_("{machine} has no print speed. An administrator must set it."), on_machine))
         if film is None:
             continue
-        on_film = {"film": film_name}
+        on_film = {"film": _film_name(film)}
         if machine.placement == "encoder":
             if machine.head_distance_mm is None:
                 problems.append(Msg(N_("{machine} isn't calibrated: it has no head distance."), on_machine))
@@ -1240,13 +1257,19 @@ def _item_value(plan, item):
     raise ValueError(f"unknown item kind {kind!r}")
 
 
+def sent_gap(placement: str, gap: int) -> int:
+    """The gap an item is sent with (§3.4): a right-placed item at least SIDE_GAP_MIN, so two items
+    side by side never print touching; an item placed below keeps its own gap."""
+    return max(gap, SIDE_GAP_MIN) if placement == "right" else gap
+
+
 def _join_bag_text(parts):
-    """§3.5: (text, placement, gap) in order -> one line; " / " before an item placed below,
-    " " before one with a gap."""
+    """§3.5: (text, placement, gap) in order -> one line; " / " before an item placed below, " "
+    before one placed right (it always prints at least SIDE_GAP_MIN away, whatever its gap)."""
     out = []
     for k, (text, placement, gap) in enumerate(parts):
         if k:
-            out.append(" / " if placement == "below" else (" " if gap > 0 else ""))
+            out.append(" / " if placement == "below" else " ")
         out.append(text)
     return "".join(out)
 
@@ -1280,23 +1303,21 @@ def merge_plan(request, data, identity):
         problems.append(Msg(N_("Choose at least one line.")))
     lines_seen = set()
     for choice in request.lines:
-        if choice.line_id in lines_seen:
-            line = data.lines.get(choice.line_id)
-            problems.append(Msg(N_("{line} is in this Send twice."),
-                                {"line": line.name if line is not None else choice.line_id}))
+        line = data.lines.get(choice.line_id)
+        if choice.line_id in lines_seen and line is not None:     # validate_choice tells of a missing line
+            problems.append(Msg(N_("{line} is in this Send twice."), {"line": line.name}))
         lines_seen.add(choice.line_id)
     machines_seen = set()
     by_printer = {}
     for choice in request.lines:
         for machine_id in choice.machine_ids:
             machine = data.machines.get(machine_id)
+            if machine is None:
+                continue                    # validate_choice tells of a missing machine
             if machine_id in machines_seen:
-                problems.append(Msg(N_("{machine} is in this Send twice."),
-                                    {"machine": machine.name if machine is not None else machine_id}))
+                problems.append(Msg(N_("{machine} is in this Send twice."), {"machine": machine.name}))
                 continue
             machines_seen.add(machine_id)
-            if machine is None:
-                continue
             first = by_printer.setdefault(machine.printer_id, machine)
             if first is not machine:
                 problems.append(Msg(N_("{machine} and {other} use the same printer."),
@@ -1498,9 +1519,9 @@ def _text_items(plan):
         else:
             _need(_is_int(it.gap) and 0 <= it.gap <= GAP_MAX, "a gap")
             if it.placement == "right":
-                # right of the previous item, same top
+                # right of the previous item, same top, never touching it
                 place = [("XRID", str(prev)), ("YRID", str(prev)), ("SXAS", "0"), ("SYAS", "1")]
-                marg = f"{it.gap},0"
+                marg = f"{sent_gap(it.placement, it.gap)},0"
             elif it.placement == "below":
                 # a new line under the previous item, lined up with the start of the previous line
                 place = [("XRID", str(line_start)), ("YRID", str(prev)), ("SXAS", "1"), ("SYAS", "0")]
@@ -1896,9 +1917,11 @@ def plan_test(machine_id, film_id, ranges, data, identity, *, kind="test"):
     printer = data.printers.get(machine.printer_id) if machine is not None else None
     line_name = line.name if line is not None else ""
     problems = []
-    if machine is None or not machine.active:
+    if machine is None:
+        problems.append(Msg(N_("The machine chosen for this test no longer exists.")))
+    elif not machine.active:
         problems.append(Msg(N_("{machine} isn't an active machine on {line}."),
-                            {"machine": machine.name if machine is not None else machine_id, "line": line_name}))
+                            {"machine": machine.name, "line": line_name}))
     else:
         problems += validate_machine(machine, data)
         if not _printer_ready(printer):

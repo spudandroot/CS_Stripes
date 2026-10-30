@@ -2,10 +2,10 @@
 
 LineBoard shows a BoardView as one card per line, with a row per machine; it sits in the
 MapleJet tab and in the MapleJet monitor. FloorBoard is the monitor in floor-board mode:
-one big row per machine, drawn on a canvas, for the production-schedule PC. AlertSounder
-rings the alert sound while an unacknowledged sound alert is meant for this PC, and opens
-the personal pop-up for alerts addressed to the person signed in. UserSettingsDialog holds
-the three floor-board settings.
+one big row per machine under its line's name, drawn on a canvas, for the
+production-schedule PC. AlertSounder rings the alert sound while an unacknowledged sound
+alert is meant for this PC, and opens the personal pop-up for alerts addressed to the person
+signed in. UserSettingsDialog holds the three floor-board settings.
 
 Nothing here decides a colour, a state or whether a button is allowed: those come from the
 board's views (hx_state). Bag text (origins) is only ever shown in BagText canvases or as
@@ -70,6 +70,8 @@ ES = {
 add_spanish(ES)
 
 FLOOR_MIN_ROWS = 4          # a floor-board row is never taller than 1/4 of the rows area
+FLOOR_MIN_ROW_PX = 44       # rows never get shorter than this: past it the floor board scrolls
+FLOOR_GROUP_SHARE = 0.5     # a line's header band is half a row tall
 FLOOR_FLASH_MS = 1000
 
 _TICK_MS = 1000             # ages and the clock
@@ -78,6 +80,11 @@ _REFUSED_MS = 3000          # "You can refresh once every ... s." shows this lon
 _TWO_COLUMNS_PX = 1100      # line cards in two columns from this board width
 _ORIGIN_WRAP_PX = 520
 _SEPARATOR = "#e5e7eb"      # between rows of one line on the floor board
+_FLOOR_COLUMNS = (0.025, 0.14, 0.44, 0.27)  # floor-board bar, name, origin, status; the age takes the rest
+_FLOOR_PAD = 12             # each floor-board text starts this far into its column and stops this far short of the next
+_FLOOR_SMALLEST = {"name": 14, "status": 16, "age": 9}     # px these shrink to before an ellipsis
+_ELLIPSIS = "…"
+_NAME_SEPARATORS = " -–—:·/|_,."    # between a line's name and the rest of a machine's name
 _SUMMARY = ((RED, N_("{n} red")), (AMBER, N_("{n} amber")), (BLUE, N_("{n} in progress")),
             (GREY, N_("{n} grey")), (GREEN, N_("{n} green")))
 _SIZE_LIMITS = ((640, 7680), (360, 4320))   # the settings dialog's width and height Spinboxes
@@ -89,33 +96,100 @@ _SIZE_LIMITS = ((640, 7680), (360, 4320))   # the settings dialog's width and he
 
 @dataclass(frozen=True, kw_only=True)
 class FloorLayout:
+    width: int                  # of the rows: the board's width, less the scrollbar when it scrolls
     header_h: int
+    group_h: float              # a line's header band
     row_h: float
+    rows_h: int                 # every band and row together
+    scrolls: bool               # rows_h is taller than the room under the header
     bar_w: int
     names_w: int
     origin_w: int
     status_w: int
     age_w: int
     header_px: int
-    line_px: int
-    machine_px: int
+    line_px: int                # a line's name in its header band
+    machine_px: int             # the largest sizes; texts too wide for their column shrink from these
     origin_px: int
     status_px: int
     age_px: int
 
 
-def floor_layout(width: int, height: int, rows: int) -> FloorLayout:
-    """Column widths, the row height and the font sizes (pixels) of the floor board (ui.md §10.3).
-    Rows fill the screen, each at most a quarter of it; beyond 12 they keep shrinking."""
+def floor_layout(width: int, height: int, rows: int, lines: int = 0, scrollbar_w: int = 0) -> FloorLayout:
+    """Column widths, the row and band heights and the starting font sizes (pixels) of the floor
+    board (ui.md §10.3): `rows` machines under `lines` line headers. Rows fill the room under the
+    header, each at most a quarter of it; they shrink to FLOOR_MIN_ROW_PX and no further, and
+    then the board scrolls, its rows narrower by `scrollbar_w`."""
     header_h = max(48, round(height * 0.07))
-    row_h = (height - header_h) / max(rows, FLOOR_MIN_ROWS)
-    bar_w, names_w = round(width * 0.03), round(width * 0.17)
-    origin_w, status_w = round(width * 0.45), round(width * 0.25)
-    return FloorLayout(header_h=header_h, row_h=row_h, bar_w=bar_w, names_w=names_w, origin_w=origin_w,
-                       status_w=status_w, age_w=width - bar_w - names_w - origin_w - status_w,
-                       header_px=max(12, round(header_h * 0.45)), line_px=max(8, round(row_h * 0.20)),
-                       machine_px=max(9, round(row_h * 0.28)), origin_px=max(10, round(row_h * 0.50)),
-                       status_px=max(9, round(row_h * 0.30)), age_px=max(8, round(row_h * 0.20)))
+    room = max(1, height - header_h)
+    units = rows + FLOOR_GROUP_SHARE * lines
+    row_h = max(room / max(units, FLOOR_MIN_ROWS), float(FLOOR_MIN_ROW_PX))
+    rows_h = round(row_h * units)
+    scrolls = rows_h > room
+    if scrolls:
+        width = max(1, width - scrollbar_w)
+    bar_w, names_w, origin_w, status_w = (round(width * share) for share in _FLOOR_COLUMNS)
+    group_h = row_h * FLOOR_GROUP_SHARE
+    return FloorLayout(width=width, header_h=header_h, group_h=group_h, row_h=row_h, rows_h=rows_h, scrolls=scrolls,
+                       bar_w=bar_w, names_w=names_w, origin_w=origin_w, status_w=status_w,
+                       age_w=width - bar_w - names_w - origin_w - status_w,
+                       header_px=max(12, round(header_h * 0.45)), line_px=max(9, round(group_h * 0.60)),
+                       machine_px=max(9, round(row_h * 0.30)), origin_px=max(10, round(row_h * 0.50)),
+                       status_px=max(9, round(row_h * 0.30)), age_px=max(9, round(row_h * 0.24)))
+
+
+def fit_px(texts, measure, start: int, smallest: int, room: float) -> int:
+    """One pixel size for all of texts: the largest from start down to smallest at which the
+    widest fits room. measure(px, text) is the text's width at that size. Too wide even at
+    smallest: smallest."""
+    texts = {t for t in texts if t}
+    smallest = max(1, min(smallest, start))
+    if not texts:
+        return start
+    widths = {}
+
+    def widest(px):
+        if px not in widths:
+            widths[px] = max(measure(px, t) for t in texts)
+        return widths[px]
+    if widest(start) <= room:
+        return start
+    # Widths grow about in step with the size: start near the answer, then step to it
+    px = max(smallest, min(start - 1, int(start * room / max(1, widest(start)))))
+    while px > smallest and widest(px) > room:
+        px -= 1
+    while px < start and widest(px + 1) <= room:
+        px += 1
+    return px
+
+
+def ellipsize(value: str, measure, room: float) -> str:
+    """value as it is when it fits room, else its longest start that fits with "…" after it
+    ("" when not even "…" fits). measure(text) is the text's width. Never used on bag text."""
+    if measure(value) <= room:
+        return value
+    lo, hi = 0, len(value)
+    while lo < hi:                      # the longest start that fits with the ellipsis
+        mid = (lo + hi + 1) // 2
+        if measure(value[:mid].rstrip() + _ELLIPSIS) <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo == 0 and measure(_ELLIPSIS) > room:
+        return ""
+    return value[:lo].rstrip() + _ELLIPSIS
+
+
+def short_name(machine_name: str, line_name: str, code: str = "") -> str:
+    """A machine's name under its line's header on the floor board: without the line's name in
+    front ("Line 1 Bagger 1" under "Line 1" is "Bagger 1"), its printed code when nothing else
+    is left, else its whole name. "Line 10 Bagger 1" doesn't start with "Line 1"."""
+    name, prefix = machine_name.strip(), line_name.strip()
+    if prefix and name[:len(prefix)].casefold() == prefix.casefold():
+        rest = name[len(prefix):]
+        if not rest or rest[0] in _NAME_SEPARATORS:
+            return rest.strip(_NAME_SEPARATORS) or code.strip() or name
+    return name
 
 
 def board_summary(board: BoardView) -> list[Msg]:
@@ -234,10 +308,8 @@ class MachineRow(tk.Frame):
         texts.set(self.unknown_label, N_("(origin unknown)"))
         self.details_label = tk.Label(body, font=(UI_FONT, 8), background=CARD_BG, foreground=MUTED_FG,
                                       anchor="w", justify="left", wraplength=_ORIGIN_WRAP_PX)
-        self.details_label.pack(anchor="w", fill="x")
         self.alerts_frame = tk.Frame(body, background=CARD_BG)
-        self.alerts_frame.pack(anchor="w", fill="x")
-        self.alert_labels: list[tk.Label] = []
+        self.alert_labels: list[tk.Label] = []      # details, alerts and buttons are packed by update_view
         self.buttons = tk.Frame(body, background=CARD_BG)
         self.stop_button = ttk.Button(self.buttons, command=lambda: self._nav().stop([self.view.machine_id]))
         self.resume_button = ttk.Button(self.buttons, command=lambda: self._nav().resume([self.view.machine_id]))
@@ -281,10 +353,6 @@ class MachineRow(tk.Frame):
         details = [text(d) for d in view.details]
         details = [d for d in details if d and d not in alert_texts]
         self.details_label.configure(text="\n".join(details), foreground=DIM_FG if dim else MUTED_FG)
-        if details:
-            self.details_label.pack(anchor="w", fill="x", before=self.alerts_frame)  # alerts_frame stays packed
-        else:
-            self.details_label.pack_forget()
         for label in self.alert_labels:
             label.destroy()
         self.alert_labels = []
@@ -311,10 +379,10 @@ class MachineRow(tk.Frame):
             if roles_now.admin and view.code == "not_set_up":
                 wanted.add(self.setup_button)
         _show_widgets(self._buttons, wanted, side="left", padx=(0, 6), pady=(4, 0))
-        if wanted:
-            self.buttons.pack(anchor="w", fill="x")
-        else:
-            self.buttons.pack_forget()
+        # Details, alerts and buttons only while there are some, in that order. An empty frame
+        # left packed keeps the height its last children gave it, so alerts_frame goes too
+        parts = {self.details_label: bool(details), self.alerts_frame: bool(view.alerts), self.buttons: bool(wanted)}
+        _show_widgets(list(parts), {w for w, on in parts.items() if on}, anchor="w", fill="x")
 
     def update_age(self, elapsed_s: float) -> None:
         self.age_label.configure(text=text(hx_state.checked_text(_age(self.view.checked_age_s, elapsed_s))))
@@ -680,9 +748,12 @@ def _flag_changed(nav):
 # --------------------------------------------------------------------------
 
 class FloorBoard(HxWindow):
-    """The MapleJet monitor in floor-board mode: one big row per machine on one canvas
-    (ui.md §10). Full screen is a borderless window on the chosen screen, not topmost; Escape
-    does nothing, and the board stays until Close."""
+    """The MapleJet monitor in floor-board mode (ui.md §10): a header, then each line's machines
+    under the line's name, one big row per machine in fixed columns (name, origin, status,
+    age). Every origin is drawn at one size, the largest at which the longest fits; nothing
+    wraps or overlaps, and when the rows can't all fit the board scrolls. Full screen is a
+    borderless window on the chosen screen, not topmost; Escape does nothing, and the board
+    stays until Close."""
     key = "floor"
 
     def __init__(self, master, services, *, screen: int = 0, size: str = "full"):
@@ -693,7 +764,11 @@ class FloorBoard(HxWindow):
         self.received = None
         self.rows = []
         self.views = {}
+        self.line_views = {}
         self.layout = None
+        self.font_px: dict[str, int] = {}   # the size each column's text is drawn at, the same on every row
+        self.line_items: dict[str, int] = {}
+        self.name_items: dict[str, int] = {}
         self.origin_items: dict[str, int] = {}
         self.unknown_items: dict[str, int] = {}
         self.status_items: dict[str, int] = {}
@@ -703,13 +778,21 @@ class FloorBoard(HxWindow):
         self.title_item = self.clock_item = self.banner_item = None
         self.message_item = None        # the text that stands in for the rows when there are none
         self._fonts = {}
+        self._fit = {}                  # "age"/"banner": (font, room) to fit the texts tick() changes
         self._redraw_timer = None
         self._refused_until = None
-        self.canvas = tk.Canvas(self, background=CARD_BG, highlightthickness=0, borderwidth=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.refresh_button = ttk.Button(self.canvas, command=self._refresh)
-        self.ack_button = ttk.Button(self.canvas, command=self._acknowledge)
-        self.close_button = ttk.Button(self.canvas, command=self.close)
+        # The header stays put; the rows below it scroll when they can't all fit
+        self.header = tk.Canvas(self, background=CARD_BG, highlightthickness=0, borderwidth=0, height=48)
+        self.header.pack(side="top", fill="x")
+        self.body = tk.Frame(self, background=CARD_BG)
+        self.body.pack(side="top", fill="both", expand=True)
+        self.canvas = tk.Canvas(self.body, background=CARD_BG, highlightthickness=0, borderwidth=0)
+        self.scrollbar = ttk.Scrollbar(self.body, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.refresh_button = ttk.Button(self.header, command=self._refresh)
+        self.ack_button = ttk.Button(self.header, command=self._acknowledge)
+        self.close_button = ttk.Button(self.header, command=self.close)
         self.texts.set(self.refresh_button, N_("Refresh now"))
         self.texts.set(self.ack_button, N_("Acknowledge"))
         self.texts.set(self.close_button, N_("Close"))
@@ -718,6 +801,8 @@ class FloorBoard(HxWindow):
         self.subscribe(BoardUpdate, lambda e: self.show(e.board))
         self.subscribe(DataUpdate, lambda e: self.redraw())
         self.canvas.bind("<Configure>", self._on_configure, add="+")
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind(sequence, self._on_wheel, add="+")
         self.later(_TICK_MS, self._tick_timer)
         self.later(FLOOR_FLASH_MS, self._flash_timer)
         self.show(getattr(services.watcher, "latest", None))
@@ -742,8 +827,9 @@ class FloorBoard(HxWindow):
             self.geometry_spec = f"{min(wanted[0], m.width)}x{min(wanted[1], m.height)}+{m.x}+{m.y}"
         self.geometry(self.geometry_spec)
 
-    def _canvas_size(self):
-        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+    def _board_size(self):
+        """The window's size: the header and the rows share it."""
+        width, height = self.winfo_width(), self.winfo_height()
         if width <= 1 or height <= 1:       # not laid out yet: the size it was given
             size = self.geometry_spec.split("+", 1)[0]
             width, height = (int(n) for n in size.split("x"))
@@ -757,6 +843,7 @@ class FloorBoard(HxWindow):
         self.received = self.services.clock.monotonic()
         self.rows = hx_state.floor_board_rows(board) if board is not None else []
         self.views = ({m.machine_id: m for line in board.lines for m in line.machines} if board is not None else {})
+        self.line_views = {line.line_id: line for line in board.lines} if board is not None else {}
         self.redraw()
 
     def _on_configure(self, event):
@@ -767,6 +854,17 @@ class FloorBoard(HxWindow):
     def _debounced(self):
         self._redraw_timer = None
         self.redraw()
+
+    def _on_wheel(self, event):
+        if self.layout is None or not self.layout.scrolls or event.widget is self.scrollbar:
+            return                  # the scrollbar scrolls itself
+        if event.num == 4:
+            units = -1
+        elif event.num == 5:
+            units = 1
+        else:
+            units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+        self.canvas.yview_scroll(units, "units")
 
     def refresh_texts(self) -> None:
         self.redraw()
@@ -788,13 +886,14 @@ class FloorBoard(HxWindow):
         """Ages, the clock and the banner's countdown, by itemconfigure only."""
         elapsed = self.elapsed()
         if self.clock_item is not None:
-            self.canvas.itemconfigure(self.clock_item, text=_clock_text())
+            self.header.itemconfigure(self.clock_item, text=_clock_text())
         if self.banner_item is not None:
-            self.canvas.itemconfigure(self.banner_item, text=self._banner_text(elapsed))
+            self.header.itemconfigure(self.banner_item, text=self._fitted("banner", self._banner_text(elapsed)))
         for r in self.rows:
             item = self.age_items.get(r.machine_id)
             if item is not None:
-                self.canvas.itemconfigure(item, text=text(hx_state.checked_text(_age(r.checked_age_s, elapsed))))
+                self.canvas.itemconfigure(item, text=self._fitted(
+                    "age", text(hx_state.checked_text(_age(r.checked_age_s, elapsed)))))
 
     def flash(self) -> None:
         """The colour bar of a machine with an unacknowledged sound alert alternates with the card colour."""
@@ -837,18 +936,44 @@ class FloorBoard(HxWindow):
             self._fonts[key] = tkinter.font.Font(root=self, family=family, size=-px, weight=weight)
         return self._fonts[key]
 
+    def _size_for(self, texts, family, weight, start, smallest, room):
+        return fit_px(texts, lambda px, t: self._font(family, px, weight).measure(t), start, smallest, room)
+
+    def _fitted(self, what, value):
+        """value shortened with "…" to fit where tick() puts it (never an origin)."""
+        if what not in self._fit:
+            return value
+        font, room = self._fit[what]
+        return ellipsize(value, font.measure, room)
+
+    def _machine_code(self, machine_id):
+        data = getattr(self.services.data, "current", None)
+        machine = data.machines.get(machine_id) if data is not None else None
+        return machine.code if machine is not None else ""
+
     def redraw(self) -> None:
-        """Draw the whole board again for the canvas's size."""
+        """Draw the whole board again for the window's size."""
         check_tk_thread()
         c = self.canvas
         c.delete("all")
         self.message_item = None
-        self.origin_items, self.unknown_items, self.status_items = {}, {}, {}
-        self.age_items, self.bar_items = {}, {}
-        width, height = self._canvas_size()
-        self.layout = lay = floor_layout(width, height, len(self.rows))
+        self.line_items, self.name_items, self.origin_items, self.unknown_items = {}, {}, {}, {}
+        self.status_items, self.age_items, self.bar_items = {}, {}, {}
+        width, height = self._board_size()
+        rows = self.rows
+        lines = sum(1 for i, r in enumerate(rows) if i == 0 or rows[i - 1].line_id != r.line_id)
+        self.layout = lay = floor_layout(width, height, len(rows), lines, self.scrollbar.winfo_reqwidth())
         self._draw_header(width, lay)
-        if not self.rows:
+        room = max(1, height - lay.header_h)
+        if lay.scrolls:
+            self.scrollbar.pack(side="right", fill="y", before=c)
+        else:
+            self.scrollbar.pack_forget()
+        c.configure(scrollregion=(0, 0, lay.width, lay.rows_h if lay.scrolls else room),
+                    yscrollincrement=max(1, round(lay.row_h / 2)))
+        if not lay.scrolls:
+            c.yview_moveto(0)
+        if not rows:
             # No board yet, the settings not loaded (their problems), or no machines to show
             warn = False
             if self.board is None:
@@ -857,30 +982,60 @@ class FloorBoard(HxWindow):
                 msgs, warn = no_lines_texts(self.services)
             else:
                 msgs = [Msg(N_("No lines are set up yet."))]
+            self.font_px = {}
             self.message_item = c.create_text(
-                width / 2, lay.header_h + (height - lay.header_h) / 2, text=text(_joined(msgs)),
-                font=(UI_FONT, -lay.status_px, "bold"), fill=COLOUR_HEX[AMBER] if warn else MUTED_FG,
-                justify="center", width=max(1, width - 32))
+                width / 2, room / 2, text=text(_joined(msgs)), font=(UI_FONT, -lay.status_px, "bold"),
+                fill=COLOUR_HEX[AMBER] if warn else MUTED_FG, justify="center", width=max(1, width - 32))
             return
-        family = bag_font_family(self)
-        elapsed = self.elapsed()
-        for i, r in enumerate(self.rows):
-            self._draw_row(i, r, lay, width, family, elapsed)
+        texts = self._row_texts()
+        self.font_px = px = self._sizes(texts, lay)
+        y = 0.0
+        for i, r in enumerate(rows):
+            if i == 0 or rows[i - 1].line_id != r.line_id:
+                self._draw_line(r, y, lay, first=i == 0)
+                y += lay.group_h
+            self._draw_row(r, texts[r.machine_id], y, lay, px, same_line=i > 0 and rows[i - 1].line_id == r.line_id)
+            y += lay.row_h
         self._sync_flash()
 
+    def _row_texts(self):
+        """Each row's (name, origin, status, age) as drawn before fitting."""
+        elapsed = self.elapsed()
+        return {r.machine_id: (short_name(r.machine_name, r.line_name, self._machine_code(r.machine_id)),
+                               r.origin_line, text(r.status),
+                               text(hx_state.checked_text(_age(r.checked_age_s, elapsed))))
+                for r in self.rows}
+
+    def _sizes(self, texts, lay):
+        """One size per column for every row: the largest at which its widest text fits. Names,
+        statuses and ages shrink only so far (then they get an ellipsis); origins as far as
+        they need, so an origin is never cut short."""
+        family = bag_font_family(self)
+        pad = 2 * _FLOOR_PAD
+        names = [t[0] for t in texts.values()]
+        origins = [t[1] for t in texts.values()]
+        statuses = [t[2] for t in texts.values()]
+        # Ages change every second: sized for "Not checked yet" and three-digit seconds too (an
+        # age that outgrows its column before the next redraw gets an ellipsis from tick())
+        ages = [t[3] for t in texts.values()] + [text(hx_state.checked_text(s)) for s in (None, 119)]
+        px = {
+            "name": self._size_for(names, UI_FONT, "bold", lay.machine_px, _FLOOR_SMALLEST["name"],
+                                   lay.names_w - pad),
+            "origin": self._size_for(origins, family, "bold", lay.origin_px, 1, lay.origin_w - pad),
+            "status": self._size_for(statuses, UI_FONT, "bold", lay.status_px, _FLOOR_SMALLEST["status"],
+                                     lay.status_w - pad),
+            "age": self._size_for(ages, UI_FONT, "normal", lay.age_px, _FLOOR_SMALLEST["age"], lay.age_w - pad),
+        }
+        # "(origin unknown)" isn't an origin: no larger than the statuses or the origins
+        px["unknown"] = min(px["status"], px["origin"]) if any(origins) else px["status"]
+        self._fit["age"] = (self._font(UI_FONT, px["age"]), max(1, lay.age_w - pad))
+        return px
+
     def _draw_header(self, width, lay):
-        c = self.canvas
+        h = self.header
+        h.delete("all")
+        h.configure(height=lay.header_h)
         mid = lay.header_h / 2
-        self.title_item = c.create_text(16, mid, anchor="w", text=tr("MapleJet floor board"),
-                                        font=(UI_FONT, -lay.header_px, "bold"), fill=TEXT_FG)
-        x = (c.bbox(self.title_item) or (0, 0, 16, 0))[2] + 24
-        self.clock_item = c.create_text(x, mid, anchor="w", text=_clock_text(),
-                                        font=(UI_FONT, -lay.header_px), fill=MUTED_FG)
-        x = (c.bbox(self.clock_item) or (0, 0, x, 0))[2] + 24
-        self.banner_item = c.create_text(x, mid, anchor="w", text=self._banner_text(self.elapsed()),
-                                         font=(UI_FONT, -max(8, round(lay.header_px * 0.6))),
-                                         fill=COLOUR_HEX[AMBER])
-        c.create_line(0, lay.header_h, width, lay.header_h, fill=RULE_FG, width=1)
         # Buttons at the right, as canvas windows: Refresh now only in standalone mode,
         # Acknowledge only for someone who may and while something rings here
         shown = [self.close_button]
@@ -890,62 +1045,83 @@ class FloorBoard(HxWindow):
             shown.append(self.refresh_button)
         x = width - 16
         for button in shown:
-            c.create_window(x, mid, anchor="e", window=button)
+            h.create_window(x, mid, anchor="e", window=button)
             x -= button.winfo_reqwidth() + 8
+        buttons_left = x + 8
+        self.title_item = h.create_text(16, mid, anchor="w", text=tr("MapleJet floor board"),
+                                        font=(UI_FONT, -lay.header_px, "bold"), fill=TEXT_FG)
+        x = (h.bbox(self.title_item) or (0, 0, 16, 0))[2] + 24
+        self.clock_item = h.create_text(x, mid, anchor="w", text=_clock_text(),
+                                        font=(UI_FONT, -lay.header_px), fill=MUTED_FG)
+        x = (h.bbox(self.clock_item) or (0, 0, x, 0))[2] + 24
+        # The banner stops short of the buttons
+        banner_px = max(8, round(lay.header_px * 0.6))
+        self._fit["banner"] = (self._font(UI_FONT, banner_px), max(1, buttons_left - 16 - x))
+        self.banner_item = h.create_text(x, mid, anchor="w",
+                                         text=self._fitted("banner", self._banner_text(self.elapsed())),
+                                         font=(UI_FONT, -banner_px), fill=COLOUR_HEX[AMBER])
+        h.create_line(0, lay.header_h - 1, width, lay.header_h - 1, fill=RULE_FG, width=1)
 
-    def _draw_row(self, i, r, lay, width, family, elapsed):
+    def _draw_line(self, r, y, lay, *, first):
+        """A line's header band: its name, over its machines' rows."""
         c = self.canvas
-        y0 = round(lay.header_h + i * lay.row_h)
-        y1 = round(lay.header_h + (i + 1) * lay.row_h)
+        y0, y1 = round(y), round(y + lay.group_h)
+        line_view = self.line_views.get(r.line_id)
+        # Greyed out when nobody checks any of its machines, as on the line cards
+        dim = line_view is not None and not any(m.monitored for m in line_view.machines)
+        c.create_rectangle(0, y0, lay.width, y1, fill=PAGE_BG, outline="")
+        if not first:
+            c.create_line(0, y0, lay.width, y0, fill=RULE_FG, width=2)
+        font = (UI_FONT, -lay.line_px, "bold")
+        name = ellipsize(r.line_name, self._font(UI_FONT, lay.line_px, "bold").measure, lay.width - 16 - _FLOOR_PAD)
+        self.line_items[r.line_id] = c.create_text(16, (y0 + y1) / 2, anchor="w", text=name, font=font,
+                                                   fill=DIM_FG if dim else TEXT_FG)
+
+    def _draw_row(self, r, texts, y, lay, px, *, same_line):
+        c = self.canvas
+        name, origin, status, age = texts
+        y0, y1 = round(y), round(y + lay.row_h)
         cy = (y0 + y1) / 2
         view = self.views.get(r.machine_id)
         dim = view is not None and view.code == "not_monitored"
         colour = COLOUR_HEX.get(r.colour, COLOUR_HEX[GREY])
+        x_name = lay.bar_w
+        x_origin = x_name + lay.names_w
+        x_status = x_origin + lay.origin_w
+        pad = 2 * _FLOOR_PAD
         # 1. Colour bar (it keeps its colour on a NOT MONITORED row)
         self.bar_items[r.machine_id] = c.create_rectangle(0, y0, lay.bar_w, y1, fill=colour, outline="")
-        # 2. Names
-        x = lay.bar_w + 8
-        line_h, machine_h = lay.line_px * 1.25, lay.machine_px * 1.25
-        top = cy - (line_h + machine_h) / 2
-        c.create_text(x, top, anchor="nw", text=r.line_name, width=max(1, lay.names_w - 16),
-                      font=(UI_FONT, -lay.line_px), fill=DIM_FG if dim else MUTED_FG)
-        c.create_text(x, top + line_h, anchor="nw", text=r.machine_name, width=max(1, lay.names_w - 16),
-                      font=(UI_FONT, -lay.machine_px, "bold"), fill=DIM_FG if dim else TEXT_FG)
-        # 3. Origin: bag text, as large as fits; never cut short
-        x = lay.bar_w + lay.names_w + 8
-        room = max(1, lay.origin_w - 16)
-        if r.origin_line:
-            px, wrap = self._origin_px(r.origin_line, family, lay.origin_px, room)
+        # 2. Name: the machine's name without its line's, on one line
+        font = self._font(UI_FONT, px["name"], "bold")
+        self.name_items[r.machine_id] = c.create_text(
+            x_name + _FLOOR_PAD, cy, anchor="w", text=ellipsize(name, font.measure, lay.names_w - pad),
+            font=(UI_FONT, -px["name"], "bold"), fill=DIM_FG if dim else TEXT_FG)
+        # 3. Origin: bag text at the board's one origin size; never cut short or wrapped
+        family = bag_font_family(self)
+        if origin:
             self.origin_items[r.machine_id] = c.create_text(
-                x, cy, anchor="w", text=r.origin_line, width=room if wrap else 0,
-                font=(family, -px, "bold"), fill=DIM_FG if dim else TEXT_FG)
+                x_origin + _FLOOR_PAD, cy, anchor="w", text=origin, font=(family, -px["origin"], "bold"),
+                fill=DIM_FG if dim else TEXT_FG)
         else:
-            self.origin_items[r.machine_id] = c.create_text(x, cy, anchor="w", text="", font=(family, -lay.origin_px))
+            self.origin_items[r.machine_id] = c.create_text(x_origin + _FLOOR_PAD, cy, anchor="w", text="",
+                                                            font=(family, -px["origin"], "bold"))
+            unknown = self._font(UI_FONT, px["unknown"])
             self.unknown_items[r.machine_id] = c.create_text(
-                x, cy, anchor="w", text=tr("(origin unknown)"), font=(UI_FONT, -lay.status_px),
+                x_origin + _FLOOR_PAD, cy, anchor="w", font=(UI_FONT, -px["unknown"]),
+                text=ellipsize(tr("(origin unknown)"), unknown.measure, lay.origin_w - pad),
                 fill=DIM_FG if dim else MUTED_FG)
         # 4. Status
-        x = lay.bar_w + lay.names_w + lay.origin_w + 8
+        font = self._font(UI_FONT, px["status"], "bold")
         self.status_items[r.machine_id] = c.create_text(
-            x, cy, anchor="w", text=text(r.status), width=max(1, lay.status_w - 16),
-            font=(UI_FONT, -lay.status_px, "bold"), fill=DIM_FG if dim else colour)
-        # 5. Age
+            x_status + _FLOOR_PAD, cy, anchor="w", text=ellipsize(status, font.measure, lay.status_w - pad),
+            font=(UI_FONT, -px["status"], "bold"), fill=DIM_FG if dim else colour)
+        # 5. Age, against the right edge
         self.age_items[r.machine_id] = c.create_text(
-            width - 8, cy, anchor="e", text=text(hx_state.checked_text(_age(r.checked_age_s, elapsed))),
-            font=(UI_FONT, -lay.age_px), fill=DIM_FG if dim else MUTED_FG)
-        # 6. Dividers: 2 px where the line changes, 1 px between rows of one line
-        if i > 0:
-            same = self.rows[i - 1].line_id == r.line_id
-            c.create_line(0, y0, width, y0, fill=_SEPARATOR if same else RULE_FG, width=1 if same else 2)
-
-    def _origin_px(self, origin, family, start, room):
-        """(pixel size, wraps): from the row's origin size down 1 px at a time until it fits,
-        but not below 40 % of it; still too long, it wraps at that size."""
-        smallest = max(8, round(start * 0.4))
-        for px in range(start, smallest - 1, -1):
-            if self._font(family, px, "bold").measure(origin) <= room:
-                return px, False
-        return smallest, True
+            lay.width - _FLOOR_PAD, cy, anchor="e", text=self._fitted("age", age),
+            font=(UI_FONT, -px["age"]), fill=DIM_FG if dim else MUTED_FG)
+        # 6. A thin divider between rows of one line (the line's band divides lines)
+        if same_line:
+            c.create_line(0, y0, lay.width, y0, fill=_SEPARATOR, width=1)
 
     def _sync_flash(self):
         # A redraw in the "off" half of a flash keeps flashing bars off until the next beat

@@ -24,13 +24,13 @@ import hx_send
 import hx_state
 import hx_ui_common
 from hx_core import CancelToken, Msg
-from hx_model import (AMBER, RED, STEP_CHECK_MACHINE, STEP_CONFIRM_2, STEP_LOCK, STEPS, ActionEvent, ActionFinished,
-                      BoardUpdate, DataUpdate, HxError, LineChoice, MachineResult, MessageDesign, NotAllowed,
-                      PlanError, SendEvent, SendFinished, SendRequest, SendResult, ShareError, ShareHealth,
-                      new_id, same_user)
-from hx_ui_common import (COLOUR_HEX, HIGHLIGHT_BG, RED_BG, RED_FG, UI_FONT, BagText, HxWindow, PhotoWindow,
+from hx_model import (AMBER, BLUE, RED, STEP_CHECK_MACHINE, STEP_CONFIRM_2, STEP_LOCK, STEPS, ActionEvent,
+                      ActionFinished, BoardUpdate, DataUpdate, HxError, LineChoice, MachineResult, MessageDesign,
+                      NotAllowed, PlanError, SendEvent, SendFinished, SendRequest, SendResult, ShareError,
+                      ShareHealth, new_id, same_user)
+from hx_ui_common import (COLOUR_HEX, DIM_FG, HIGHLIGHT_BG, RED_BG, RED_FG, UI_FONT, BagText, HxWindow,
                           PictureView, RecordBox, Scroller, WorkFailed, check_tk_thread, mark_done,
-                          mark_running, photo_from_png, roles, start_thread, text, when)
+                          mark_running, photo_from_png, roles, show_photo, start_thread, text, when)
 from i18n import N_, add_spanish
 
 ES = {
@@ -66,6 +66,8 @@ ES = {
     "I know this line will print two origins": "Sé que esta línea imprimirá dos orígenes",
     "(origin unknown) →": "(origen desconocido) →",
     "Prints:": "Imprime:",
+    "Delay {ms} ms": "Retardo de {ms} ms",
+    "Print position {mm} mm": "Posición de impresión de {mm} mm",
     "Still needed:": "Falta:",
     "Send to {n} machines": "Enviar a {n} máquinas",
     "Send to 1 machine": "Enviar a 1 máquina",
@@ -126,6 +128,8 @@ ES = {
         "Stripes no sabe qué fue lo último confirmado que imprimía esta máquina.",
     "{machines} went live. Confirm them in the result window.":
         "{machines} quedaron activas. Confírmelas en la ventana de resultados.",
+    "{machine} went live. Confirm it in the result window.":
+        "{machine} quedó activa. Confírmela en la ventana de resultados.",
     "Only {user} can choose Try again or Leave it.": "Solo {user} puede elegir Intentar de nuevo o Dejarlo así.",
     "Choose Try again or Leave it.": "Elija Intentar de nuevo o Dejarlo así.",
     "Leave {machines} red? The line stays red until a Send succeeds, the line's notify user is alerted, and this "
@@ -166,7 +170,10 @@ MARKS = {"running": ("…", "Muted.TLabel"), "ok": ("✓", "Ok.TLabel"), "warnin
          "failed": ("✗", "Bad.TLabel"), "skipped": ("–", "Muted.TLabel")}
 COUNTDOWN_MS = 200
 DEBOUNCE_MS = 300
-THUMB_PX = 96
+THUMB_BOX = (100, 150)      # film photo thumbnails fit this box (width, height), keeping their shape
+THUMB_GAP = 4               # between a film's front and back photo
+FILM_CARD_GAP = 6           # between film cards
+FILM_CARD_BORDER = 2        # the chosen film's card has a blue border, the others a grey one
 LOCAL_BG, LOCAL_FG = "#fef3c7", "#92400e"
 BLOCKED_BG, BLOCKED_FG = "#fee2e2", "#991b1b"
 _WRAP = 900
@@ -185,6 +192,20 @@ def origin_preview(film, countries: list[str]) -> str:
     if countries:
         return hx_message.origin_phrase(countries)
     return ""
+
+
+def placement_text(position) -> Msg:
+    """Where the print goes, in a sender's words: "Delay 480 ms" on a delay machine (the machine's
+    adjustment included), "Print position 150 mm" from the bag's bottom edge on an encoder machine.
+    The working behind it (PositionWorking.text) is for administrators."""
+    if position.placement == "delay":
+        return Msg(N_("Delay {ms} ms"), {"ms": f"{position.sent / 1000:g}"})
+    return Msg(N_("Print position {mm} mm"), {"mm": f"{position.film_value + position.adjustment:g}"})
+
+
+def sorted_films(films):
+    """Films as the admin list shows them: by code, then artwork revision."""
+    return sorted(films, key=lambda f: (hx_state.natural_key(f.code), hx_state.natural_key(f.artwork_revision), f.id))
 
 
 def _joined(names):
@@ -373,6 +394,7 @@ class LineBlock(ttk.LabelFrame):
         self.state_labels: dict[str, tk.Label] = {}
         self.film_var = tk.StringVar(value="")
         self.film_radios: dict[str, ttk.Radiobutton] = {}
+        self.film_cards: dict[str, tk.Frame] = {}
         self.thumbs: dict[tuple[str, str], ttk.Label] = {}
         self.lot_var = tk.StringVar(value="")
         self.countries: list[str] = []
@@ -380,12 +402,14 @@ class LineBlock(ttk.LabelFrame):
         self.change_texts: dict[str, BagText] = {}
         self.bag_texts: dict[str, BagText] = {}
         self.position_labels: dict[str, ttk.Label] = {}
+        self.working_labels: dict[str, ttk.Label] = {}     # administrators only
         self.warning_labels: dict[str, list[ttk.Label]] = {}
         self.unticked_warnings: dict[str, tk.Frame] = {}
         self.two_origins_var = tk.BooleanVar(value=False)
         self.trial = None
         self._free_vars: dict[str, tk.StringVar] = {}
         self._photos = {}           # (film id, kind) -> (PhotoImage, png)
+        self._film_cols = 0         # film cards to a row, as last laid out
         self._has_lot = False
         self._warned = frozenset()
         self._suspend = 0
@@ -394,6 +418,7 @@ class LineBlock(ttk.LabelFrame):
         self.columnconfigure(1, weight=1)
         self._build()
         self.lot_var.trace_add("write", lambda *a: self._debounce())
+        self.film_var.trace_add("write", lambda *a: self._mark_film())
 
     # building
 
@@ -439,27 +464,29 @@ class LineBlock(ttk.LabelFrame):
             self.product_box.grid_remove()
 
         # 3 Film
+        # The cards take the block's whole width, under the heading, so four fit in a 1000 px window
         self.film_label = self._row_label(2, N_("Film"))
         self.films_frame = ttk.Frame(self)
-        self.films_frame.grid(row=2, column=1, sticky="w", pady=3)
+        self.films_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=(20, 0), pady=(0, 3))
+        self.films_frame.bind("<Configure>", self._flow_films, add="+")
 
         # 4 Print text
-        self.print_text_label = self._row_label(3, N_("Print text"))
+        self.print_text_label = self._row_label(4, N_("Print text"))
         self.print_text_box = RecordBox(self, width=44)
-        self.print_text_box.grid(row=3, column=1, sticky="w", pady=3)
+        self.print_text_box.grid(row=4, column=1, sticky="w", pady=3)
         self.print_text_box.bind("<<ComboboxSelected>>", lambda e: self._print_text_chosen(), add="+")
 
         # 5 What the sender fills in
-        self.lot_label = self._row_label(4, N_("Lot"))
+        self.lot_label = self._row_label(5, N_("Lot"))
         self.lot_frame = ttk.Frame(self)
-        self.lot_frame.grid(row=4, column=1, sticky="w", pady=3)
+        self.lot_frame.grid(row=5, column=1, sticky="w", pady=3)
         self.lot_entry = ttk.Entry(self.lot_frame, width=12, textvariable=self.lot_var)
         self.lot_entry.pack(side="left")
         self.lot_hint = ttk.Label(self.lot_frame, style="Muted.TLabel")
         self.lot_hint.pack(side="left", padx=(8, 0))
 
         self.countries_frame = ttk.Frame(self)
-        self.countries_frame.grid(row=5, column=0, columnspan=2, sticky="w", pady=3)
+        self.countries_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=3)
         caption = ttk.Label(self.countries_frame)
         texts.set(caption, N_("Countries, in the order they print:"))
         caption.grid(row=0, column=0, columnspan=4, sticky="w")
@@ -481,7 +508,7 @@ class LineBlock(ttk.LabelFrame):
         self.add_country_button.grid(row=1, column=3, sticky="nw")
 
         self.preprinted_frame = ttk.Frame(self)
-        self.preprinted_frame.grid(row=6, column=0, columnspan=2, sticky="w", pady=3)
+        self.preprinted_frame.grid(row=7, column=0, columnspan=2, sticky="w", pady=3)
         caption = ttk.Label(self.preprinted_frame)
         texts.set(caption, N_("Origin is pre-printed on this film:"))
         caption.pack(side="left")
@@ -489,11 +516,11 @@ class LineBlock(ttk.LabelFrame):
         self.preprinted_text.pack(side="left", padx=(8, 0))
 
         self.free_frame = ttk.Frame(self)
-        self.free_frame.grid(row=7, column=0, columnspan=2, sticky="w", pady=3)
+        self.free_frame.grid(row=8, column=0, columnspan=2, sticky="w", pady=3)
 
         # 6 Origin and preview
         self.preview_frame = ttk.Frame(self)
-        self.preview_frame.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.preview_frame.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Separator(self.preview_frame).pack(fill="x", pady=(0, 6))
         caption = ttk.Label(self.preview_frame, style="Hx.Section.TLabel")
         texts.set(caption, N_("Origin on the bag:"))
@@ -503,13 +530,13 @@ class LineBlock(ttk.LabelFrame):
         self.machines_preview = ttk.Frame(self.preview_frame)
         self.machines_preview.pack(fill="x", padx=(20, 0))
         self.warnings_frame = ttk.Frame(self)
-        self.warnings_frame.grid(row=9, column=0, columnspan=2, sticky="ew")
+        self.warnings_frame.grid(row=10, column=0, columnspan=2, sticky="ew")
         self.two_origins_check = ttk.Checkbutton(self, variable=self.two_origins_var,
                                                  command=self.window.update_send_button)
         texts.set(self.two_origins_check, N_("I know this line will print two origins"))
-        self.two_origins_check.grid(row=10, column=0, columnspan=2, sticky="w")
+        self.two_origins_check.grid(row=11, column=0, columnspan=2, sticky="w")
         self.problems_label = _Lines(self, style="Warn.TLabel")
-        self.problems_label.grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.problems_label.grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         self._show_rows()
 
@@ -537,66 +564,110 @@ class LineBlock(ttk.LabelFrame):
         return data.print_texts.get(pt_id) if data is not None and pt_id else None
 
     def _build_films(self):
-        """One row per film of the chosen product: radio, side, front and back photos."""
+        """A card per film of the chosen product, by code then revision: the radio (code · revision),
+        the side, and the front and back photos in fixed boxes. The cards wrap to the width there is,
+        so up to four sit side by side in a 1000 px window (ui.md §5.3)."""
         texts = self.window.texts
         _clear(self.films_frame, texts)
         self.film_radios.clear()
+        self.film_cards.clear()
         self.thumbs.clear()
         self._photos.clear()
+        self._film_cols = 0
         data = self.services.data.current
         product_id = self.product_box.record_id()
         if not product_id:
             return
         loads = []
-        for row, film in enumerate(hx_message.films_for_line(self.line, product_id, data)):
+        box_w, box_h = THUMB_BOX
+        for film in sorted_films(hx_message.films_for_line(self.line, product_id, data)):
             name = f"{film.code} · {film.artwork_revision}" if film.artwork_revision else film.code
-            radio = ttk.Radiobutton(self.films_frame, text=name, value=film.id, variable=self.film_var,
+            card = tk.Frame(self.films_frame, highlightthickness=FILM_CARD_BORDER, padx=4, pady=4)
+            radio = ttk.Radiobutton(card, text=name, value=film.id, variable=self.film_var,     # data
                                     command=self._film_chosen)
-            radio.grid(row=row, column=0, sticky="w", pady=2)
-            self.film_radios[film.id] = radio
-            side = ttk.Label(self.films_frame, style="Muted.TLabel")
+            radio.grid(row=0, column=0, columnspan=2, sticky="w")
+            side = ttk.Label(card, style="Muted.TLabel", wraplength=2 * box_w + THUMB_GAP, justify="left")
             texts.set(side, _SIDE_TEXTS.get(film.side, _SIDE_TEXTS["back"]))
-            side.grid(row=row, column=1, sticky="w", padx=(12, 12))
-            for col, kind in ((2, "front_photo"), (3, "back_photo")):
-                thumb = ttk.Label(self.films_frame, cursor="hand2")
-                thumb.grid(row=row, column=col, sticky="w", padx=4, pady=2)
+            side.grid(row=1, column=0, columnspan=2, sticky="w")
+            # Clicking the card picks the film too; clicking a photo opens it larger
+            for widget in (card, side):
+                widget.bind("<Button-1>", lambda e, r=radio: r.invoke(), add="+")
+            for col, kind in enumerate(("front_photo", "back_photo")):
+                holder = ttk.Frame(card, width=box_w, height=box_h)     # the same box with or without a photo
+                holder.grid(row=2, column=col, sticky="n", padx=(THUMB_GAP if col else 0, 0), pady=(4, 0))
+                holder.pack_propagate(False)
+                thumb = ttk.Label(holder, anchor="center", justify="center", wraplength=box_w)
+                thumb.pack(fill="both", expand=True)
                 self.thumbs[(film.id, kind)] = thumb
                 refs = [f for f in film.files if f.kind == kind]
                 if refs:
-                    loads.append((film, kind, refs[-1].sha256))
+                    loads.append((film, kind, refs[-1]))
                 else:
                     thumb.configure(style="Muted.TLabel")
                     texts.set(thumb, N_("No photo"))
+            self.film_radios[film.id] = radio
+            self.film_cards[film.id] = card
+        self._mark_film()
+        self._flow_films()
         if loads:
             # Photos come from the PC's cache or the share: a worker each, never from a constructor
             self.window.later(0, lambda: [self._load_thumb(*load) for load in loads])
 
-    def _load_thumb(self, film, kind, sha256):
+    def _flow_films(self, event=None):
+        """As many film cards to a row as fit the width there is."""
+        cards = list(self.film_cards.values())
+        if not cards or not _alive(self.films_frame):
+            return
+        if event is None:
+            self.films_frame.update_idletasks()     # the new cards' sizes
+        width = event.width if event is not None else self.films_frame.winfo_width()
+        if width <= 1:          # not laid out yet: one row until the first <Configure>
+            cols = len(cards)
+        else:
+            card_w = max(card.winfo_reqwidth() for card in cards)
+            cols = max(1, min(len(cards), width // (card_w + FILM_CARD_GAP)))
+        if cols == self._film_cols:
+            return
+        self._film_cols = cols
+        for n, card in enumerate(cards):
+            row, col = divmod(n, cols)
+            # The same gap after every card, so every card is as wide as the others
+            card.grid(row=row, column=col, sticky="nsew", padx=(0, FILM_CARD_GAP), pady=(0, FILM_CARD_GAP))
+            self.films_frame.columnconfigure(col, uniform="film")
+
+    def _mark_film(self):
+        """The chosen film's card has a blue border."""
+        chosen = self.film_var.get()
+        for film_id, card in self.film_cards.items():
+            colour = COLOUR_HEX[BLUE] if film_id == chosen else DIM_FG
+            card.configure(highlightbackground=colour, highlightcolor=colour)
+
+    def _load_thumb(self, film, kind, ref):
         services = self.services
         key = (film.id, kind)
+        thumb = self.thumbs.get(key)
 
         def done(png, error):
-            thumb = self.thumbs.get(key)
-            if thumb is None or not _alive(thumb):
+            if self.thumbs.get(key) is not thumb or not _alive(thumb):     # the cards were built again
                 return
             photo = None
             if png and error is None:
                 try:
-                    photo = photo_from_png(thumb, png, height=THUMB_PX)
+                    photo = photo_from_png(thumb, png, box=THUMB_BOX)
                 except Exception:
                     photo = None
             if photo is None:
-                thumb.configure(style="Muted.TLabel", image="")
+                thumb.configure(style="Muted.TLabel", image="", cursor="")
                 self.window.texts.set(thumb, N_("No photo"))
                 return
             self.window.texts.forget(thumb)
             self._photos[key] = (photo, png)
-            thumb.configure(image=photo, text="")
+            thumb.configure(image=photo, text="", cursor="hand2")
             caption = f"{film.code} · {film.artwork_revision}: " if film.artwork_revision else f"{film.code}: "
-            thumb.bind("<Button-1>", lambda e: PhotoWindow(self.window.master, services, png=png,
-                                                           caption=caption + text(Msg(_KIND_TEXTS[kind]))))
+            thumb.bind("<Button-1>", lambda e: show_photo(self.window.master, services, png=png, original=ref,
+                                                          caption=caption + text(Msg(_KIND_TEXTS[kind]))))
 
-        services.bg.run(lambda: services.data.preview_bytes(film.id, sha256), done)
+        services.bg.run(lambda: services.data.preview_bytes(film.id, ref.sha256), done)
 
     def _build_fill_in(self):
         """Lot, countries or the pre-printed origin, and free texts, for the chosen print text."""
@@ -845,6 +916,7 @@ class LineBlock(ttk.LabelFrame):
         self.change_texts.clear()
         self.bag_texts.clear()
         self.position_labels.clear()
+        self.working_labels.clear()
         self.warning_labels.clear()
         self.unticked_warnings.clear()
         self._build()
@@ -879,6 +951,7 @@ class LineBlock(ttk.LabelFrame):
         self.change_texts.clear()
         self.bag_texts.clear()
         self.position_labels.clear()
+        self.working_labels.clear()
         self.warning_labels.clear()
         self.trial = None
         problems = self.problems()
@@ -903,6 +976,7 @@ class LineBlock(ttk.LabelFrame):
     def _show_trial(self):
         texts = self.window.texts
         frame = self.machines_preview
+        admin = roles(self.services).admin
         for row_plan in self.trial.machines:
             mid = row_plan.machine.id
             view = self.window.view(mid)
@@ -939,9 +1013,17 @@ class LineBlock(ttk.LabelFrame):
             bag.set(row_plan.bag_text)
             bag.pack(side="left", padx=(4, 0))
             self.bag_texts[mid] = bag
-            position = ttk.Label(row, text=row_plan.position.text, style="Muted.TLabel")   # English working: data
-            position.grid(row=2, column=1, sticky="w")
+            # Where it prints, in plain words; administrators also see how it was worked out
+            placed = ttk.Frame(row)
+            placed.grid(row=2, column=1, sticky="w")
+            position = ttk.Label(placed, style="Hx.Small.TLabel")
+            texts.msg(position, placement_text(row_plan.position))
+            position.pack(side="left")
             self.position_labels[mid] = position
+            if admin:
+                working = ttk.Label(placed, text=row_plan.position.text, style="Hx.Small.TLabel")  # English: data
+                working.pack(side="left", padx=(12, 0))
+                self.working_labels[mid] = working
             warnings = []
             for n, warning in enumerate(row_plan.warnings):
                 label = ttk.Label(row, style="Warn.TLabel", wraplength=620, justify="left")
@@ -2122,11 +2204,15 @@ class FailureWindow(HxWindow):
         sent.pack(anchor="w", pady=(4, 12), **pad)
         for row in self.rows:
             self._show_row(inner, row)
-        passed = [m.machine_id for m in result.machines if m.ok]
+        passed = _machine_names(services, [m.machine_id for m in result.machines if m.ok])
         if passed:
             self.passed_label = _red_label(inner, 14)
-            texts.set(self.passed_label, N_("{machines} went live. Confirm them in the result window."),
-                      machines=_joined(_machine_names(services, passed)))
+            if len(passed) == 1:
+                texts.set(self.passed_label, N_("{machine} went live. Confirm it in the result window."),
+                          machine=passed[0])
+            else:
+                texts.set(self.passed_label, N_("{machines} went live. Confirm them in the result window."),
+                          machines=_joined(passed))
             self.passed_label.pack(anchor="w", pady=(4, 4), **pad)
         self.message_label = _red_label(inner, 14, True)
         self.message_label.pack(anchor="w", pady=(8, 0), **pad)

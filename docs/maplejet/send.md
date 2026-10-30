@@ -75,6 +75,7 @@ COUNTRY_NAME_MAX = 30
 MAX_ITEMS = 99                                    # OBJIDs 10001..10099 (a technical limit only)
 FIRST_OBJID = 10001
 GAP_MAX = 50                                      # PrintTextItem.gap, canvas units (OPEN)
+SIDE_GAP_MIN = 8                                  # the least gap a right-placed item is sent with (§3.4, OPEN)
 OFFSET_MAX = {"days": 999, "months": 999, "years": 99}   # CTDAT DAY, MON, YEAR (manual)
 FILM_LENGTH_MAX_MM = 5000.0
 HEAD_DISTANCE_MAX_MM = 20000.0
@@ -112,6 +113,7 @@ def origin_change_text(old_origin_line: str, new_origin_line: str) -> str  # §2
 def validate_line(line: Line, data: HxData) -> list[Msg]                   # §4.1
 def validate_company(company: Company) -> list[Msg]                        # §4.1
 def origin_conflicts(data: HxData, company: Company) -> list[Msg]          # §4.1
+def sent_gap(placement: str, gap: int) -> int                              # §3.4 rule 4: the gap sent as MARG
 def render_date(frmt: str, day: date, *, add_days: int = 0, add_months: int = 0,
                 add_years: int = 0) -> str                                  # §3.2
 def design_parts(plan: MachinePlan) -> tuple[list[tuple[str, list[tuple[str, str]]]], list[tuple[str, str]]]
@@ -413,7 +415,7 @@ for k, item in enumerate(present_items):
     if prev is None:                         # the first item: absolute
         POS "0,0", MARG "0,0"; no XRID, YRID, SXAS, SYAS; line_start = objid
     elif item.placement == "right":          # right of the previous item, same top
-        XRID prev, SXAS 0 (its X-max); YRID prev, SYAS 1 (its Y-min); MARG f"{gap},0"
+        XRID prev, SXAS 0 (its X-max); YRID prev, SYAS 1 (its Y-min); MARG f"{sent_gap},0"
     else:                                    # "below": a new line under the previous item,
         XRID line_start, SXAS 1 (X-min);     # lined up with the start of the previous line
         YRID prev, SYAS 0 (Y-max); MARG f"0,{gap}"; line_start = objid
@@ -425,6 +427,15 @@ for k, item in enumerate(present_items):
 2. The first item's `placement` and `gap` are ignored. `gap` is 0 to `GAP_MAX` canvas units (OPEN: the
    units and whether a margin from the canvas edge is needed; the test print shows it).
 3. Relative items don't send POS (protocol.md §12.2 doesn't compare it then).
+4. Side by side, never touching. A right-placed item's MARG x is measured from the previous item's
+   X-max, so with gap 0 the two texts would print as one word ("Product of USA and CanadaLot 4417").
+   `sent_gap(placement, gap)` is `max(gap, SIDE_GAP_MIN)` for an item placed right and `gap` for one
+   placed below, and MARG uses it. `SIDE_GAP_MIN` is 8 canvas units, the same as `TEST_SAMPLE_GAP`
+   between the test print's font samples and about one word space at Arial 4 (OPEN with the units).
+   The stored `gap` is never changed and stays valid from 0, so existing print texts keep sending; a gap
+   above the minimum is sent as it is. MARG is part of the content code (§7), so a print text saved
+   with a smaller gap sends under a new message name from this rule on; gaps 0 to 8 print alike and
+   give the same name.
 
 ### 3.5 The one-line bag text
 
@@ -433,10 +444,9 @@ for k, item in enumerate(present_items):
 1. Each present item's text: a CTEXT item's TXT; a CTDAT item's `before + render_date(...) + after`, for
    the local date of `SendRequest.created_at` (`time.localtime`). Test plans have no dates.
 2. Joined in order: the first item's text; then for each next item, `" / "` before it when it is
-   placed below, else `" "` when its gap is above 0, else nothing.
-3. Example (the storage.md print text, gap 4 on the lot): `Packed on 10/29/26 / Product of USA and
-   Canada Lot 4417`. With the `FakeWorld` print text (gap 0): `Packed on 10/29/26 / Product of USA and
-   CanadaLot 4417`.
+   placed below, else `" "` (it prints at least `SIDE_GAP_MIN` away, §3.4 rule 4, whatever its gap).
+3. Example (the storage.md print text, gap 4 on the lot, and the `FakeWorld` print text, gap 0, alike):
+   `Packed on 10/29/26 / Product of USA and Canada Lot 4417`.
 
 ### 3.6 validate_print_text(pt, company)
 
@@ -745,16 +755,18 @@ The `FakeWorld` delay machine, the seeded film and print text, countries USA the
 slot 9. The commands' `xml`, one per line (each is its own request):
 
 ```
-<CRTMSG>EXCO1-PKO01-MN6D-L9</CRTMSG>
+<CRTMSG>EXCO1-PKO01-FDNP-H9</CRTMSG>
 <CTDAT><OBJID>10001</OBJID><POS>0,0</POS><MARG>0,0</MARG><FONTIND>2</FONTIND><SIZE>4</SIZE><PREF>Packed on </PREF><FRMT>M/D/y</FRMT><DAY>0</DAY><MON>0</MON><YEAR>0</YEAR></CTDAT>
 <CTEXT><OBJID>10002</OBJID><XRID>10001</XRID><YRID>10001</YRID><SXAS>1</SXAS><SYAS>0</SYAS><MARG>0,0</MARG><FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Product of USA and Canada</TXT></CTEXT>
-<CTEXT><OBJID>10003</OBJID><XRID>10002</XRID><YRID>10002</YRID><SXAS>0</SXAS><SYAS>1</SYAS><MARG>0,0</MARG><FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Lot 4417</TXT></CTEXT>
+<CTEXT><OBJID>10003</OBJID><XRID>10002</XRID><YRID>10002</YRID><SXAS>0</SXAS><SYAS>1</SYAS><MARG>8,0</MARG><FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Lot 4417</TXT></CTEXT>
 <CPPARM><ENCST>0</ENCST><DELAY>480000</DELAY><PRNSPD>2400</PRNSPD><ROTAT>0</ROTAT><MIRR>0</MIRR><RESMOD>0</RESMOD><BOLD>1</BOLD><WDTH>1</WDTH><QUANT>1</QUANT><REVRS>0</REVRS><AUTREP>0</AUTREP></CPPARM>
 <SAVEMSG>9</SAVEMSG>
 ```
 
+The lot is placed right of the origin with gap 0, so its MARG is `8,0` (§3.4 rule 4).
+
 The same on the `FakeWorld` encoder machine (head distance 412 mm): the name is
-`EXCO1-PKO01-5E11-W9`, the items are identical, and the CPPARM starts
+`EXCO1-PKO01-G79S-N9`, the items are identical, and the CPPARM starts
 `<CPPARM><ENCST>1</ENCST><DLYMM>348</DLYMM><PRNSPD>2400</PRNSPD>` and continues as above.
 
 ### 6.5 Empty messages
@@ -798,7 +810,7 @@ FRMT and offsets and rendered by the printer.
 
 For the golden example the canonical design is 679 bytes, starting
 `{"v":1,"items":[["CTDAT",[["OBJID","10001"],["POS","0,0"],` and with sha256
-`a54cde6dbf91adca88911db3bf74c1bfa9f6ee5516f245e8bd71c13f50d3166b`.
+`7b6b6d64a5f307e0941bd6a0b848024de687a8b8dce2bbdaa3198c17bb3b42d0`.
 
 ### 7.2 The content code
 
@@ -849,13 +861,13 @@ format or the letter: a random change passes with a chance of 1 in 24.
 
 | Case | Content code | Slot 9 name | Slot 10 name |
 |---|---|---|---|
-| Golden example, delay | `MN6D` | `EXCO1-PKO01-MN6D-L9` | `EXCO1-PKO01-MN6D-U0` |
-| Golden example, encoder (DLYMM 348) | `5E11` | `EXCO1-PKO01-5E11-W9` | `EXCO1-PKO01-5E11-D0` |
-| Delay, lot 4418 instead of 4417 | `RVFJ` | | |
+| Golden example, delay | `FDNP` | `EXCO1-PKO01-FDNP-H9` | `EXCO1-PKO01-FDNP-D0` |
+| Golden example, encoder (DLYMM 348) | `G79S` | `EXCO1-PKO01-G79S-N9` | `EXCO1-PKO01-G79S-U0` |
+| Delay, lot 4418 instead of 4417 | `RSA0` | | |
 | Longest: film `ABCDEF`, code `XYZ`, revision 123, content `ZZZZ` | | | `ABCDEF-XYZ23-ZZZZ-V0` (20 characters) |
 
-`parse_message_name("EXCO1-PKO01-MN6D-L9")` is `MessageName("EXCO1", "PKO", 1, "MN6D", 9)`;
-`"EXCO1-PKO01-MN6D-M9"`, `"STRIPES TEST"`, `"1"` and `""` give None.
+`parse_message_name("EXCO1-PKO01-FDNP-H9")` is `MessageName("EXCO1", "PKO", 1, "FDNP", 9)`;
+`"EXCO1-PKO01-FDNP-M9"`, `"STRIPES TEST"`, `"1"` and `""` give None.
 
 ## 8. Read-back: compare, dates, fingerprint
 
@@ -1154,7 +1166,8 @@ The UI shows the problems and keeps the Send window open.
    (the plan's "Line 2 is being sent by jsmith"); `test` and `calibration` give "{machine} is running a
    test print by {user}."; `stop`, `resume` and `clock` give "{machine} is being changed by {user}.";
    anything else (a damaged lock) uses `LockHeld`'s own message. `{user}` is `info.user` and
-   `{machine}` the machine whose printer is locked.
+   `{machine}` the machine whose printer is locked. Stop, Resume and Set clocks (§13) use the same
+   texts; for a machine whose line record is missing `{line}` is the machine's name.
 3. For each machine still going: `store.read_expected(machine_id)`. `FormatTooNew`: that machine is red
    at `STEP_LOCK` with its message ("Update Stripes: ...") and its lock is released. `ShareUnavailable`:
    the note `no_lock`, and the machine's state before the Send is `store.cached_expected(machine_id)`
@@ -1280,8 +1293,9 @@ slot (the fake records any such write as a violation).
 2. `diffs = compare(built, d) + date_differences(built, d, to_local(d.read_at + reading.offset_s))`.
 3. Any difference raises `CheckFailed(msg, differences=diffs, step=STEP_VERIFY_IDLE)` with "The date
    {machine} would print differs from the date Stripes expects." when every difference is a date's TXT,
-   and otherwise "The message read back from {machine} differs from what was sent ({n} differences)."
-   The machine stops here, red, still printing its previous message.
+   and otherwise "The message read back from {machine} differs from what was sent ({n} differences).",
+   or "... differs from what was sent (1 difference)." when there is exactly one. The machine stops
+   here, red, still printing its previous message.
 4. Post `ok` with `design=d`.
 
 ### 10.9 Step switch
@@ -1450,8 +1464,11 @@ Blocking; worker thread.
    is skipped.
 7. If any machine wasn't updated because of step 5's lock or share cases, raise
    `ShareError(Msg(N_("Your answer was logged, but Stripes couldn't update the monitor for
-   {machines}."), {"machines": <names joined with ", ">}))` after doing everything else. The UI offers
-   to try again; a second confirm writes a second log entry, which is harmless.
+   {machines}."), {"machines": <names joined with ", ">}))` after doing everything else. A name comes
+   from the Send's log entry, else the current records; when one of the machines has neither (it no
+   longer exists), the text is "Your answer was logged, but Stripes couldn't update the monitor."
+   without names, because a text never shows an id (§19). The UI offers to try again; a second confirm
+   writes a second log entry, which is harmless.
 
 "Something's wrong" continues with the Stop question (§13.1).
 
@@ -1487,7 +1504,7 @@ isn't cancelled, in result order:
 
 | `FailureRow` field | From |
 |---|---|
-| `machine_id`, `machine_name`, `line_name` | the plan's records |
+| `machine_id`, `machine_name`, `line_name` | the plan's records; a machine missing from the plan (it can't be, but its failure must still show) is `tr("Unknown machine")` with `line_name` `""`, never its id. `failure_rows` runs on the Tk thread, so that is the screen's language |
 | `step`, `step_text` | `r.step`, `STEP_TEXTS[r.step]` |
 | `msg` | `r.msg` |
 | `after_switch`, `after_switch_text` | `r.after_switch`; when true, "This machine may be printing the new message, the old one, or nothing. Check the bags now." |
@@ -1746,8 +1763,9 @@ afterwards: a normal admin edit, and the film's status doesn't change.
 
 1. Not `identity.is_admin(company)`: `NotAllowed(Msg(N_("Only Stripes Administrators can run test
    prints.")))`.
-2. Problems (all collected, then `PlanError`): the machine exists and is active; its printer is set up;
-   `print_speed` is set; the film exists (any status) and passes `validate_film`.
+2. Problems (all collected, then `PlanError`): the machine exists ("The machine chosen for this test no
+   longer exists.") and is active; its printer is set up; `print_speed` is set; the film exists (any
+   status) and passes `validate_film`.
 3. Kind `"test"`, per machine mode: `ranges.vary` must be `"position"` on encoder machines and `"delay"`
    on delay machines. Encoder machines need `head_distance_mm` (calibrated) and the film's `length_mm`.
    `ranges.step > 0` and `ranges.start <= ranges.stop`; the values are `start + i × step` for `i = 0 ..
@@ -2052,7 +2070,8 @@ travel as BMP bytes inside `MessageDesign`.
 
 Each module defines `ES` with its own texts and calls `i18n.add_spanish(ES)` (architecture §10.6).
 `{machine}`, `{line}`, `{film}`, `{print_text}`, `{printer}`, `{name}`, `{other}` and `{machines}` are
-record names; `{user}` and `{sender}` are Windows user names; `{country}` and `{words}` are names from
+record names, never ids: a record that no longer exists has its own text ("A machine chosen for {line}
+no longer exists.") instead of its id; `{user}` and `{sender}` are Windows user names; `{country}` and `{words}` are names from
 Stripes' own lists; `{label}` is an administrator's question text. None is text a sender typed. A
 `{where}` value is one of the nested Msgs listed. ui.md uses these texts through the `Msg`s and doesn't
 redefine them.
@@ -2068,13 +2087,17 @@ redefine them.
 | A line in this Send no longer exists or isn't active. | Una línea de este envío ya no existe o no está activa. |
 | Tick at least one machine on {line}. | Marque al menos una máquina en {line}. |
 | {machine} isn't an active machine on {line}. | {machine} no es una máquina activa de {line}. |
+| A machine chosen for {line} no longer exists. | Una máquina elegida para {line} ya no existe. |
+| The machine chosen for this test no longer exists. | La máquina elegida para esta prueba ya no existe. |
 | {machine} is in this Send twice. | {machine} está dos veces en este envío. |
 | {machine} and {other} use the same printer. | {machine} y {other} usan la misma impresora. |
 | Choose a product for {line}. | Elija un producto para {line}. |
 | The product chosen for {line} isn't active. | El producto elegido para {line} no está activo. |
 | Choose a film for {line}. | Elija una película para {line}. |
+| The film chosen for {line} no longer exists. | La película elegida para {line} ya no existe. |
 | Film {film} can't be sent to {line}: it must be active, belong to the product and use the line's cartridge type. | La película {film} no se puede enviar a {line}: debe estar activa, ser del producto y usar el tipo de cartucho de la línea. |
 | Choose a print text for {line}. | Elija un texto de impresión para {line}. |
+| The print text chosen for {line} no longer exists. | El texto de impresión elegido para {line} ya no existe. |
 | Print text {print_text} can't be used with film {film}. | El texto de impresión {print_text} no se puede usar con la película {film}. |
 | Enter the lot for {line}. | Escriba el lote para {line}. |
 | The lot for {line} must be {min} to {max} digits. | El lote para {line} debe tener de {min} a {max} dígitos. |
@@ -2230,6 +2253,7 @@ redefine them.
 | {machine} is set for plastic cartridges; this film needs paper. | {machine} está configurada para cartuchos de plástico; esta película necesita papel. |
 | {machine}'s clock reads {printer_time} after it was set to {expected}. | El reloj de {machine} marca {printer_time} después de ajustarlo a {expected}. |
 | The message read back from {machine} differs from what was sent ({n} differences). | El mensaje leído de {machine} difiere de lo enviado ({n} diferencias). |
+| The message read back from {machine} differs from what was sent (1 difference). | El mensaje leído de {machine} difiere de lo enviado (1 diferencia). |
 | The date {machine} would print differs from the date Stripes expects. | La fecha que imprimiría {machine} difiere de la fecha que espera Stripes. |
 | {machine} is printing slot {got}, not slot {slot}. | {machine} está imprimiendo la ranura {got}, no la ranura {slot}. |
 | {machine} didn't turn printing on. | {machine} no activó la impresión. |
@@ -2238,6 +2262,8 @@ redefine them.
 | Stripes can't find this Send yet. Try again in a minute. | Stripes todavía no encuentra este envío. Inténtelo de nuevo en un minuto. |
 | Only {sender} can confirm this Send. | Solo {sender} puede confirmar este envío. |
 | Your answer was logged, but Stripes couldn't update the monitor for {machines}. | Su respuesta quedó registrada, pero Stripes no pudo actualizar el monitor de {machines}. |
+| Your answer was logged, but Stripes couldn't update the monitor. | Su respuesta quedó registrada, pero Stripes no pudo actualizar el monitor. |
+| Unknown machine | Máquina desconocida |
 | Stripes couldn't record the switch on the server, so it didn't switch. | Stripes no pudo registrar el cambio en el servidor, así que no cambió de mensaje. |
 | Only Stripes MapleJet Senders can stop, resume or set clocks. | Solo los miembros de Stripes MapleJet Senders pueden detener, reanudar o ajustar relojes. |
 | Stripes couldn't stop printing on {machine}. Stop it at the printer with its Print On/Off button now. | Stripes no pudo detener la impresión en {machine}. Deténgala ahora en la impresora con su botón Print On/Off. |
@@ -2267,10 +2293,11 @@ purpose. No test waits more than about 0.5 s of real time.
 | | characters | `bag_text_problems("A<B>", where)` is one Msg whose `codes` is `"U+003C, U+003E"`; `"ñ°é&"` passes; a tab and `"€"` are refused |
 | | change text | the §2.5 examples |
 | BuilderTests | date formats | `render_date` for every `DATE_FORMATS` key on 29 Oct 2026 gives the §3.2 column; 31 Jan 2027 plus 1 month is 28 Feb 2027, 31 Jan 2028 plus 1 month is 29 Feb 2028; 29 Feb 2028 plus 1 year is 28 Feb 2029; 10 Apr 2022 with years 1, months 3, days 5 and FRMT `Y/M/D` is `2023/07/15`; FRMT `j` raises `ValueError` |
-| | placement | items right, below, right, below give OBJID 10001 to 10005 and the XRID, YRID, SXAS, SYAS and MARG of §3.4 (the fourth item lines up with item 2, the fifth with item 4's line start); an optional empty free text is left out and the next item refers to the one before it |
+| | placement | items right, below, right, below give OBJID 10001 to 10005 and the XRID, YRID, SXAS, SYAS and MARG of §3.4 (the fourth item lines up with item 2, the fifth with item 4's line start); a right-placed gap under `SIDE_GAP_MIN` is sent as 8, a larger one as it is, a below gap as it is; an optional empty free text is left out and the next item refers to the one before it |
 | | print text rules | one failing case per rule of §3.6, each giving its message; the `FakeWorld` print text has no problems; code `TST` is refused |
-| | bag text | the two §3.5 examples |
+| | bag text | the §3.5 example for gaps 0, 4, 8 and 12 on the lot (one text; MARG `8,0` for the first three, which share a content code, and `12,0`); the lot placed below gives `" / "` |
 | ValidationTests | merge | `FakeWorld` data: every field of §4.4's table; each §4.3 problem in turn gives `PlanError` with that message among `problems`; not a sender raises `NotAllowed`; a pre-printed film gives `origin_line` `USA (pre-printed)` and empty countries; merging twice gives equal plans |
+| | names, not ids | missing machines, films, print texts, products and lines in a Send, and a missing machine or film in a test plan: every problem, in English and Spanish, names its record or says it no longer exists, and holds no id |
 | | offers | `films_for_line` leaves out inactive films, other products and the other cartridge type; `print_texts_for_film` keeps the film's order and the origin rule |
 | | conflicts | adding the alias `LOT` to a country makes `origin_conflicts` name the print text whose lot item has `Lot ` before it, and `merge_plan` then refuses it |
 | | restricted | a two-line, three-machine plan restricted to one machine of line 2: `machines` holds only that `MachinePlan`; the request has one line with that one machine id; both have the same new `send_id`, which differs from the old; `created_at`, `from_local_copy` and `data_as_of` are unchanged; `merge_plan(restricted.request, ...)` equals `restricted.machines` |
@@ -2341,9 +2368,9 @@ purpose. No test waits more than about 0.5 s of real time.
 | | wrong, then a failed Send | `confirm(..., False)`, then a Send with `override("HXUI", "1110")`: the row Failed before the switch has `rejected` False, `resume_blocked` True and the new `failure`; a poller then judges `failed_before_switch` with `send_failed` only (no `send_rejected`) |
 | | superseded | confirming an older Send after a newer one: no expected-state change; the log entry is still written |
 | | pending | `pending_confirmation` lists the live machines, and `[]` after the confirmation |
-| FailureTests | rows | `failure_rows` after a verify_idle failure holds the hooked difference; after an after-switch failure it has `after_switch_text` and the previous picture |
+| FailureTests | rows | `failure_rows` after a verify_idle failure holds the hooked difference and "(1 difference)", two hooked differences "(2 differences)", in English and Spanish; a machine missing from the plan is "Unknown machine" ("Máquina desconocida"); after an after-switch failure it has `after_switch_text` and the previous picture |
 | | try again | `plan.restricted([failed])` runs with a new `send_id`, only that machine, from the lock step |
-| | leave it | `leave_it`: `reread_token`, `left_by` and `left_at` set, still RED with its failure, a `send_leave` entry |
+| | leave it | `leave_it`: `reread_token`, `left_by` and `left_at` set, still RED with its failure, a `send_leave` entry; with a machine id the records don't have, the unnamed "couldn't update the monitor." text |
 | ActionTests | stop and resume | a confirmed Send, `stop(reason="user")`, then `resume`: PRINT 1, PRIN read twice, mode `running`, GREEN |
 | | resume refused | after `stop`, the test saves another message into the printing slot directly on the fake: `check_resume` and `resume` refuse with the mismatch message |
 | | stop fails | `override("PRINT", FakePrinter.DROP)`: red with the "Stop it at the printer" message, mode `stop_requested_at_printer` |
@@ -2379,7 +2406,7 @@ Failure injections ("each failure"):
 | Which counter counts bags | `Company.bag_counter` `PMCNT`; a step's count restarts at each switch, so an MSCNT reset doesn't matter; `none` makes steps timed | which counter, and whether it resets on a message change |
 | Print speed units and range | `Machine.print_speed` required, 1 to 2500, sent as PRNSPD and compared exactly | cm/min; whether 2400 is accepted and read back; whether it matters with the encoder |
 | Film print length (film-stop warning) | no warning without `Film.print_length_mm`, and "Print length unknown" shown | how it is measured; what happens when a print runs past the stop |
-| Item positions and gaps | first item at POS `0,0`, others relative, gaps in canvas units 0 to 50 | units, the need for an edge margin, how relative items read back |
+| Item positions and gaps | first item at POS `0,0`, others relative, gaps in canvas units 0 to 50; an item placed right is sent at least `SIDE_GAP_MIN` (8) away (§3.4 rule 4) | units, the need for an edge margin, how relative items read back; that 8 units print as a word space at the sizes in use |
 | `&`, `<`, `>` and `ñ` | `<` and `>` refused; `&` escaped when sent, compared raw | how they print and read back |
 | TD hour and rollover | HOUR 0 to 23, rollover DTRH 0, DTRM 0, always sent | the accepted values; that midnight is the rollover; what a TD without the rollover does |
 | TD seconds | rounded to the nearest minute; 90 s tolerance on the read-back | whether the printer zeroes its seconds |
@@ -2495,3 +2522,8 @@ Failure injections ("each failure"):
     Send never opens the red window.
 44. **`end_again`** lets the administrator who ran a test retry its end procedure without needing the
     sender group.
+45. **Items side by side never print touching**: the builder sends a right-placed item at least
+    `SIDE_GAP_MIN` from the previous one, instead of refusing small gaps, so every saved print text
+    stays sendable; the one-line bag text always puts a space between items on the same line.
+46. **Texts name records, never ids**: a record missing when a Send or test is checked has its own
+    text, and the red window falls back to "Unknown machine".

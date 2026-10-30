@@ -22,6 +22,8 @@ import unittest
 from dataclasses import dataclass
 from unittest import mock
 
+from PIL import Image, ImageDraw
+
 import hx_message
 import hx_send
 import hx_share
@@ -30,13 +32,13 @@ import hx_ui_send
 import i18n
 from hx_core import EventBus, Msg
 from hx_fake import FakeWorld
-from hx_model import (ALLOWED_WRITE_TAGS, AMBER, GREEN, GREY, STEP_CHECK_MACHINE, STEP_CONFIRM_2, STEP_LOCK,
-                      STEP_VERIFY_IDLE, STEP_WAIT_POLLER, TIMINGS, ActionEvent, ActionFinished, ActionResult,
+from hx_model import (ALLOWED_WRITE_TAGS, AMBER, BLUE, GREEN, GREY, RED, STEP_CHECK_MACHINE, STEP_CONFIRM_2,
+                      STEP_LOCK, STEP_VERIFY_IDLE, STEP_WAIT_POLLER, TIMINGS, ActionEvent, ActionFinished, ActionResult,
                       BoardUpdate, BoardView, Film, Line, LineChoice, LineView, MachineResult, MachineView, PollStatus,
-                      PrintText, PrintTextItem, ResumeCheck, SendEvent, SendFinished, SendRequest, ShareHealth,
-                      new_id)
+                      PositionWorking, PrintText, PrintTextItem, ResumeCheck, SendEvent, SendFinished, SendRequest,
+                      SendResult, ShareHealth, new_id)
 from hx_protocol import ClientPool, GateRegistry, release_key
-from hx_ui_common import HIGHLIGHT_BG, BagText, SyncBackground, WorkFailed
+from hx_ui_common import COLOUR_HEX, DIM_FG, HIGHLIGHT_BG, BagText, PhotoWindow, SyncBackground, WorkFailed
 from hx_ui_send import FailureWindow, ResultWindow, ResumeDialog, SendWindow, SetClocksDialog, StopDialog
 
 # ui.md §17.1's scaled timings, with printer and share timeouts that leave room for a busy machine. The
@@ -229,6 +231,21 @@ def alive(widget):
         return False
 
 
+@dataclass
+class SimpleFilm:
+    id: str
+    code: str
+    artwork_revision: str
+
+
+def tall_photo(path, size, colour):
+    """A made-up bag photo drawn with Pillow: a coloured bag with a white label."""
+    img = Image.new("RGB", size, colour)
+    ImageDraw.Draw(img).rectangle((size[0] // 8, size[1] // 10, size[0] * 7 // 8, size[1] // 4), fill="white")
+    img.save(path, "JPEG", quality=90)
+    return path
+
+
 class UiCase(unittest.TestCase):
     """ui.md §17.1: a FakeWorld, services on its share, strict threads, and tell/ask patched on
     hx_ui_common."""
@@ -388,6 +405,32 @@ class PureTests(unittest.TestCase):
         self.assertEqual(plan.machines[0].origin_line, "USA (pre-printed)")
         self.assertEqual(hx_ui_send.origin_preview(pre, []), plan.machines[0].origin_line)
         self.assertEqual(hx_ui_send.origin_preview(pre, ["Canada"]), "USA (pre-printed)")
+
+    def test_films_by_code_then_revision(self):
+        # As the admin list shows them (films_for_line orders by revision first)
+        films = [SimpleFilm("fm_1", "EXCO2", "Rev B"), SimpleFilm("fm_2", "EXCO10", "Rev A"),
+                 SimpleFilm("fm_3", "EXCO1", "Rev D"), SimpleFilm("fm_4", "EXCO1", "Rev C"),
+                 SimpleFilm("fm_5", "EXCO3", "")]
+        self.assertEqual([(f.code, f.artwork_revision) for f in hx_ui_send.sorted_films(films)],
+                         [("EXCO1", "Rev C"), ("EXCO1", "Rev D"), ("EXCO2", "Rev B"), ("EXCO3", ""),
+                          ("EXCO10", "Rev A")])
+
+    def test_placement_text(self):
+        delay = PositionWorking(placement="delay", film_value=480.0, adjustment=0.0, sent=480000,
+                                text="480 + 0 = 480 ms = 480000 µs")
+        self.assertEqual(hx_ui_common.text(hx_ui_send.placement_text(delay)), "Delay 480 ms")
+        adjusted = PositionWorking(placement="delay", film_value=480.5, adjustment=20.0, sent=500500,
+                                   text="480.5 + 20 = 500.5 ms = 500500 µs")
+        self.assertEqual(hx_ui_common.text(hx_ui_send.placement_text(adjusted)), "Delay 500.5 ms")
+        encoder = PositionWorking(placement="encoder", film_value=150.0, adjustment=-3.0, head_distance_mm=412.0,
+                                  film_length_mm=610.0, sent=345, wrapped=True, text="(150 - 412 - 3) mod 610 = 345 mm")
+        self.assertEqual(hx_ui_common.text(hx_ui_send.placement_text(encoder)), "Print position 147 mm")
+        try:
+            i18n.set_language("es")
+            self.assertEqual(hx_ui_common.text(hx_ui_send.placement_text(delay)), "Retardo de 480 ms")
+            self.assertEqual(hx_ui_common.text(hx_ui_send.placement_text(encoder)), "Posición de impresión de 147 mm")
+        finally:
+            i18n.set_language("en")
 
     def test_joined_names_follow_the_language(self):
         joined = hx_ui_send._joined(["Line 1 Bagger 1", "Line 1 Bagger 2", "Line 1 Bagger 3"])
@@ -703,6 +746,27 @@ class SendWindowTests(UiCase):
         self.assertEqual(w.blocks[self.line_id].product_box.record_id(), "")
         self.assertFalse(w.has_choices())
 
+    def test_delay_for_senders_and_the_working_for_administrators(self):
+        mid = self.mid()
+        w = self.send_window()                  # jsmith is a sender and an administrator
+        block = w.blocks[self.line_id]
+        self.assertEqual(block.position_labels[mid].cget("text"), "Delay 480 ms")
+        self.assertEqual(str(block.position_labels[mid].cget("style")), "Hx.Small.TLabel")
+        self.assertEqual(block.working_labels[mid].cget("text"), "480 + 0 = 480 ms = 480000 µs")
+        self.assertEqual(str(block.working_labels[mid].cget("style")), "Hx.Small.TLabel")
+        w.destroy()
+        # A sender who isn't an administrator sees the delay only
+        akim = self.make("akim", admin=False, sender=True)
+        w = SendWindow(self.root, akim, prefill=self.request(self.choice(), services=akim))
+        block = w.blocks[self.line_id]
+        self.assertTrue(w.send_button.instate(["!disabled"]))
+        self.assertEqual(block.position_labels[mid].cget("text"), "Delay 480 ms")
+        self.assertEqual(block.working_labels, {})
+        self.assertFalse([t for t in label_texts(w) if "µs" in t or " = " in t])
+        i18n.set_language("es")
+        w.retranslate()
+        self.assertEqual(block.position_labels[mid].cget("text"), "Retardo de 480 ms")
+
     def test_language_switch_keeps_bag_text(self):
         services = self.services
         services.watcher.latest = board_of(self.line_id, mview(self.mid(), self.line_id, "Line 1 Bagger 1"))
@@ -724,6 +788,157 @@ class SendWindowTests(UiCase):
 # --------------------------------------------------------------------------
 # Result, red window, Try again
 # --------------------------------------------------------------------------
+
+class FilmCardTests(UiCase):
+    """The films of the chosen product as cards with their photos (ui.md §5.3)."""
+
+    def add_films(self):
+        """Four films of the product, with Pillow-drawn photos saved the way the film editor saves
+        them: EXCO1 Rev C (tall front and back), EXCO10 Rev A (none), EXCO2 Rev B (a wide front only),
+        EXCO3 (no revision, none)."""
+        services = self.services
+        data = services.data
+        base = data.current.films[self.world.ids["film"]]
+        films = [base,
+                 dataclasses.replace(base, id=new_id("fm"), code="EXCO10", artwork_revision="Rev A"),
+                 dataclasses.replace(base, id=new_id("fm"), code="EXCO2", artwork_revision="Rev B", side="front"),
+                 dataclasses.replace(base, id=new_id("fm"), code="EXCO3", artwork_revision="")]
+        photos = {films[0].id: (("front_photo", (600, 1500)), ("back_photo", (560, 1400))),
+                  films[2].id: (("front_photo", (900, 600)),)}
+        self.refs = {}
+        for film in films:
+            os.makedirs(os.path.join(self.world.share_root, "templates", "films", film.id), exist_ok=True)
+            refs = []
+            for kind, size in photos.get(film.id, ()):
+                path = tall_photo(os.path.join(self.tmp, f"{film.code} {kind}.jpg"), size, (180, 83, 9))
+                ref = data.save_file(film.id, kind, path)
+                data.save_preview(film.id, ref.sha256, hx_ui_common.png_preview(path))
+                refs.append(ref)
+                self.refs[(film.id, kind)] = ref
+            hx_share.write_record(services.store, dataclasses.replace(film, files=refs))
+        services.store.write_json("config/hx/changes.json", {"file_type": "changes", "counter": 2,
+                                                            "written_at": time.time(),
+                                                            "written_by": services.identity.user, "last": None})
+        data.run_once()
+        services.bus.pump()
+        return [f.id for f in films]
+
+    def test_film_cards(self):
+        services, ids = self.services, self.add_films()
+        exco1, exco10, exco2, exco3 = ids
+        w = SendWindow(self.root, services)
+        w.line_checks[self.line_id].invoke()
+        block = w.blocks[self.line_id]
+        block.product_box.set_record_id(self.world.ids["product"])
+        block.product_box.event_generate("<<ComboboxSelected>>")
+        # By code, then revision, as the admin list shows them
+        self.assertEqual(list(block.film_radios), [exco1, exco2, exco3, exco10])
+        self.assertEqual([r.cget("text") for r in block.film_radios.values()],
+                         ["EXCO1 · Rev C", "EXCO2 · Rev B", "EXCO3", "EXCO10 · Rev A"])
+        self.assertEqual(list(block.film_cards), list(block.film_radios))
+        # The photos load (a worker each), fitted to the box with their shape kept
+        self.pump(lambda: w.winfo_width() == 1000 and (exco1, "back_photo") in block._photos
+                  and (exco2, "front_photo") in block._photos and block.films_frame.winfo_width() > 1)
+        self.settle(0.1)
+        front = block._photos[(exco1, "front_photo")][0]
+        self.assertEqual((front.width(), front.height()), (60, 150))        # 600 x 1500
+        back = block._photos[(exco1, "back_photo")][0]
+        self.assertEqual((back.width(), back.height()), (60, 150))          # 560 x 1400
+        wide = block._photos[(exco2, "front_photo")][0]
+        self.assertEqual((wide.width(), wide.height()), (100, 67))          # 900 x 600
+        self.assertEqual(hx_ui_send.THUMB_BOX, (100, 150))
+        for key in ((exco2, "back_photo"), (exco3, "front_photo"), (exco3, "back_photo"), (exco10, "front_photo")):
+            self.assertEqual(block.thumbs[key].cget("text"), "No photo")
+            self.assertEqual(str(block.thumbs[key].cget("image")), "")
+        # Four films side by side in a 1000 x 780 window, with the rest of the form in view
+        self.assertEqual(block._film_cols, 4)
+        self.assertEqual([int(card.grid_info()["row"]) for card in block.film_cards.values()], [0, 0, 0, 0])
+        self.assertEqual([int(card.grid_info()["column"]) for card in block.film_cards.values()], [0, 1, 2, 3])
+        widths = {card.winfo_width() for card in block.film_cards.values()}
+        self.assertEqual(len(widths), 1)                                     # every card as wide
+        # Clicking a card (not only its radio button) picks that film; its card is marked
+        block.film_cards[exco2].event_generate("<Button-1>", x=2, y=2)
+        self.assertEqual(block.film_var.get(), exco2)
+        block.film_cards[exco1].winfo_children()[1].event_generate("<Button-1>", x=2, y=2)    # the side text
+        self.assertEqual(block.film_var.get(), exco1)
+        self.assertEqual(block.print_text_box.record_id(), self.world.ids["print_text"])
+        self.assertEqual(block.film_cards[exco1].cget("highlightbackground"), COLOUR_HEX[BLUE])
+        self.assertEqual({block.film_cards[f].cget("highlightbackground") for f in (exco2, exco3, exco10)}, {DIM_FG})
+        self.settle(0.1)
+        canvas = w.scroller.canvas
+        fold = canvas.winfo_rooty() + canvas.winfo_height()
+        for widget in (block.print_text_box, block.lot_entry, block.countries_frame, block.origin_text):
+            self.assertLess(widget.winfo_rooty(), fold, widget)
+        self.assertLess(block.lot_entry.winfo_rooty() + block.lot_entry.winfo_height(), fold)
+        # A narrow window takes fewer cards to a row
+        w.geometry("760x560")
+        self.pump(lambda: block._film_cols < 4)
+        rows = [int(card.grid_info()["row"]) for card in block.film_cards.values()]
+        self.assertEqual(rows[:block._film_cols], [0] * block._film_cols)
+        self.assertEqual(rows[-1], 1)
+        # Clicking a photo opens it larger, once, and the window reads the original from the share
+        thumb = block.thumbs[(exco1, "front_photo")]
+        self.assertEqual(str(thumb.cget("cursor")), "hand2")
+        thumb.event_generate("<Button-1>", x=2, y=2)
+        thumb.event_generate("<Button-1>", x=2, y=2)
+        photos = [x for x in hx_ui_common.open_windows() if isinstance(x, PhotoWindow)]
+        self.assertEqual(len(photos), 1)
+        photo = photos[0]
+        self.assertEqual(photo.title(), "EXCO1 · Rev C: Front photo")
+        self.assertEqual(photo.original, self.refs[(exco1, "front_photo")])
+        self.pump(lambda: photo.source == "original")
+        self.assertEqual(photo.image.size, (600, 1500))
+
+    def test_photos_built_again_ignore_a_late_load(self):
+        services, ids = self.services, self.add_films()
+        exco1 = ids[0]
+        w = SendWindow(self.root, services)
+        w.line_checks[self.line_id].invoke()
+        block = w.blocks[self.line_id]
+        late = []
+        services.bg = mock.Mock(run=lambda work, done: late.append((work, done)))
+        block.product_box.set_record_id(self.world.ids["product"])
+        block.product_box.event_generate("<<ComboboxSelected>>")
+        self.settle(0.05)
+        self.assertTrue(late)
+        first = block.thumbs[(exco1, "front_photo")]
+        block._build_films()                    # e.g. the product chosen again
+        self.assertIsNot(block.thumbs[(exco1, "front_photo")], first)
+        for work, done in late:
+            done(work(), None)
+        self.assertNotIn((exco1, "front_photo"), block._photos)
+
+
+class WentLiveTests(UiCase):
+    """The red window's line about the machines that went live, one or more (ui.md §7.2)."""
+    printers = [{}, {}, {}]
+
+    def red_window(self, live):
+        services = self.services
+        plan = hx_message.merge_plan(self.request(self.choice((1, 2, 3))), services.data.current, services.identity)
+        machines = [MachineResult(machine_id=self.mid(n), colour=AMBER if n in live else RED, ok=n in live,
+                                  step=STEP_CONFIRM_2 if n in live else STEP_VERIFY_IDLE) for n in (1, 2, 3)]
+        result = SendResult(send_id=plan.send_id, sender=services.identity.user, computer=services.identity.computer,
+                            started_at=time.time(), finished_at=time.time(), machines=machines, time_source="server")
+        return FailureWindow(self.root, services, result, plan)
+
+    def test_one_machine_went_live(self):
+        fw = self.red_window({2})
+        self.assertEqual(fw.passed_label.cget("text"), "Line 1 Bagger 2 went live. Confirm it in the result window.")
+        i18n.set_language("es")
+        fw.retranslate()
+        self.assertEqual(fw.passed_label.cget("text"),
+                         "Line 1 Bagger 2 quedó activa. Confírmela en la ventana de resultados.")
+
+    def test_machines_went_live(self):
+        fw = self.red_window({2, 3})
+        self.assertEqual(fw.passed_label.cget("text"),
+                         "Line 1 Bagger 2 and Line 1 Bagger 3 went live. Confirm them in the result window.")
+        i18n.set_language("es")
+        fw.retranslate()
+        self.assertEqual(fw.passed_label.cget("text"), "Line 1 Bagger 2 y Line 1 Bagger 3 quedaron activas. "
+                                                       "Confírmelas en la ventana de resultados.")
+
 
 class DataChangeTests(UiCase):
     """The Send window while an administrator changes the templates on another PC (ui.md §5.2, §5.9)."""

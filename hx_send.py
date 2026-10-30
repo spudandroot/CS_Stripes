@@ -48,7 +48,7 @@ from hx_model import (AMBER, GREEN, RED, SLOTS, STEP_BUILD, STEP_CHECK_CHOICE, S
                       new_id, same_user, to_json)
 from hx_protocol import clock_from, worst_case_s
 from hx_time import to_local
-from i18n import N_, add_spanish
+from i18n import N_, add_spanish, tr
 
 ES = {
     "The templates changed since you checked them. Look at the Send window again.":
@@ -79,6 +79,8 @@ ES = {
         "El reloj de {machine} marca {printer_time} después de ajustarlo a {expected}.",
     "The message read back from {machine} differs from what was sent ({n} differences).":
         "El mensaje leído de {machine} difiere de lo enviado ({n} diferencias).",
+    "The message read back from {machine} differs from what was sent (1 difference).":
+        "El mensaje leído de {machine} difiere de lo enviado (1 diferencia).",
     "The date {machine} would print differs from the date Stripes expects.":
         "La fecha que imprimiría {machine} difiere de la fecha que espera Stripes.",
     "{machine} is printing slot {got}, not slot {slot}.": "{machine} está imprimiendo la ranura {got}, no la ranura {slot}.",
@@ -91,6 +93,9 @@ ES = {
     "Only {sender} can confirm this Send.": "Solo {sender} puede confirmar este envío.",
     "Your answer was logged, but Stripes couldn't update the monitor for {machines}.":
         "Su respuesta quedó registrada, pero Stripes no pudo actualizar el monitor de {machines}.",
+    "Your answer was logged, but Stripes couldn't update the monitor.":
+        "Su respuesta quedó registrada, pero Stripes no pudo actualizar el monitor.",
+    "Unknown machine": "Máquina desconocida",
     "Stripes couldn't record the switch on the server, so it didn't switch.":
         "Stripes no pudo registrar el cambio en el servidor, así que no cambió de mensaje.",
     "Only Stripes MapleJet Senders can stop, resume or set clocks.":
@@ -143,6 +148,9 @@ _STOP_AT_PRINTER = N_("Stripes couldn't stop printing on {machine}. Stop it at t
 _NEEDS_SERVER = N_("A test print needs the server, so that nobody else uses the printer meanwhile.")
 _COUNTER_CHANGED = N_("The bag counter setting changed since this test was set up. Set it up again.")
 _NO_SERVER = N_("Stripes can't reach the server.")                                 # hx_share's text
+_UNKNOWN_MACHINE = N_("Unknown machine")          # a machine missing from the plan: texts never show an id
+_NOT_UPDATED = N_("Your answer was logged, but Stripes couldn't update the monitor for {machines}.")
+_NOT_UPDATED_UNNAMED = N_("Your answer was logged, but Stripes couldn't update the monitor.")
 _CANT_CHECK = N_("Stripes can't reach the server, so it can't check the last confirmed Send.")
 
 
@@ -169,7 +177,9 @@ class FailureRow:
 
 
 def failure_rows(result: SendResult, plan) -> list[FailureRow]:
-    """One row per machine that failed, in result order; a cancelled machine has none."""
+    """One row per machine that failed, in result order; a cancelled machine has none. Called by the
+    red window on the Tk thread: a machine missing from the plan (it can't be, but a failure must
+    still show) is "Unknown machine" in the screen's language, never its id."""
     plans = {mp.machine.id: mp for mp in plan.machines}
     rows = []
     for r in result.machines:
@@ -184,7 +194,7 @@ def failure_rows(result: SendResult, plan) -> list[FailureRow]:
                 differences = []
         previous = r.previous
         rows.append(FailureRow(
-            machine_id=r.machine_id, machine_name=mp.machine.name if mp else r.machine_id,
+            machine_id=r.machine_id, machine_name=mp.machine.name if mp else tr(_UNKNOWN_MACHINE),
             line_name=mp.line.name if mp else "", step=r.step,
             step_text=STEP_TEXTS.get(r.step, Msg(r.step)), msg=r.msg, after_switch=r.after_switch,
             after_switch_text=Msg(_AFTER_SWITCH) if r.after_switch else None,
@@ -347,6 +357,9 @@ def _readback_problem(built, design, read_local, machine_name):
         return None
     if not diffs:
         msg = Msg(N_("The date {machine} would print differs from the date Stripes expects."),
+                  {"machine": machine_name})
+    elif len(diffs) + len(dates) == 1:
+        msg = Msg(N_("The message read back from {machine} differs from what was sent (1 difference)."),
                   {"machine": machine_name})
     else:
         msg = Msg(N_("The message read back from {machine} differs from what was sent ({n} differences)."),
@@ -1232,12 +1245,21 @@ class SendPipeline(_Worker):
         return list(self._pending_states(send_id, self.data.find_send(send_id)))
 
     def _machine_name(self, machine_id, entry_rows=None):
+        """The machine's name from the Send's log entry or the current records; "" when neither knows it."""
         for row in entry_rows or []:
             if row.get("machine_id") == machine_id and row.get("machine_name"):
                 return row["machine_name"]
         current = self.data.current
         machine = current.machines.get(machine_id) if current is not None else None
-        return machine.name if machine is not None else machine_id
+        return machine.name if machine is not None else ""
+
+    def _not_updated(self, machine_ids, entry_rows=None):
+        """The ShareError for machines whose expected state couldn't be written: by name, and without
+        names when one of them isn't known any more (texts never show an id)."""
+        names = [self._machine_name(mid, entry_rows) for mid in machine_ids]
+        if all(names):
+            return ShareError(Msg(_NOT_UPDATED, {"machines": ", ".join(names)}))
+        return ShareError(Msg(_NOT_UPDATED_UNNAMED))
 
     def _under_lock(self, send_id, machine_id, line_id, printer_id, change):
         """§11.2 step 5: take the printer's lock (no printer request), read E, and when change(E) gives
@@ -1355,9 +1377,7 @@ class SendPipeline(_Worker):
             except (ShareError, ValueError) as e:
                 print(f"Could not write the line status of {line_id}: {e}", file=sys.stderr)
         if failed:
-            names = ", ".join(self._machine_name(mid, rows) for mid in failed)
-            raise ShareError(Msg(N_("Your answer was logged, but Stripes couldn't update the monitor for {machines}."),
-                                 {"machines": names}))
+            raise self._not_updated(failed, rows)
 
     def leave_it(self, send_id: str, machine_ids: list[str]) -> None:
         """Leave it: the machines stay red with their failure; logged, and a new reread_token asks the
@@ -1386,9 +1406,7 @@ class SendPipeline(_Worker):
             if outcome == "error":
                 failed.append(mid)
         if failed:
-            names = ", ".join(self._machine_name(mid) for mid in failed)
-            raise ShareError(Msg(N_("Your answer was logged, but Stripes couldn't update the monitor for {machines}."),
-                                 {"machines": names}))
+            raise self._not_updated(failed)
 
     # ---- after an outage (§14.1)
 
@@ -1538,7 +1556,7 @@ class PrinterActions(_Worker):
     def _take(self, a, purpose, action_id):
         """The printer's lock and the poller handshake. True when the machine may make requests;
         otherwise a has failed. A local_only lock is a.held False."""
-        line_name = a.line.name if a.line is not None else ""
+        line_name = a.line.name if a.line is not None else a.machine.name
         a.lock = self.store.lock(a.printer.id, purpose=purpose, run_id=action_id, line_id=a.machine.line_id,
                                  machine_id=a.id)
         try:

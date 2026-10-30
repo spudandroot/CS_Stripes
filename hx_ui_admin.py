@@ -461,6 +461,12 @@ THUMB_PX = 160
 ADJUST_LIMITS = {"position_mm": 1000.0, "delay_ms": 10000.0}
 _NOTIFY_PATTERN = r"[^\\/\s][^\\/]*\\[^\\/]+"
 _WRAP = 620
+# An editor's layout: the field column is never narrower than FIELD_MIN_PX, hints wrap to the room
+# they have but never narrower than HINT_MIN_PX, and an editor narrower than FORM_MIN_PX scrolls
+# sideways instead of squeezing its fields
+FIELD_MIN_PX = 160
+HINT_MIN_PX = 100
+FORM_MIN_PX = 500
 
 
 # --------------------------------------------------------------------------
@@ -572,17 +578,22 @@ def print_text_choices(film: Film, data) -> list[PrintText]:
 
 
 def film_choices(pt: PrintText, data) -> list[Film]:
-    """Films of any status that suit the print text's origin items, by product then code."""
+    """Films of any status that suit the print text's origin items, by product, then code and revision."""
     def product_name(film):
         product = data.products.get(film.product_id)
         return product.name if product is not None else ""
     found = [f for f in data.films.values() if origin_rule_ok(f, pt)]
-    return sorted(found, key=lambda f: (hx_state.natural_key(product_name(f)), hx_state.natural_key(f.code), f.id))
+    return sorted(found, key=lambda f: (hx_state.natural_key(product_name(f)),) + _film_key(f))
 
 
 def film_name(film: Film) -> str:
     """A film as people know it: code · artwork revision (data)."""
     return f"{film.code} · {film.artwork_revision}" if film.artwork_revision else film.code
+
+
+def _film_key(film: Film) -> tuple:
+    """Films in the Send window's order: by code, then artwork revision ("Rev 2" before "Rev 10")."""
+    return hx_state.natural_key(film.code), hx_state.natural_key(film.artwork_revision), film.id
 
 
 def membership_saves(pt: PrintText, wanted: set[str], data) -> tuple[list[Film], list[Msg]]:
@@ -610,7 +621,7 @@ def membership_saves(pt: PrintText, wanted: set[str], data) -> tuple[list[Film],
     # A film that already allows the print text but no longer suits it (an origin item removed or
     # added) would be left failing validate_film: refused, so the admin unticks it in that film first
     chosen = {f.id for f in film_choices(pt, data2)}
-    for film in sorted(data.films.values(), key=lambda f: (hx_state.natural_key(f.code), f.id)):
+    for film in sorted(data.films.values(), key=_film_key):
         if film.id in chosen or pt.id not in film.print_text_ids:
             continue
         before = hx_message.validate_film(film, data)
@@ -744,6 +755,19 @@ def _marked(key, work):
     return target
 
 
+def _fit_wrap(label, *, cap=_WRAP, floor=HINT_MIN_PX):
+    """Wrap a label's text to the width it's given, at most cap and at least floor pixels, so a long
+    hint wraps instead of running out of the window. The label must fill its cell (grid sticky "ew",
+    or pack fill="x") so it gets wider again when the window does."""
+    def fit(event):
+        px = max(floor, min(cap, event.width - 4))
+        if getattr(label, "_wrap_px", None) != px:
+            label._wrap_px = px
+            label.configure(wraplength=px)
+    label.bind("<Configure>", fit, add="+")
+    return label
+
+
 def _red_label(master, size=14, bold=False, wrap=1200):
     return tk.Label(master, background=RED_BG, foreground=RED_FG, font=(UI_FONT, size, "bold" if bold else "normal"),
                     wraplength=wrap, justify="left", anchor="w")
@@ -751,12 +775,14 @@ def _red_label(master, size=14, bold=False, wrap=1200):
 
 class _Lines(ttk.Label):
     """Msgs in the current language, one per line (or joined by sep); hidden while there are none.
-    Grid it once where it belongs."""
+    Grid it once where it belongs; with fit, grid it sticky "ew" and it wraps to the width it gets."""
 
-    def __init__(self, master, *, style="Bad.TLabel", wrap=_WRAP, sep="\n", **kw):
+    def __init__(self, master, *, style="Bad.TLabel", wrap=_WRAP, sep="\n", fit=False, **kw):
         super().__init__(master, style=style, wraplength=wrap, justify="left", **kw)
         self.msgs: list[Msg] = []
         self.sep = sep
+        if fit:
+            _fit_wrap(self, cap=wrap)
 
     def show(self, msgs, *, header: Msg | None = None) -> None:
         msgs = list(msgs)
@@ -824,7 +850,11 @@ class _Form(ttk.Frame):
         self.fields: dict[str, tk.Variable | tk.Widget] = {}
         self._kinds: dict[str, tuple] = {}      # name -> (kind, label, required)
         self._loading = 0
-        self.columnconfigure(1, weight=1)
+        # Labels, fields, hints. The field column keeps at least FIELD_MIN_PX; the hint column, weighted
+        # three times as much, takes most of any shortfall and its hints wrap to what is left, so an
+        # editor narrower than the hints' one-line width never squeezes a field to nothing
+        self.columnconfigure(1, weight=1, minsize=FIELD_MIN_PX)
+        self.columnconfigure(2, weight=3)
 
     # building
 
@@ -834,9 +864,19 @@ class _Form(ttk.Frame):
         label.grid(row=row, column=col, sticky="w", padx=(0, 8), pady=2, **grid)
         return label
 
-    def hint(self, master, english, **values):
+    def hint(self, master, english, *, fit=False, **values):
+        """A muted hint; with fit it wraps to the width it gets (grid it sticky "ew")."""
         label = ttk.Label(master, style="Muted.TLabel", wraplength=_WRAP, justify="left")
         self.texts.set(label, english, **values)
+        if fit:
+            _fit_wrap(label)
+        return label
+
+    def side_hint(self, row, english, *, column=2, columnspan=1, **values):
+        """A hint right of the row's field (column 2), or under it (column 1, spanning 2), wrapping to
+        the room it has."""
+        label = self.hint(self, english, fit=True, **values)
+        label.grid(row=row, column=column, columnspan=columnspan, sticky="ew", padx=(8, 0) if column == 2 else 0)
         return label
 
     def section(self, row, english):
@@ -858,9 +898,10 @@ class _Form(ttk.Frame):
         self.label(row, english)
         var = self.var(name, kind, label=english, required=required)
         entry = ttk.Entry(master or self, textvariable=var, width=width)
-        entry.grid(row=row, column=1, sticky="w", pady=2)
+        # Without a hint it may reach into the hint column, so a wide entry never narrows the hints
+        entry.grid(row=row, column=1, columnspan=1 if hint else 2, sticky="w", pady=2)
         if hint:
-            self.hint(self, hint).grid(row=row, column=2, sticky="w", padx=(8, 0))
+            self.side_hint(row, hint)
         return var, entry
 
     def spin(self, master, name, english, lo, hi, *, width=5):
@@ -1058,6 +1099,11 @@ class AdminPage(ttk.Frame):
 
         self.editor_scroller = Scroller(self)
         self.editor_scroller.grid(row=1, column=1, sticky="nsew")
+        # Sideways too: an editor narrower than FORM_MIN_PX keeps that width and scrolls
+        canvas = self.editor_scroller.canvas
+        self.editor_xbar = ttk.Scrollbar(self.editor_scroller, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=self.editor_xbar.set)
+        canvas.bind("<Configure>", lambda e: self._fit_editor(e.width), add="+")
         box = self.editor_box = self.editor_scroller.inner
         box.columnconfigure(0, weight=1)
         self.form_holder = ttk.Frame(box)
@@ -1065,14 +1111,14 @@ class AdminPage(ttk.Frame):
         self.form_holder.columnconfigure(0, weight=1)
         self.revision_label = ttk.Label(box, style="Muted.TLabel")
         self.revision_label.grid(row=1, column=0, sticky="w", padx=4, pady=(8, 0))
-        self.changed_banner = ttk.Label(box, style="Warn.TLabel", wraplength=_WRAP, justify="left")
-        self.changed_banner.grid(row=2, column=0, sticky="w", padx=4)
+        self.changed_banner = _fit_wrap(ttk.Label(box, style="Warn.TLabel", wraplength=_WRAP, justify="left"))
+        self.changed_banner.grid(row=2, column=0, sticky="ew", padx=4)
         self.changed_banner.grid_remove()
-        self.problems_label = _Lines(box, style="Bad.TLabel")
-        self.problems_label.grid(row=3, column=0, sticky="w", padx=4, pady=(4, 0))
+        self.problems_label = _Lines(box, style="Bad.TLabel", fit=True)
+        self.problems_label.grid(row=3, column=0, sticky="ew", padx=4, pady=(4, 0))
         self.problems_label.show([])
-        self.warnings_label = _Lines(box, style="Warn.TLabel")
-        self.warnings_label.grid(row=4, column=0, sticky="w", padx=4)
+        self.warnings_label = _Lines(box, style="Warn.TLabel", fit=True)
+        self.warnings_label.grid(row=4, column=0, sticky="ew", padx=4)
         self.warnings_label.show([])
         buttons = ttk.Frame(box)
         buttons.grid(row=5, column=0, sticky="ew", padx=4, pady=(8, 4))
@@ -1092,6 +1138,20 @@ class AdminPage(ttk.Frame):
         self.build_editors()
         self.refresh_list()
         self.update_save_state()
+
+    def _fit_editor(self, width):
+        """Runs after the Scroller's own <Configure> binding, which gives the editor the canvas's
+        width: below FORM_MIN_PX it gets FORM_MIN_PX instead, with a sideways scrollbar."""
+        canvas = self.editor_scroller.canvas
+        narrow = width < FORM_MIN_PX
+        for item in canvas.find_all():
+            if canvas.type(item) == "window":
+                canvas.itemconfigure(item, width=max(width, FORM_MIN_PX))
+        if narrow and not self.editor_xbar.winfo_manager():
+            self.editor_xbar.pack(side="bottom", fill="x", before=canvas)
+        elif not narrow and self.editor_xbar.winfo_manager():
+            self.editor_xbar.pack_forget()
+            canvas.xview_moveto(0)
 
     def extra_buttons(self, top):
         """More buttons next to New (the products page's Add new version)."""
@@ -1581,8 +1641,8 @@ class _CompanyForm(_Form):
             self.font_vars.append(var)
         self.fields["standard_fonts"] = fonts
         row += 1
-        self.hint(self, N_("Change these only when every printer's font list has changed: Stripes refuses to send to "
-                           "a printer whose fonts differ.")).grid(row=row, column=1, columnspan=2, sticky="w")
+        self.side_hint(row, N_("Change these only when every printer's font list has changed: Stripes refuses to send "
+                               "to a printer whose fonts differ."), column=1, columnspan=2)
 
         # Which counter counts bags (OPEN)
         row += 1
@@ -1793,26 +1853,26 @@ class _LineForm(_Form):
         self.entry(1, "code", N_("Printed code"), width=5,
                    hint=N_("Up to 3 capital letters or digits, printed by a Line code item."))
         self.label(2, N_("Cartridge type"))
-        self.choice(self, "cartridge", CARTRIDGE_CHOICES).grid(row=2, column=1, sticky="w", pady=2)
-        self.hint(self, N_("Only films of the same type are offered at Send.")).grid(row=2, column=2, sticky="w",
-                                                                                     padx=(8, 0))
+        self.choice(self, "cartridge", CARTRIDGE_CHOICES, width=16).grid(row=2, column=1, sticky="w", pady=2)
+        self.side_hint(2, N_("Only films of the same type are offered at Send."))
         self.label(3, N_("Notify user"))
         notify = ttk.Frame(self)
-        notify.grid(row=3, column=1, sticky="w")
+        notify.grid(row=3, column=1, columnspan=2, sticky="w")
         ttk.Entry(notify, width=26, textvariable=self.var("notify_user")).pack(side="left")
         self.me_button = ttk.Button(notify, command=lambda: self.fields["notify_user"].set(self.services.identity.user))
         self.texts.set(self.me_button, N_("Me"))
         self.me_button.pack(side="left", padx=(6, 0))
-        self.hint(self, N_("DOMAIN\\name. Gets this line's alerts on whichever PC they're signed in to.")).grid(
-            row=3, column=2, sticky="w", padx=(8, 0))
+        # Under the entry and its button, which are too wide to leave the hint room beside them
+        self.side_hint(4, N_("DOMAIN\\name. Gets this line's alerts on whichever PC they're signed in to."), column=1,
+                       columnspan=2)
         _, active = self.check(self, "active", N_("Active"))
-        active.grid(row=4, column=1, sticky="w", pady=2)
-        self.label(5, N_("Machines"))
+        active.grid(row=5, column=1, sticky="w", pady=2)
+        self.label(6, N_("Machines"))
         self.machines_label = ttk.Label(self, wraplength=400, justify="left")
-        self.machines_label.grid(row=5, column=1, sticky="w")
+        self.machines_label.grid(row=6, column=1, columnspan=2, sticky="w")
         self.add_machine_button = ttk.Button(self, command=self._add_machine)
         self.texts.set(self.add_machine_button, N_("Add a machine"))
-        self.add_machine_button.grid(row=6, column=1, sticky="w", pady=(4, 0))
+        self.add_machine_button.grid(row=7, column=1, sticky="w", pady=(4, 0))
 
     def fill_extra(self, record):
         self.refresh()
@@ -1874,57 +1934,61 @@ class _MachineForm(_Form):
                    hint=N_("Up to 3 capital letters or digits, printed by a Machine code item."))
         self.label(2, N_("Line"))
         self.line_box = self.records(self, "line_id")
-        self.line_box.grid(row=2, column=1, sticky="w", pady=2)
+        self.line_box.grid(row=2, column=1, columnspan=2, sticky="w", pady=2)
         self.label(3, N_("Printer"))
         self.printer_box = self.records(self, "printer_id")
-        self.printer_box.grid(row=3, column=1, sticky="w", pady=2)
-        self.hint(self, N_("A printer belongs to one machine.")).grid(row=3, column=2, sticky="w", padx=(8, 0))
-        self.label(4, N_("Placement mode"))
+        self.printer_box.grid(row=3, column=1, columnspan=2, sticky="w", pady=2)
+        self.side_hint(4, N_("A printer belongs to one machine."), column=1, columnspan=2)     # under the wide box
+        self.label(5, N_("Placement mode"))
         placement = self.var("placement", "text")
         radios = ttk.Frame(self)
-        radios.grid(row=4, column=1, columnspan=2, sticky="w")
+        radios.grid(row=5, column=1, columnspan=2, sticky="w")
         for value in ("delay", "encoder"):
             radio = ttk.Radiobutton(radios, variable=placement, value=value)
             texts.set(radio, PLACEMENT_TEXTS[value])
             radio.pack(side="left", padx=(0, 12))
-        self.placement_hint = ttk.Label(self, style="Muted.TLabel", wraplength=_WRAP, justify="left")
-        self.placement_hint.grid(row=5, column=1, columnspan=2, sticky="w")
-        self.entry(6, "print_speed", N_("Print speed (cm/min)"), kind="whole", width=8,
+        self.placement_hint = _fit_wrap(ttk.Label(self, style="Muted.TLabel", wraplength=_WRAP, justify="left"))
+        self.placement_hint.grid(row=6, column=1, columnspan=2, sticky="ew")
+        self.entry(7, "print_speed", N_("Print speed (cm/min)"), kind="whole", width=8,
                    hint=N_("Needed before this machine can be sent to."))
         flags = ttk.Frame(self)
-        flags.grid(row=7, column=1, columnspan=2, sticky="w", pady=2)
+        flags.grid(row=8, column=1, columnspan=2, sticky="ew", pady=2)
         _, rotate = self.check(flags, "rotate", N_("Rotate"))
         rotate.pack(side="left")
         _, mirror = self.check(flags, "mirror", N_("Mirror"))
         mirror.pack(side="left", padx=(12, 0))
-        self.hint(flags, N_("Depend on how the printer is mounted.")).pack(side="left", padx=(12, 0))
-        self.entry(8, "seconds_per_bag", N_("Seconds per bag"), kind="number", width=8, required=True,
+        self.hint(flags, N_("Depend on how the printer is mounted."), fit=True).pack(side="left", fill="x",
+                                                                                    expand=True, padx=(12, 0))
+        self.entry(9, "seconds_per_bag", N_("Seconds per bag"), kind="number", width=8, required=True,
                    hint=N_("Used to time test steps when no counter counts bags."))
 
+        # The two expected values on rows of their own, so the frame fits the window's own size
         self.encoder_frame = ttk.LabelFrame(self, padding=8)
         texts.set(self.encoder_frame, N_("Encoder (encoder machines only)"))
-        self.encoder_frame.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(8, 4))
-        self.head_label = ttk.Label(self.encoder_frame, wraplength=480, justify="left")
-        self.head_label.grid(row=0, column=0, columnspan=3, sticky="w")
+        self.encoder_frame.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        self.encoder_frame.columnconfigure(1, weight=1)
+        self.head_label = _fit_wrap(ttk.Label(self.encoder_frame, wraplength=480, justify="left"), cap=480)
+        self.head_label.grid(row=0, column=0, columnspan=2, sticky="ew")
         self.calibrate_button = ttk.Button(self.encoder_frame, command=self._calibrate)
         texts.set(self.calibrate_button, N_("Calibrate..."))
-        self.calibrate_button.grid(row=0, column=3, sticky="e", padx=(8, 0))
+        self.calibrate_button.grid(row=0, column=2, sticky="ne", padx=(8, 0))
         self.encoder_entries = []
-        for col, (name, english, kind) in enumerate((("encoder_wheel_mm", N_("Expected wheel size (mm)"), "number"),
-                                                     ("encoder_ppr", N_("Expected pulses per turn"), "whole"))):
+        for n, (name, english, kind) in enumerate((("encoder_wheel_mm", N_("Expected wheel size (mm)"), "number"),
+                                                   ("encoder_ppr", N_("Expected pulses per turn"), "whole"))):
             caption = ttk.Label(self.encoder_frame)
             texts.set(caption, english)
-            caption.grid(row=1, column=col * 2, sticky="w", pady=(6, 0), padx=(0 if col == 0 else 12, 4))
+            caption.grid(row=1 + n, column=0, sticky="w", pady=(6, 0), padx=(0, 8))
             entry = ttk.Entry(self.encoder_frame, width=8, textvariable=self.var(name, kind, label=english))
-            entry.grid(row=1, column=col * 2 + 1, sticky="w", pady=(6, 0))
+            entry.grid(row=1 + n, column=1, sticky="w", pady=(6, 0))
             self.encoder_entries.append(entry)
         self.hint(self.encoder_frame, N_("Stripes reads these from the printer every day and raises an alert if they "
-                                         "change.")).grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+                                         "change."), fit=True).grid(row=3, column=0, columnspan=3, sticky="ew",
+                                                                    pady=(4, 0))
         _, active = self.check(self, "active", N_("Active"))
-        active.grid(row=10, column=1, sticky="w", pady=2)
-        self.label(11, N_("Now:"))
+        active.grid(row=11, column=1, sticky="w", pady=2)
+        self.label(12, N_("Now:"))
         self.now_label = ttk.Label(self)
-        self.now_label.grid(row=11, column=1, columnspan=2, sticky="w")
+        self.now_label.grid(row=12, column=1, columnspan=2, sticky="w")
 
     def prepare(self, record):
         data = self.services.data.current
@@ -2068,10 +2132,10 @@ class _PrinterForm(_Form):
         self.password_entry.grid(row=4, column=1, sticky="w", pady=2)
         self.password_entry.bind("<KeyRelease>", lambda e: self.changed() if self.password_entry.get() else None,
                                  add="+")
-        self.password_status = ttk.Label(self, wraplength=360, justify="left")
-        self.password_status.grid(row=4, column=2, sticky="w", padx=(8, 0))
-        self.hint(self, N_("Stripes keeps only a scrambled token made from the password, never the password "
-                           "itself.")).grid(row=5, column=1, columnspan=2, sticky="w")
+        self.password_status = _fit_wrap(ttk.Label(self, wraplength=360, justify="left"), cap=360)
+        self.password_status.grid(row=4, column=2, sticky="ew", padx=(8, 0))
+        self.side_hint(5, N_("Stripes keeps only a scrambled token made from the password, never the password itself."),
+                       column=1, columnspan=2)
         _, active = self.check(self, "active", N_("Active"))
         active.grid(row=6, column=1, sticky="w", pady=2)
         self.label(7, N_("Used by:"))
@@ -2180,8 +2244,7 @@ class ProductEditor(_Form):
         record = self.page.working
         if data is None or not isinstance(record, Product):
             return
-        films = sorted((f for f in data.films.values() if f.product_id == record.id),
-                       key=lambda f: (hx_state.natural_key(f.code), f.id))
+        films = sorted((f for f in data.films.values() if f.product_id == record.id), key=_film_key)
         self.films_label.configure(text="\n".join(film_name(f) for f in films))   # data
 
     def checks(self, record):
@@ -2203,10 +2266,10 @@ class FilmEditor(_Form):
         self.product_label = ttk.Label(self, style="Hx.Section.TLabel")
         self.product_label.grid(row=row, column=0, columnspan=3, sticky="w")
         row += 1
-        self.new_note = ttk.Label(self, style="Warn.TLabel", wraplength=_WRAP, justify="left")
+        self.new_note = _fit_wrap(ttk.Label(self, style="Warn.TLabel", wraplength=_WRAP, justify="left"))
         texts.set(self.new_note, N_("A new artwork revision is a new film. It starts blank and needs its own test "
                                     "print."))
-        self.new_note.grid(row=row, column=0, columnspan=3, sticky="w")
+        self.new_note.grid(row=row, column=0, columnspan=3, sticky="ew")
         row += 1
         self.entry(row, "code", N_("Code"), width=8, hint=N_("Up to 6 capital letters or digits, used in the "
                                                              "printer's message name. A new film needs a new code."))
@@ -2215,11 +2278,11 @@ class FilmEditor(_Form):
         row += 1
         self.label(row, N_("Status"))
         self.choice(self, "status", STATUS_CHOICES, width=16).grid(row=row, column=1, sticky="w", pady=2)
-        self.hint(self, N_("Only Active films are offered at Send.")).grid(row=row, column=2, sticky="w", padx=(8, 0))
+        self.side_hint(row, N_("Only Active films are offered at Send."))
         row += 1
         self.revision_text = ttk.Label(self)
         self.revision_text.grid(row=row, column=1, sticky="w")
-        self.hint(self, N_("Goes up on every save.")).grid(row=row, column=2, sticky="w", padx=(8, 0))
+        self.side_hint(row, N_("Goes up on every save."))
 
         row += 1
         self.section(row, N_("Bag"))
@@ -2231,16 +2294,15 @@ class FilmEditor(_Form):
                                ("front", N_("Front film: the code goes on the front"))):
             radio = ttk.Radiobutton(sides, variable=side, value=value)
             texts.set(radio, english)
-            radio.pack(side="left", padx=(0, 16))
+            radio.pack(side="top", anchor="w")        # one per row: both fit a narrow editor
         row += 1
         self.label(row, N_("Paper or plastic"))
         self.choice(self, "cartridge", CARTRIDGE_CHOICES, width=16).grid(row=row, column=1, sticky="w", pady=2)
-        self.hint(self, N_("Must match the line's cartridge type.")).grid(row=row, column=2, sticky="w", padx=(8, 0))
+        self.side_hint(row, N_("Must match the line's cartridge type."))
         row += 1
         self.label(row, N_("Ink colour"))
         self.choice(self, "ink_colour", COLOUR_CHOICES, width=10).grid(row=row, column=1, sticky="w", pady=2)
-        self.hint(self, N_("Checked against the ink the printer reports.")).grid(row=row, column=2, sticky="w",
-                                                                                 padx=(8, 0))
+        self.side_hint(row, N_("Checked against the ink the printer reports."))
 
         row += 1
         self.section(row, N_("Placement"))
@@ -2262,10 +2324,9 @@ class FilmEditor(_Form):
         self.section(row, N_("Print settings"))
         row += 1
         self.label(row, N_("Font"))
-        self.font_box = self.records(self, "font", kind="record_int", width=22)
+        self.font_box = self.records(self, "font", kind="record_int", width=18)
         self.font_box.grid(row=row, column=1, sticky="w", pady=2)
-        self.hint(self, N_("One font and size for the whole print text.")).grid(row=row, column=2, sticky="w",
-                                                                                padx=(8, 0))
+        self.side_hint(row, N_("One font and size for the whole print text."))
         row += 1
         settings = ttk.Frame(self)
         settings.grid(row=row, column=0, columnspan=3, sticky="w", pady=2)
@@ -2276,18 +2337,18 @@ class FilmEditor(_Form):
             caption.pack(side="left", padx=(0, 4))
             _, spin = self.spin(settings, name, english, lo, hi, width=4)
             spin.pack(side="left", padx=(0, 14))
-        caption = ttk.Label(settings)
-        texts.set(caption, N_("Resolution"))
-        caption.pack(side="left", padx=(0, 4))
-        self.choice(settings, "resolution", RESOLUTION_CHOICES, kind="choice_int", width=12).pack(side="left")
+        row += 1
+        self.label(row, N_("Resolution"))
+        self.choice(self, "resolution", RESOLUTION_CHOICES, kind="choice_int", width=12).grid(row=row, column=1,
+                                                                                            sticky="w", pady=2)
 
         row += 1
         self.section(row, N_("Origin"))
         row += 1
         _, preprinted = self.check(self, "origin_preprinted", N_("The origin is pre-printed on the film"))
         preprinted.grid(row=row, column=0, columnspan=2, sticky="w")
-        self.origin_hint = ttk.Label(self, style="Muted.TLabel", wraplength=_WRAP, justify="left")
-        self.origin_hint.grid(row=row, column=2, sticky="w", padx=(8, 0))
+        self.origin_hint = _fit_wrap(ttk.Label(self, style="Muted.TLabel", wraplength=_WRAP, justify="left"))
+        self.origin_hint.grid(row=row, column=2, sticky="ew", padx=(8, 0))
         row += 1
         self.label(row, N_("Pre-printed origin"))
         origin = ttk.Frame(self)
@@ -2297,8 +2358,7 @@ class FilmEditor(_Form):
         self.origin_preview = BagText(origin, size=13, bold=True)
         self.origin_preview.pack(side="left", padx=(10, 0))
         row += 1
-        self.hint(self, N_("Shown at Send, on the floor board and in the log.")).grid(row=row, column=1, columnspan=2,
-                                                                                      sticky="w")
+        self.side_hint(row, N_("Shown at Send, on the floor board and in the log."), column=1, columnspan=2)
         self._last_preprinted = None
 
         row += 1
@@ -2308,14 +2368,15 @@ class FilmEditor(_Form):
         self.print_texts_frame.grid(row=row, column=0, columnspan=3, sticky="w")
         self.fields["print_text_ids"] = self.print_texts_frame
         row += 1
-        self.unticked_note = _Lines(self, style="Warn.TLabel")
-        self.unticked_note.grid(row=row, column=0, columnspan=3, sticky="w")
+        self.unticked_note = _Lines(self, style="Warn.TLabel", fit=True)
+        self.unticked_note.grid(row=row, column=0, columnspan=3, sticky="ew")
         self.unticked_note.show([])
         row += 1
         self.label(row, N_("Default"))
         self.default_box = self.records(self, "default_print_text_id", width=30)
-        self.default_box.grid(row=row, column=1, sticky="w", pady=2)
-        self.hint(self, N_("Pre-filled at Send.")).grid(row=row, column=2, sticky="w", padx=(8, 0))
+        self.default_box.grid(row=row, column=1, columnspan=2, sticky="w", pady=2)
+        row += 1
+        self.side_hint(row, N_("Pre-filled at Send."), column=1, columnspan=2)       # under the wide box
 
         row += 1
         self.section(row, N_("Files and photos"))
@@ -2329,8 +2390,8 @@ class FilmEditor(_Form):
         row += 1
         self.files_tree = ttk.Treeview(self, columns=("kind", "name", "size", "by", "at"), show="headings", height=4,
                                        selectmode="browse")
-        for column, english, width in (("kind", N_("Kind"), 90), ("name", N_("Name"), 180), ("size", N_("Size"), 70),
-                                       ("by", N_("Added by"), 120), ("at", N_("Added"), 120)):
+        for column, english, width in (("kind", N_("Kind"), 80), ("name", N_("Name"), 140), ("size", N_("Size"), 60),
+                                       ("by", N_("Added by"), 100), ("at", N_("Added"), 100)):
             texts.heading(self.files_tree, column, english)
             self.files_tree.column(column, width=width)
         self.files_tree.grid(row=row, column=0, columnspan=3, sticky="ew")
@@ -2345,16 +2406,19 @@ class FilmEditor(_Form):
         self.add_kind_box.pack(side="left", padx=(0, 6))
         self.add_file_button = ttk.Button(files, command=self._add_file)
         texts.set(self.add_file_button, N_("Add file..."))
-        self.add_file_button.pack(side="left", padx=(0, 6))
-        self.open_file_button = ttk.Button(files, command=self._open_file)
+        self.add_file_button.pack(side="left")
+        row += 1
+        chosen = ttk.Frame(self)        # a row of their own, so the buttons fit the window's own size in Spanish
+        chosen.grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.open_file_button = ttk.Button(chosen, command=self._open_file)
         texts.set(self.open_file_button, N_("Open"))
         self.open_file_button.pack(side="left", padx=(0, 6))
-        self.remove_file_button = ttk.Button(files, command=self._remove_file)
+        self.remove_file_button = ttk.Button(chosen, command=self._remove_file)
         texts.set(self.remove_file_button, N_("Remove from film"))
         self.remove_file_button.pack(side="left")
         row += 1
-        self.files_note = _Lines(self, style="Muted.TLabel")
-        self.files_note.grid(row=row, column=0, columnspan=3, sticky="w")
+        self.files_note = _Lines(self, style="Muted.TLabel", fit=True)
+        self.files_note.grid(row=row, column=0, columnspan=3, sticky="ew")
         self.files_note.show([Msg(N_("Originals stay on the server. Each PC keeps small previews of the photos."))])
 
         row += 1
@@ -2362,9 +2426,9 @@ class FilmEditor(_Form):
         row += 1
         self.adjust_tree = ttk.Treeview(self, columns=("machine", "placement", "adjustment", "by", "at"),
                                         show="headings", height=4, selectmode="browse")
-        for column, english, width in (("machine", N_("Machine"), 150), ("placement", N_("Placement"), 80),
-                                       ("adjustment", N_("Adjustment"), 90), ("by", N_("Set by"), 120),
-                                       ("at", N_("Set at"), 120)):
+        for column, english, width in (("machine", N_("Machine"), 130), ("placement", N_("Placement"), 70),
+                                       ("adjustment", N_("Adjustment"), 80), ("by", N_("Set by"), 100),
+                                       ("at", N_("Set at"), 100)):
             texts.heading(self.adjust_tree, column, english)
             self.adjust_tree.column(column, width=width)
         self.adjust_tree.grid(row=row, column=0, columnspan=3, sticky="ew")
@@ -2432,7 +2496,7 @@ class FilmEditor(_Form):
             check = ttk.Checkbutton(self.print_texts_frame, variable=var,
                                     text=f"{pt.name} ({pt.code}) · {_choice_text(STATUS_CHOICES, pt.status)}",
                                     command=lambda pid=pt.id: self._pt_toggled(pid))
-            check.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 16))
+            check.grid(row=i, column=0, sticky="w")        # one per row: long names fit a narrow editor
             self.pt_vars[pt.id] = var
         ticked = [data.print_texts[i] for i in self.pt_ids if data is not None and i in data.print_texts]
         chosen = self.default_box.record_id()
@@ -2642,7 +2706,13 @@ class FilmEditor(_Form):
         page = self.page
         saved = page.expected_revision is not None
         _enable(self.adjust_button, saved and bool(self.adjust_tree.selection()))
-        _enable(self.test_button, saved and not page.dirty)
+        testable = saved and not page.dirty
+        _enable(self.test_button, testable)
+        # "Save the film first." says why the button is disabled, so it shows only then
+        if testable:
+            self.test_hint.pack_forget()
+        elif not self.test_hint.winfo_manager():
+            self.test_hint.pack(side="left", padx=(8, 0))
 
     def _edit_adjustment(self):
         chosen = self.adjust_tree.selection()
@@ -2733,7 +2803,7 @@ class ProductsPage(AdminPage):
                 continue
             self.tree.insert("", "end", iid=product.id, text=product.name,
                              values=(product.customer, "", _yes_no(product.active), ""), open=True)
-            for film in sorted(films.get(product.id, []), key=lambda f: (hx_state.natural_key(f.code), f.id)):
+            for film in sorted(films.get(product.id, []), key=_film_key):
                 if film.status == "inactive" and not show_all:
                     continue
                 self.tree.insert(product.id, "end", iid=film.id, text=film_name(film),
@@ -2786,23 +2856,15 @@ class PrintTextEditor(_Form):
         self._item_loading = 0
         self._editing_item = None       # the item the item editor shows
         self._typed: dict[tuple[str, str], str] = {}    # (item id, field) -> a bad or empty number, as typed
-        header = ttk.Frame(self)
-        header.grid(row=0, column=0, columnspan=3, sticky="w")
-        for col, (name, english, width) in enumerate((("name", N_("Name"), 26), ("code", N_("Code"), 5))):
-            caption = ttk.Label(header)
-            texts.set(caption, english)
-            caption.grid(row=0, column=col * 2, sticky="w", padx=(0 if col == 0 else 12, 4))
-            ttk.Entry(header, width=width, textvariable=self.var(name)).grid(row=0, column=col * 2 + 1, sticky="w")
-        caption = ttk.Label(header)
-        texts.set(caption, N_("Status"))
-        caption.grid(row=0, column=4, sticky="w", padx=(12, 4))
-        self.choice(header, "status", STATUS_CHOICES, width=16).grid(row=0, column=5, sticky="w")
-        self.revision_text = ttk.Label(header)
-        self.revision_text.grid(row=0, column=6, sticky="w", padx=(12, 0))
-        self.hint(header, N_("Up to 3 capital letters or digits, used in the printer's message name.")).grid(
-            row=1, column=2, columnspan=3, sticky="w")
-        self.hint(header, N_("Goes up on every save. The send log records which one printed.")).grid(
-            row=1, column=5, columnspan=2, sticky="w")
+        # The header a row each, as in the film editor, so each hint sits by its own field and wraps
+        self.entry(0, "name", N_("Name"), width=26)
+        self.entry(1, "code", N_("Code"), width=5,
+                   hint=N_("Up to 3 capital letters or digits, used in the printer's message name."))
+        self.label(2, N_("Status"))
+        self.choice(self, "status", STATUS_CHOICES, width=16).grid(row=2, column=1, sticky="w", pady=2)
+        self.revision_text = ttk.Label(self)
+        self.revision_text.grid(row=3, column=1, sticky="w", pady=2)
+        self.side_hint(3, N_("Goes up on every save. The send log records which one printed."))
 
         columns = ("n", "item", "before", "data", "after", "placement", "gap")
         self.items_tree = ttk.Treeview(self, columns=columns, show="headings", height=6, selectmode="browse")
@@ -2814,11 +2876,11 @@ class PrintTextEditor(_Form):
             else:
                 texts.heading(self.items_tree, column, english)
             self.items_tree.column(column, width=width)
-        self.items_tree.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.items_tree.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         self.items_tree.bind("<<TreeviewSelect>>", lambda e: self._show_item_editor(), add="+")
         self.fields["items"] = self.items_tree
         bar = ttk.Frame(self)
-        bar.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        bar.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self.add_kind_box = ChoiceBox(bar, list(ITEM_TEXTS.items()), width=18)
         self.add_kind_box.set_key("fixed")
         self.add_kind_box.pack(side="left")
@@ -2834,29 +2896,29 @@ class PrintTextEditor(_Form):
         self.remove_item_button = ttk.Button(bar, command=self._remove_item)
         texts.set(self.remove_item_button, N_("Remove item"))
         self.remove_item_button.pack(side="left")
-        self.add_problem = _Lines(self, style="Warn.TLabel")
-        self.add_problem.grid(row=3, column=0, columnspan=3, sticky="w")
+        self.add_problem = _Lines(self, style="Warn.TLabel", fit=True)
+        self.add_problem.grid(row=6, column=0, columnspan=3, sticky="ew")
         self.add_problem.show([])
         self.item_editor = ttk.Frame(self, padding=(0, 6))
-        self.item_editor.grid(row=4, column=0, columnspan=3, sticky="ew")
+        self.item_editor.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.item_editor.columnconfigure(2, weight=1)       # the item's hints wrap in what is left
 
         caption = ttk.Label(self, style="Hx.Section.TLabel")
         texts.set(caption, N_("Preview with the longest values"))
-        caption.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        caption.grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 2))
         self.preview = BagText(self, size=12, family=mono_font_family(self), wrap_px=None)
-        self.preview.grid(row=6, column=0, columnspan=3, sticky="w")
+        self.preview.grid(row=9, column=0, columnspan=3, sticky="w")
         self.lengths_label = ttk.Label(self, style="Muted.TLabel")
-        self.lengths_label.grid(row=7, column=0, columnspan=3, sticky="w")
-        self.hint(self, N_("Approximate: the test print shows exactly how it prints.")).grid(
-            row=8, column=0, columnspan=3, sticky="w")
+        self.lengths_label.grid(row=10, column=0, columnspan=3, sticky="w")
+        self.side_hint(11, N_("Approximate: the test print shows exactly how it prints."), column=0, columnspan=3)
 
         caption = ttk.Label(self, style="Hx.Section.TLabel")
         texts.set(caption, N_("Films that may use this print text"))
-        caption.grid(row=9, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        caption.grid(row=12, column=0, columnspan=3, sticky="w", pady=(10, 2))
         self.films_frame = ttk.Frame(self)
-        self.films_frame.grid(row=10, column=0, columnspan=3, sticky="w")
-        self.films_note = ttk.Label(self, style="Muted.TLabel", wraplength=_WRAP, justify="left")
-        self.films_note.grid(row=11, column=0, columnspan=3, sticky="w")
+        self.films_frame.grid(row=13, column=0, columnspan=3, sticky="w")
+        self.films_note = _fit_wrap(ttk.Label(self, style="Muted.TLabel", wraplength=_WRAP, justify="left"))
+        self.films_note.grid(row=14, column=0, columnspan=3, sticky="ew")
 
     # filling
 
@@ -3068,10 +3130,10 @@ class PrintTextEditor(_Form):
             if kind == "fixed":
                 text_field("text", N_("Text"), width=40)
             elif kind == "origin":
-                note = ttk.Label(frame, style="Muted.TLabel", wraplength=_WRAP, justify="left")
+                note = _fit_wrap(ttk.Label(frame, style="Muted.TLabel", wraplength=_WRAP, justify="left"))
                 texts.set(note, N_("Always prints \"Product of\" and the countries chosen at Send. It has no text "
                                    "before or after."))
-                note.grid(row=row, column=0, columnspan=3, sticky="w")
+                note.grid(row=row, column=0, columnspan=3, sticky="ew")
                 row += 1
             else:
                 if kind == "free_text":
@@ -3138,8 +3200,8 @@ class PrintTextEditor(_Form):
                 self.item_fields["placement"] = placement
                 row += 1
                 number_field("gap", N_("Gap"), 0, hx_message.GAP_MAX)
-                self.hint(frame, N_("Extra space before the item, in printer canvas units.")).grid(
-                    row=row - 1, column=2, sticky="w", padx=(8, 0))
+                self.hint(frame, N_("Extra space before the item, in printer canvas units."), fit=True).grid(
+                    row=row - 1, column=2, sticky="ew", padx=(8, 0))
         finally:
             self._item_loading -= 1
         self._show_date_example(item)
@@ -3406,7 +3468,7 @@ class AdjustmentsPage(AdminPage):
 
         def key(a):
             m, f = data.machines.get(a.machine_id), data.films.get(a.film_id)
-            return (hx_state.natural_key(m.name if m else ""), hx_state.natural_key(f.code if f else ""), a.id)
+            return (hx_state.natural_key(m.name if m else ""),) + (_film_key(f) if f else ([], [], "")) + (a.id,)
         return sorted(found, key=key)
 
     def values(self, adj):
@@ -3424,8 +3486,8 @@ class AdjustmentsPage(AdminPage):
         if data is not None and hasattr(self, "machine_filter"):
             self.machine_filter.set_records([(m.id, m.name) for m in _sorted(data.machines.values())],
                                             none_text=N_("All machines"))
-            self.film_filter.set_records([(f.id, film_name(f)) for f in sorted(
-                data.films.values(), key=lambda f: (hx_state.natural_key(f.code), f.id))], none_text=N_("All films"))
+            self.film_filter.set_records([(f.id, film_name(f)) for f in sorted(data.films.values(), key=_film_key)],
+                                         none_text=N_("All films"))
             if self.machine_filter.current() < 0:
                 self.machine_filter.current(0)
             if self.film_filter.current() < 0:
@@ -3490,8 +3552,7 @@ class AdjustmentDialog(HxWindow):
         texts.set(caption, N_("Film"))
         caption.grid(row=1, column=0, sticky="w", padx=(0, 8))
         self.film_box = RecordBox(body, width=26)
-        self.film_box.set_records([(f.id, film_name(f)) for f in sorted(
-            data.films.values(), key=lambda f: (hx_state.natural_key(f.code), f.id))])
+        self.film_box.set_records([(f.id, film_name(f)) for f in sorted(data.films.values(), key=_film_key)])
         self.film_box.set_record_id(film_id)
         self.film_box.grid(row=1, column=1, sticky="w", pady=2)
         self.film_box.bind("<<ComboboxSelected>>", lambda e: self._chosen(), add="+")
@@ -4423,7 +4484,7 @@ class CalibrationWindow(_TestRunner, HxWindow):
         def product_name(f):
             p = data.products.get(f.product_id)
             return p.name if p is not None else ""
-        films.sort(key=lambda f: (hx_state.natural_key(product_name(f)), hx_state.natural_key(f.code), f.id))
+        films.sort(key=lambda f: (hx_state.natural_key(product_name(f)),) + _film_key(f))
         self.film_box.set_records([(f.id, f"{film_name(f)} ({_num(f.length_mm)} mm)") for f in films])
         if films:
             self.film_box.set_record_id(films[0].id)

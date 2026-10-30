@@ -6,6 +6,7 @@ The Tk tests need a display; they skip themselves when Tk can't start.
 import io
 import json
 import os
+import queue
 import random
 import shutil
 import struct
@@ -20,14 +21,14 @@ from tkinter import ttk
 from types import SimpleNamespace
 from unittest import mock
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import hx_share
 import hx_state
 import hx_ui_common as common
 import i18n
 from hx_core import EventBus, Msg
-from hx_model import AMBER, BLUE, GREEN, GREY, RED, Company, HxData, Identity, NoReply
+from hx_model import AMBER, BLUE, GREEN, GREY, RED, Company, FileRef, HxData, Identity, NoReply
 from i18n import N_
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -650,6 +651,17 @@ class PictureViewTests(TkCase):
         self.assertEqual((small.width(), small.height()), (192, 96))
         with self.assertRaises(Exception):
             common.photo_from_png(self.root, b"not a png")
+        # Into a box, keeping the shape: a tall bag is as tall as the box, a wide photo as wide
+        tall = common.photo_from_png(self.root, png_bytes((192, 480)), box=(100, 150))
+        self.assertEqual((tall.width(), tall.height()), (60, 150))
+        wide = common.photo_from_png(self.root, png_bytes((480, 320)), box=(100, 150))
+        self.assertEqual((wide.width(), wide.height()), (100, 67))
+
+    def test_fit_size(self):
+        self.assertEqual(common.fit_size((600, 1600), (400, 800)), (300, 800))
+        self.assertEqual(common.fit_size((1600, 600), (400, 800)), (400, 150))
+        self.assertEqual(common.fit_size((100, 50), (400, 800)), (400, 200))     # enlarged to fill the box
+        self.assertEqual(common.fit_size((10_000, 1), (100, 100)), (100, 1))      # never 0
 
 
 class WindowTests(TkCase):
@@ -824,10 +836,14 @@ class WindowTests(TkCase):
                          f"200x100+{main.winfo_rootx() + 200}+{main.winfo_rooty() + 150}")
 
     def test_photo_window(self):
+        # Only the preview (the film editor's way): shown as it is, with nothing to zoom or open
         window = common.PhotoWindow(self.root, self.services, png=png_bytes((300, 200)), caption="EXCO1 Rev C")
         self.assertEqual(window.title(), "EXCO1 Rev C")
         self.assertEqual(window.caption_label.cget("text"), "EXCO1 Rev C")
         self.assertEqual((window.photo.width(), window.photo.height()), (300, 200))
+        self.assertEqual(window.zoom_button.winfo_manager(), "")
+        self.assertEqual(window.open_button.winfo_manager(), "")
+        self.assertEqual(window.key, "")
         self.pump(lambda: window.winfo_viewable())
         DialogTests.press_escape(window)
         self.assertFalse(window.winfo_exists())
@@ -841,7 +857,268 @@ class WindowTests(TkCase):
         self.assertEqual(broken.caption_label.cget("text"), "EXCO1")    # data
 
 
+class ThreadBackground:
+    """stripes.Background's way: each work on a thread of its own, its done back on the Tk thread
+    (the test pumps them)."""
+
+    def __init__(self):
+        self.results = queue.Queue()
+
+    def run(self, work, done):
+        def target():
+            try:
+                result, error = work(), None
+            except Exception as e:  # handed to done, like Background
+                result, error = None, e
+            self.results.put((done, result, error))
+
+        threading.Thread(target=target, name="test-bg", daemon=True).start()
+
+    def pump(self):
+        while True:
+            try:
+                done, result, error = self.results.get_nowait()
+            except queue.Empty:
+                return
+            done(result, error)
+
+
+def tall_photo(path, size=(600, 1600)):
+    """A made-up tall bag photo drawn with Pillow: a coloured bag, a white label near the top and
+    fine lines near the bottom standing in for the small print."""
+    img = Image.new("RGB", size, (180, 83, 9))
+    draw = ImageDraw.Draw(img)
+    width, height = size
+    draw.rectangle((width // 8, height // 10, width * 7 // 8, height // 4), fill="white")
+    for y in range(height * 3 // 5, height - 20, 6):
+        draw.line((width // 6, y, width // 2, y), fill="white")
+    img.save(path, "JPEG", quality=90)
+    return path
+
+
+class PhotoWindowTests(TkCase):
+    CAPTION = "EXCO1 · Rev C: Front photo"
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp(prefix="stripes-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.original_path = tall_photo(os.path.join(self.tmp, "EXCO1 front.jpg"))
+        self.preview = common.png_preview(self.original_path)
+        self.ref = FileRef(kind="front_photo", name="EXCO1 front.jpg", path="films/fm_1/files/abcd1234_EXCO1_front.jpg",
+                           sha256="ab" * 32, size=os.path.getsize(self.original_path))
+        self.found = self.original_path         # what share_path answers
+        self.asked = []                         # (rel, asked on the Tk thread)
+        self.bg = ThreadBackground()
+        self.services.bg = self.bg
+        self.services.data.share_path = self.share_path
+
+    def share_path(self, rel):
+        self.asked.append((rel, common.on_tk_thread()))
+        return self.found
+
+    def pump(self, until, timeout_s=10):
+        deadline = time.monotonic() + timeout_s
+        while not until():
+            if time.monotonic() > deadline:
+                self.fail("timed out")
+            self.root.update()
+            self.bg.pump()
+            time.sleep(0.01)
+
+    def open(self, png=None):
+        return common.PhotoWindow(self.root, self.services, png=self.preview if png is None else png,
+                                  caption=self.CAPTION, original=self.ref)
+
+    def settled(self, window):
+        """On screen, with the original in and fitted to the canvas as it is now."""
+        self.pump(lambda: window.winfo_viewable() and window.source == "original" and window._fit_timer is None
+                  and (window.full or window._fitted_for == window._canvas_size()))
+
+    def test_original_fitted_then_full_size(self):
+        window = self.open()
+        self.assertEqual(window.key, "photo:" + "ab" * 32)
+        self.assertIs(self.services.nav.windows[window.key], window)
+        self.assertEqual(window.title(), self.CAPTION)
+        # At first the preview, while the original loads; nothing was started in the constructor
+        self.assertEqual(window.source, "preview")
+        self.assertEqual(window.image.size, (180, 480))
+        self.assertTrue(window.zoom_button.instate(["disabled"]))
+        self.assertTrue(window.open_button.instate(["!disabled"]))
+        self.assertEqual(window.note_label.cget("text"), "Loading the original photo...")
+        self.assertEqual(self.asked, [])
+        self.settled(window)
+        # The original was found and read on a worker thread, never on the Tk thread
+        self.assertEqual(self.asked, [("templates/films/fm_1/files/abcd1234_EXCO1_front.jpg", False)])
+        self.assertEqual(window.image.size, (600, 1600))
+        self.assertEqual(window.note_label.cget("text"), "")
+        self.assertTrue(window.zoom_button.instate(["!disabled"]))
+        # Sized to the photo: a tall window, at most 90% of the screen, its buttons in view
+        _x, _y, screen_w, screen_h = common._primary_screen(window)
+        most_w, most_h = int(screen_w * common.PHOTO_SCREEN_SHARE), int(screen_h * common.PHOTO_SCREEN_SHARE)
+        self.assertLessEqual(window.winfo_width(), most_w)
+        self.assertLessEqual(window.winfo_height(), most_h)
+        self.assertGreater(window.winfo_height(), window.winfo_width())
+        for button in (window.close_button, window.zoom_button, window.open_button):
+            self.assertTrue(button.winfo_ismapped())
+            self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
+                                 window.winfo_rooty() + window.winfo_height())
+        # Fitted: as large as the canvas allows, its shape kept, larger than the 480 px preview
+        shown_w, shown_h = window.shown_size
+        canvas_w, canvas_h = window._canvas_size()
+        self.assertEqual((window.photo.width(), window.photo.height()), (shown_w, shown_h))
+        self.assertAlmostEqual(shown_w / shown_h, 600 / 1600, delta=0.01)
+        self.assertTrue(shown_w <= canvas_w and shown_h <= canvas_h and (shown_w == canvas_w or shown_h == canvas_h))
+        if most_h > 700:
+            self.assertGreater(shown_h, 480)
+        fitted = (window.winfo_width(), window.winfo_height())
+        # Full size: pixel for pixel on a canvas that scrolls, opened on the middle of the photo
+        window.zoom_button.invoke()
+        self.assertTrue(window.full)
+        self.assertEqual(window.zoom_button.cget("text"), "Fit to window")
+        self.assertEqual(window.note_label.cget("text"), "Drag the photo to move around it.")
+        self.assertEqual((window.photo.width(), window.photo.height()), (600, 1600))
+        self.assertEqual([float(v) for v in str(window.canvas.cget("scrollregion")).split()], [0, 0, 600, 1600])
+        self.assertEqual((window.xscroll.winfo_manager(), window.yscroll.winfo_manager()), ("grid", "grid"))
+        # The window grows to what the photo needs, still at most 90% of the screen
+        self.pump(lambda: window.winfo_width() > fitted[0])
+        self.assertLessEqual(window.winfo_width(), most_w)
+        self.assertLessEqual(window.winfo_height(), most_h)
+        self.settled(window)
+        top, bottom = window.canvas.yview()
+        self.assertTrue(0 < top < 0.5 < bottom < 1, (top, bottom))
+        # The wheel and a drag move around it
+        window.canvas.event_generate("<Button-5>")
+        self.assertGreater(window.canvas.yview()[0], top)
+        moved = window.canvas.yview()[0]
+        window._on_press(SimpleNamespace(x=100, y=300))
+        window._on_drag(SimpleNamespace(x=100, y=200))
+        self.assertGreater(window.canvas.yview()[0], moved)
+        # Back to fitted, at the size it had
+        window.zoom_button.invoke()
+        self.assertFalse(window.full)
+        self.assertEqual(window.zoom_button.cget("text"), "Full size")
+        self.assertEqual((window.xscroll.winfo_manager(), window.yscroll.winfo_manager()), ("", ""))
+        self.pump(lambda: (window.winfo_width(), window.winfo_height()) == fitted)
+        self.settled(window)
+        self.assertAlmostEqual(window.shown_size[0] / window.shown_size[1], 600 / 1600, delta=0.01)
+        # A double click opens full size on the point clicked: here the bottom of the photo
+        canvas_w, canvas_h = window._canvas_size()
+        shown_w, shown_h = window.shown_size
+        window._on_double(SimpleNamespace(x=canvas_w // 2, y=(canvas_h + shown_h) // 2 - 1))
+        self.assertTrue(window.full)
+        self.settled(window)
+        self.assertEqual(window.canvas.yview()[1], 1.0)
+        window._on_double(SimpleNamespace(x=0, y=0))
+        self.assertFalse(window.full)
+        # Its texts follow the language; the caption is data
+        i18n.set_language("es")
+        window.retranslate()
+        self.assertEqual(window.zoom_button.cget("text"), "Tamaño real")
+        self.assertEqual(window.open_button.cget("text"), "Abrir el archivo")
+        self.assertEqual(window.close_button.cget("text"), "Cerrar")
+        self.assertEqual(window.caption_label.cget("text"), self.CAPTION)
+
+    def test_preview_when_the_original_cant_be_read(self):
+        not_a_picture = os.path.join(self.tmp, "artwork.pdf")
+        with open(not_a_picture, "wb") as f:
+            f.write(b"%PDF-1.4\n% not a picture\n%%EOF\n")
+        for found in (None, not_a_picture, os.path.join(self.tmp, "gone.jpg")):
+            with self.subTest(found=found):
+                self.found = found
+                window = self.open()
+                self.pump(lambda: window.note_label.cget("text") != "Loading the original photo...")
+                self.assertEqual(window.note_label.cget("text"),
+                                 "Showing the preview: Stripes couldn't read the original photo.")
+                self.assertEqual(window.source, "preview")
+                self.assertEqual(window.image.size, (180, 480))
+                self.assertTrue(window.zoom_button.instate(["disabled"]))
+                window.toggle_zoom()                 # nothing to zoom into
+                self.assertFalse(window.full)
+                self.assertIsNotNone(window.photo)
+                window.destroy()
+
+    def test_unreadable_preview_then_the_original(self):
+        window = self.open(png=b"junk")
+        self.assertIsNone(window.photo)
+        self.assertEqual(window.picture_label.cget("text"), "No photo")
+        self.settled(window)
+        self.assertEqual(window.image.size, (600, 1600))
+        self.assertEqual(window.picture_label.winfo_manager(), "")
+        self.assertEqual(window.canvas.winfo_manager(), "grid")
+        # The window is sized again, for the original: a tall bag, a tall window
+        self.pump(lambda: window.winfo_height() > window.winfo_width())
+        self.settled(window)
+        self.assertAlmostEqual(window.shown_size[0] / window.shown_size[1], 600 / 1600, delta=0.01)
+
+    def test_open_the_file(self):
+        window = self.open()
+        self.settled(window)
+        self.asked.clear()
+        opened = []
+
+        def startfile(path):
+            opened.append((path, common.on_tk_thread()))
+
+        # Windows: the original opens in the PC's default viewer, from a worker thread
+        with mock.patch.object(common.hx_win, "is_windows", return_value=True), \
+                mock.patch.object(common.os, "startfile", side_effect=startfile, create=True):
+            window.open_button.invoke()
+            self.pump(lambda: opened)
+        self.assertEqual(opened, [(self.original_path, False)])
+        self.assertEqual(self.asked, [("templates/films/fm_1/files/abcd1234_EXCO1_front.jpg", False)])
+        # It can't be opened
+        with mock.patch.object(common.hx_win, "is_windows", return_value=True), \
+                mock.patch.object(common.os, "startfile", side_effect=OSError("No application is set"), create=True):
+            window.open_button.invoke()
+            self.pump(lambda: window.note_label.cget("text"))
+        self.assertEqual(window.note_label.cget("text"), "Stripes couldn't open the file: No application is set")
+        # Elsewhere it opens nothing and says where the file is
+        with mock.patch.object(common.hx_win, "is_windows", return_value=False), \
+                mock.patch.object(common.os, "startfile", create=True) as never:
+            window.open_button.invoke()
+            self.pump(lambda: "Windows only" in window.note_label.cget("text"))
+        never.assert_not_called()
+        self.assertEqual(window.note_label.cget("text"),
+                         f"Opening files works on Windows only. The file is at {self.original_path}.")
+        # No share
+        self.found = None
+        window.open_button.invoke()
+        self.pump(lambda: "reach the server" in window.note_label.cget("text"))
+        self.assertEqual(window.note_label.cget("text"),
+                         "Stripes can't reach the server, so the original can't be opened now.")
+
+    def test_show_photo_opens_one_window_per_photo(self):
+        first = common.show_photo(self.root, self.services, png=self.preview, caption=self.CAPTION, original=self.ref)
+        again = common.show_photo(self.root, self.services, png=self.preview, caption=self.CAPTION, original=self.ref)
+        self.assertIs(again, first)
+        other_ref = FileRef(kind="back_photo", name="EXCO1 back.jpg", path="films/fm_1/files/cdef5678_EXCO1_back.jpg",
+                            sha256="cd" * 32, size=1)
+        other = common.show_photo(self.root, self.services, png=self.preview, caption=self.CAPTION, original=other_ref)
+        self.assertIsNot(other, first)
+        self.assertEqual(len([w for w in common.open_windows() if isinstance(w, common.PhotoWindow)]), 2)
+        self.settled(first)
+        first.destroy()
+        self.assertNotIn("photo:" + "ab" * 32, self.services.nav.windows)
+        reopened = common.show_photo(self.root, self.services, png=self.preview, caption=self.CAPTION,
+                                     original=self.ref)
+        self.assertIsNot(reopened, first)
+        self.settled(reopened)
+        self.settled(other)
+
+
 class DialogTests(TkCase):
+    def setUp(self):
+        super().setUp()
+        self.timers = []
+
+    def tearDown(self):
+        # The 2 s safety timers of answer_with must not outlive the test (Tk would report them
+        # as invalid commands once this class's root is gone)
+        for timer in self.timers:
+            self.root.after_cancel(timer)
+        super().tearDown()
+
     def dialog(self):
         found = [w for w in self.root.winfo_children() if isinstance(w, common._AskDialog)]
         return found[0] if found else None
@@ -863,7 +1140,7 @@ class DialogTests(TkCase):
             self.texts_seen = (dialog.question_label.cget("text"), dialog.yes_button.cget("text"),
                                dialog.no_button.cget("text"), str(dialog.yes_button.cget("style")))
             action(dialog)
-            self.root.after(2000, lambda: dialog.winfo_exists() and dialog.destroy())
+            self.timers.append(self.root.after(2000, lambda: dialog.winfo_exists() and dialog.destroy()))
 
         self.root.after(10, go)
 

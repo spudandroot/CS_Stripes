@@ -131,10 +131,62 @@ class PureTests(unittest.TestCase):
         self.assertEqual(floor_layout(1920, 1080, 2).row_h, 251.0)       # never taller than a quarter
         self.assertAlmostEqual(floor_layout(1920, 1080, 20).row_h, 50.2)  # beyond 12 they keep shrinking
         self.assertEqual(lay.bar_w + lay.names_w + lay.origin_w + lay.status_w + lay.age_w, 1920)
-        self.assertEqual((lay.bar_w, lay.names_w, lay.origin_w, lay.status_w), (58, 326, 864, 480))
+        self.assertEqual((lay.width, lay.bar_w, lay.names_w, lay.origin_w, lay.status_w, lay.age_w),
+                         (1920, 48, 269, 845, 518, 240))
+        # 12 machines under 4 line headers, each band half a row: all fit, filling the room under the header
+        lay = floor_layout(1920, 1080, 12, 4)
+        self.assertAlmostEqual(lay.row_h, 71.71, places=2)
+        self.assertAlmostEqual(lay.group_h, 35.86, places=2)
+        self.assertEqual((lay.rows_h, lay.scrolls, lay.origin_px, lay.status_px, lay.machine_px, lay.line_px),
+                         (1004, False, 36, 22, 22, 22))
+        lay = floor_layout(1280, 800, 6, 2, scrollbar_w=15)
+        self.assertEqual((lay.header_h, lay.rows_h, lay.scrolls, lay.width), (56, 744, False, 1280))
+        self.assertAlmostEqual(lay.row_h, 106.29, places=2)
+        self.assertEqual((lay.bar_w, lay.names_w, lay.origin_w, lay.status_w, lay.age_w), (32, 179, 563, 346, 160))
+        # Rows stop shrinking at FLOOR_MIN_ROW_PX: the board scrolls, its rows narrower by the scrollbar
+        lay = floor_layout(1280, 800, 30, 5, scrollbar_w=15)
+        self.assertEqual((lay.row_h, lay.group_h, lay.rows_h, lay.scrolls, lay.width),
+                         (hx_ui_monitor.FLOOR_MIN_ROW_PX, 22.0, 1430, True, 1265))
+        self.assertEqual(lay.bar_w + lay.names_w + lay.origin_w + lay.status_w + lay.age_w, 1265)
         small = floor_layout(640, 360, 40)
+        self.assertTrue(small.scrolls)
         self.assertEqual((small.header_h, small.header_px, small.line_px, small.machine_px, small.origin_px,
-                          small.status_px, small.age_px), (48, 22, 8, 9, 10, 9, 8))
+                          small.status_px, small.age_px), (48, 22, 13, 13, 22, 13, 11))
+        self.assertEqual(floor_layout(800, 600, 0).rows_h, 0)
+
+    def test_fit_px(self):
+        def measure(px, t):
+            return px * len(t) / 2
+        fit = hx_ui_monitor.fit_px
+        # One size for all: the largest at which the widest fits
+        self.assertEqual(fit(["abcd", "abcdefgh"], measure, 40, 8, 100), 25)
+        self.assertEqual(fit(["abcd"], measure, 40, 8, 100), 40)                  # fits at the start size
+        self.assertEqual(fit(["abcdefgh" * 10], measure, 40, 8, 100), 8)          # never below smallest
+        self.assertEqual(fit(["abcdefgh" * 10], measure, 40, 1, 100), 2)          # as far as needed
+        self.assertEqual(fit(["", ""], measure, 40, 8, 1), 40)                    # nothing to fit
+        self.assertEqual(fit(["abcd", "abcdefgh"], measure, 7, 8, 1000), 7)       # smallest above start
+        calls = []
+        fit(["abcdefgh"] * 20, lambda px, t: calls.append(px) or measure(px, t), 120, 1, 100)
+        self.assertLess(len(calls), 10)                                            # each text and size once
+
+    def test_ellipsize(self):
+        ellipsize = hx_ui_monitor.ellipsize
+        self.assertEqual(ellipsize("Send not confirmed", len, 100), "Send not confirmed")
+        self.assertEqual(ellipsize("Send not confirmed", len, 18), "Send not confirmed")
+        self.assertEqual(ellipsize("Send not confirmed", len, 8), "Send no…")
+        self.assertEqual(ellipsize("Send not confirmed", len, 5), "Send…")         # no space before the ellipsis
+        self.assertEqual(ellipsize("Send not confirmed", len, 1), "…")
+        self.assertEqual(ellipsize("Send not confirmed", len, 0), "")
+
+    def test_short_name(self):
+        short = hx_ui_monitor.short_name
+        self.assertEqual(short("Line 1 Bagger 1", "Line 1"), "Bagger 1")
+        self.assertEqual(short("line 1 - Bagger 2", "Line 1"), "Bagger 2")       # any case, separators dropped
+        self.assertEqual(short("Line 10 Bagger 1", "Line 1"), "Line 10 Bagger 1")  # a whole word only
+        self.assertEqual(short("Bagger 3", "Line 1"), "Bagger 3")
+        self.assertEqual(short("Line 1", "Line 1", "B1"), "B1")                   # nothing left: the printed code
+        self.assertEqual(short("Line 1", "Line 1"), "Line 1")
+        self.assertEqual(short("Line 1 Bagger 1", ""), "Line 1 Bagger 1")
 
     def test_board_summary(self):
         b = board(line("ln_1", "Line 1", [view("mc_1", colour=RED), view("mc_2"), view("mc_3", colour=BLUE)]),
@@ -568,6 +620,41 @@ class LineBoardTests(UiCase):
             row.setup_button.invoke()
         open_admin.assert_called_once_with(page="machines", record_id="mc_1")
 
+    def test_row_closes_up_when_alerts_end(self):
+        # An emptied frame left packed keeps the height its last children gave it: when a
+        # machine's alerts end, its row must close up, not keep a blank gap
+        services = self.make()
+        lb = LineBoard(self.root, services)
+        quiet = board(line("ln_1", "Line 1", [view("mc_1")]))
+        lb.show(quiet)
+        self.root.update_idletasks()
+        row = lb.cards["ln_1"].rows["mc_1"]
+        plain_h = row.winfo_reqheight()
+        self.assertFalse(shown(row.alerts_frame))
+        self.assertFalse(shown(row.details_label))
+        failed = [alert("al_1", machine="mc_1"), alert("al_2", machine="mc_1", text="Ink out on {machine}")]
+        lb.show(board(line("ln_1", "Line 1", [view("mc_1", colour=RED, alerts=failed, needs_send=True,
+                                                   details=[Msg("Message {name} in slot {slot}.",
+                                                                {"name": "EXCO1", "slot": 9})])])))
+        self.root.update_idletasks()
+        self.assertIs(lb.cards["ln_1"].rows["mc_1"], row)                  # updated in place
+        self.assertTrue(shown(row.alerts_frame))
+        self.assertGreater(row.winfo_reqheight(), plain_h + row.alerts_frame.winfo_reqheight() - 1)
+        # Details, then alerts, then buttons
+        body = row.alerts_frame.master
+        self.assertEqual([w for w in body.pack_slaves() if w in (row.details_label, row.alerts_frame, row.buttons)],
+                         [row.details_label, row.alerts_frame, row.buttons])
+        lb.show(quiet)
+        self.root.update_idletasks()
+        self.assertFalse(shown(row.alerts_frame))
+        self.assertEqual(row.alert_labels, [])
+        self.assertEqual(row.winfo_reqheight(), plain_h)                    # no gap left behind
+        # Alerts again, then only the details go: the alerts stay above the buttons
+        lb.show(board(line("ln_1", "Line 1", [view("mc_1", colour=RED, alerts=failed[:1], needs_send=True)])))
+        self.assertEqual([w for w in body.pack_slaves() if w in (row.details_label, row.alerts_frame, row.buttons)],
+                         [row.alerts_frame, row.buttons])
+        lb.destroy()
+
     def test_not_monitored_and_empty(self):
         services = self.make()
         lb = LineBoard(self.root, services)
@@ -701,54 +788,86 @@ class FloorBoardTests(UiCase):
         d = view("mc_4", line="ln_2", origin="", name="Line 2 Bagger 4")
         return board(line("ln_1", "Line 1", [a, b]), line("ln_2", "Line 2", [c, d]))
 
-    def open(self, services, **kw):
+    def open(self, services, b=None, **kw):
         with mock.patch.object(hx_win, "monitors", return_value=kw.pop("monitors", [])):
             fb = FloorBoard(self.root, services, **kw)
-        fb.show(self.board())
+        fb.show(self.board() if b is None else b)
         self.root.update_idletasks()
         return fb
 
+    @staticmethod
+    def px(fb, item):
+        """The pixel size an item is drawn at."""
+        return int(re.search(r"-(\d+)", str(fb.canvas.itemcget(item, "font"))).group(1))
+
+    @staticmethod
+    def texts(canvas, items):
+        return {key: canvas.itemcget(item, "text") for key, item in items.items()}
+
     def test_floor_board(self):
         services = self.make()
-        fb = self.open(services, size="800x600")
-        self.assertEqual(fb.geometry_spec, "800x600+0+0")
+        fb = self.open(services, size="1280x800")
+        self.assertEqual(fb.geometry_spec, "1280x800+0+0")
         self.assertFalse(fb.full_screen)
         self.assertEqual(fb.title(), "MapleJet floor board")
         self.root.update()
-        self.assertTrue(fb.geometry().startswith("800x600"))
+        self.assertTrue(fb.geometry().startswith("1280x800"))
         c = fb.canvas
+        self.assertEqual(fb.header.itemcget(fb.title_item, "text"), "MapleJet floor board")
         self.assertEqual([r.machine_id for r in fb.rows], ["mc_1", "mc_2", "mc_3", "mc_4"])
-        self.assertEqual({mid: c.itemcget(item, "text") for mid, item in fb.origin_items.items()},
-                         {r.machine_id: r.origin_line for r in fb.rows})
+        # Rows grouped under their line's name; each machine shows its name without the line's
+        self.assertEqual(self.texts(c, fb.line_items), {"ln_1": "Line 1", "ln_2": "Line 2"})
+        self.assertEqual(self.texts(c, fb.name_items),
+                         {"mc_1": "Bagger 1", "mc_2": "Bagger 2", "mc_3": "Bagger 3", "mc_4": "Bagger 4"})
+        self.assertEqual(self.texts(c, fb.origin_items), {r.machine_id: r.origin_line for r in fb.rows})
         self.assertEqual(c.itemcget(fb.unknown_items["mc_4"], "text"), "(origin unknown)")
         self.assertEqual(list(fb.unknown_items), ["mc_4"])
         self.assertEqual(c.itemcget(fb.status_items["mc_1"], "text"), "Printing")
         self.assertEqual(c.itemcget(fb.status_items["mc_2"], "fill"), COLOUR_HEX[RED])
         self.assertEqual(c.itemcget(fb.age_items["mc_1"], "text"), "checked 2 s ago")
-        # NOT MONITORED: grey text, but the bar keeps its last colour
-        for items in (fb.origin_items, fb.status_items, fb.age_items):
+        # NOT MONITORED: grey text, but the bar keeps its last colour; its line has a machine
+        # still watched, so the line's name keeps its colour
+        for items in (fb.name_items, fb.origin_items, fb.status_items, fb.age_items):
             self.assertEqual(c.itemcget(items["mc_3"], "fill"), DIM_FG)
         self.assertEqual(c.itemcget(fb.bar_items["mc_3"], "fill"), COLOUR_HEX[AMBER])
+        self.assertEqual(c.itemcget(fb.line_items["ln_2"], "fill"), hx_ui_common.TEXT_FG)
         # The bar of a machine with an unacknowledged sound alert flashes; the others don't
         self.assertEqual(c.itemcget(fb.bar_items["mc_2"], "fill"), COLOUR_HEX[RED])
         fb.flash()
         self.assertEqual((c.itemcget(fb.bar_items["mc_2"], "fill"), fb.flash_on), (CARD_BG, False))
         self.assertEqual(c.itemcget(fb.bar_items["mc_1"], "fill"), COLOUR_HEX[GREEN])
+        fb.redraw()                                                     # a redraw keeps the beat
+        self.assertEqual(c.itemcget(fb.bar_items["mc_2"], "fill"), CARD_BG)
         fb.flash()
         self.assertEqual(c.itemcget(fb.bar_items["mc_2"], "fill"), COLOUR_HEX[RED])
-        # Layout from the canvas's size
-        self.assertEqual(fb.layout, floor_layout(800, 600, 4))
+        # Layout from the window's size: 4 machines under 2 line headers
+        self.assertEqual(fb.layout, floor_layout(1280, 800, 4, 2))
         # Acknowledge: shown to someone who may, while a floor alert rings; Refresh only standalone
         self.assertTrue(shown(fb.ack_button) and shown(fb.close_button))
         self.assertFalse(shown(fb.refresh_button))
         with mock.patch.object(services.watcher, "acknowledge") as ack:
             fb.ack_button.invoke()
         ack.assert_called_once_with(["al_f"])
+        # A line nobody checks: its name greyed out too
+        lost = view("mc_5", line="ln_3", colour=GREY, code="not_monitored", headline="NOT MONITORED",
+                    monitored=False, name="Line 3 Bagger 5")
+        fb.show(board(*self.board().lines, line("ln_3", "Line 3", [lost])))
+        self.assertEqual(c.itemcget(fb.line_items["ln_3"], "fill"), DIM_FG)
         fb.destroy()
         plain = self.make("akim", sender=False, admin=False)
         fb = self.open(plain)
         self.assertFalse(shown(fb.ack_button))
         self.assertTrue(shown(fb.close_button))
+
+    def test_printed_code_when_the_name_is_the_line_name(self):
+        services = self.make()
+        data = services.data.current
+        (mid, machine), = data.machines.items()
+        services.data.current = dataclasses.replace(data, machines={mid: dataclasses.replace(machine, name="Line 1")})
+        b = board(line(machine.line_id, "Line 1", [view(mid, line=machine.line_id, name="Line 1"),
+                                                   view("mc_x", line=machine.line_id, name="Line 1")]))
+        fb = self.open(services, b, size="1280x800")
+        self.assertEqual(self.texts(fb.canvas, fb.name_items), {mid: "B1", "mc_x": "Line 1"})   # no record: the name
 
     def test_screen_and_size(self):
         services = self.make()
@@ -767,13 +886,182 @@ class FloorBoardTests(UiCase):
         fb = self.open(services, monitors=mons, size="huge")
         self.assertTrue(fb.full_screen)
 
+    def check_rows(self, fb, size):
+        """Every row inside the room under the header, every text inside its column and its row,
+        and one size per column; returns the rows' (y0, y1)."""
+        c, lay = fb.canvas, fb.layout
+        width, height = (int(n) for n in size.split("x"))
+        self.assertEqual(fb.layout, floor_layout(width, height, len(fb.rows), len(fb.line_items),
+                                                 fb.scrollbar.winfo_reqwidth()))
+        columns = {"name": (lay.bar_w, lay.bar_w + lay.names_w)}
+        columns["origin"] = (columns["name"][1], columns["name"][1] + lay.origin_w)
+        columns["status"] = (columns["origin"][1], columns["origin"][1] + lay.status_w)
+        columns["age"] = (columns["status"][1], lay.width)
+        spans = []
+        for r in fb.rows:
+            mid = r.machine_id
+            x0, y0, x1, y1 = (round(float(v)) for v in c.coords(fb.bar_items[mid]))
+            self.assertEqual((x0, x1), (0, lay.bar_w))
+            spans.append((y0, y1))
+            items = {"name": fb.name_items[mid], "origin": fb.origin_items[mid], "status": fb.status_items[mid],
+                     "age": fb.age_items[mid]}
+            if mid in fb.unknown_items:
+                items["unknown"] = fb.unknown_items[mid]
+            for column, item in items.items():
+                if not c.itemcget(item, "text"):
+                    continue
+                left, right = columns["origin" if column == "unknown" else column]
+                bx0, by0, bx1, by1 = c.bbox(item)
+                with self.subTest(size=size, machine=mid, column=column):
+                    self.assertGreaterEqual(bx0, left)
+                    self.assertLessEqual(bx1, right)            # no overlap with the next column
+                    self.assertGreaterEqual(by0, y0)
+                    self.assertLessEqual(by1, y1)               # nothing wraps onto two lines
+                    self.assertEqual(float(c.itemcget(item, "width")), 0.0)
+        # One size per column on every row
+        for column, items in (("name", fb.name_items), ("origin", fb.origin_items), ("status", fb.status_items),
+                              ("age", fb.age_items)):
+            self.assertEqual({self.px(fb, i) for i in items.values()}, {fb.font_px[column]}, column)
+        # Rows don't overlap, and line headers sit between the lines
+        for (_, a1), (b0, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(a1, b0)
+        return spans
+
+    def big_board(self, lines, per_line):
+        out, k = [], 0
+        for li in range(1, lines + 1):
+            machines = []
+            for b in range(1, per_line + 1):
+                k += 1
+                colour = (GREEN, AMBER, RED, GREY)[k % 4]
+                machines.append(view(f"mc_{k:02d}", line=f"ln_{li}", name=f"Line {li} Bagger {b}", colour=colour,
+                                     headline=("Printing", "Send not confirmed", "TEST by EXAMPLE\\akim, step 12 of 40",
+                                               "Printer off")[k % 4],
+                                     origin=("Product of USA, Canada, and Mexico", "USA (pre-printed)",
+                                             "Product of Canada", "")[k % 4]))
+            out.append(line(f"ln_{li}", f"Line {li}", machines))
+        return board(*out)
+
+    def test_rows_fit_without_overlap(self):
+        # The screenshots' boards at the two screen sizes the floor PCs use: every row on screen,
+        # nothing wrapped, nothing running into the next column, one origin size
+        services = self.make()
+        screens = [hx_win.Monitor(0, 0, 0, 1920, 1080, True)]
+        six = board(line("ln_1", "Line 1", [view(f"mc_{i}", origin="Product of USA and Canada") for i in (1, 2, 3)]),
+                    line("ln_2", "Line 2", [
+                        view("mc_4", line="ln_2", name="Line 2 Bagger 1", colour=RED, code="left_red",
+                             headline="Left red by EXAMPLE\\jsmith", origin="Product of Mexico"),
+                        view("mc_5", line="ln_2", name="Line 2 Bagger 2", colour=AMBER, code="unconfirmed",
+                             headline="Send not confirmed", origin="Product of Mexico and USA"),
+                        view("mc_6", line="ln_2", name="Line 2 Bagger 3", colour=GREY, code="off",
+                             headline="Printer off", origin="", printing=False)]))
+        family = hx_ui_common.bag_font_family(self.root)
+        for size in ("1280x800", "1920x1080"):
+            for b in (six, self.big_board(4, 3)):
+                fb = self.open(services, b, size=size, monitors=screens)
+                self.root.update()
+                lay = fb.layout
+                self.assertFalse(lay.scrolls)
+                self.assertFalse(shown(fb.scrollbar))
+                spans = self.check_rows(fb, size)
+                self.assertLessEqual(spans[-1][1], fb.canvas.winfo_height())     # the last row isn't cut off
+                self.assertEqual(fb.canvas.winfo_height(), int(size.split("x")[1]) - lay.header_h)
+                # The origin size is the largest at which the widest origin fits its column
+                origins = [r.origin_line for r in fb.rows if r.origin_line]
+                room = lay.origin_w - 24
+                size_px = fb.font_px["origin"]
+                widest = max(fb._font(family, size_px, "bold").measure(o) for o in origins)
+                self.assertLessEqual(widest, room)
+                if size_px < lay.origin_px:
+                    self.assertGreater(max(fb._font(family, size_px + 1, "bold").measure(o) for o in origins), room)
+                self.assertGreaterEqual(size_px, 20)                              # and it reads from the floor
+                fb.destroy()
+
+    def test_one_origin_size_never_cut_short(self):
+        services = self.make()
+        long_origin = "Product of " + ", ".join(["USA", "Canada", "Mexico"] * 12) + ", and Peru"
+        b = board(line("ln_1", "Line 1", [view("mc_1", origin="Product of USA"), view("mc_2", origin=long_origin)]))
+        fb = self.open(services, b, size="1280x800")
+        c, lay = fb.canvas, fb.layout
+        family = hx_ui_common.bag_font_family(fb)
+        # Both origins at one size: the long one shrinks the short one too
+        self.assertEqual(self.px(fb, fb.origin_items["mc_1"]), self.px(fb, fb.origin_items["mc_2"]))
+        px = fb.font_px["origin"]
+        self.assertLess(px, lay.origin_px)
+        self.assertLessEqual(fb._font(family, px, "bold").measure(long_origin), lay.origin_w - 24)
+        self.assertGreater(fb._font(family, px + 1, "bold").measure(long_origin), lay.origin_w - 24)
+        # Never cut short, never wrapped
+        self.assertEqual(self.texts(c, fb.origin_items), {"mc_1": "Product of USA", "mc_2": long_origin})
+        self.check_rows(fb, "1280x800")
+        # Without the long origin the board's origins grow again
+        fb.show(board(line("ln_1", "Line 1", [view("mc_1", origin="Product of USA")])))
+        self.assertGreater(fb.font_px["origin"], px)
+
+    def test_long_names_and_statuses_get_an_ellipsis(self):
+        services = self.make()
+        status = "Send interrupted on FLOOR01: check the bags now, then send again from FLOOR02"
+        b = board(line("ln_1", "Line 1", [
+            view("mc_1", name="Line 1 Bagger 1 by the north loading dock door", headline=status,
+                 origin="Product of USA, Canada, and Mexico"),
+            view("mc_2")]))
+        fb = self.open(services, b, size="1280x800")
+        c = fb.canvas
+        name, shown_status = c.itemcget(fb.name_items["mc_1"], "text"), c.itemcget(fb.status_items["mc_1"], "text")
+        self.assertTrue(name.startswith("Bagger 1 ") and name.endswith("…"), name)
+        self.assertTrue(status.startswith(shown_status[:-1]) and shown_status.endswith("…"), shown_status)
+        self.assertEqual(c.itemcget(fb.status_items["mc_2"], "text"), "Printing")
+        self.assertEqual(c.itemcget(fb.origin_items["mc_1"], "text"), "Product of USA, Canada, and Mexico")
+        # They shrank as far as allowed first, the same on every row
+        self.assertEqual(fb.font_px["status"], min(16, fb.layout.status_px))
+        self.assertEqual(fb.font_px["name"], min(14, fb.layout.machine_px))
+        self.check_rows(fb, "1280x800")
+
+    def test_scrolls_when_the_rows_cannot_fit(self):
+        services = self.make()
+        fb = self.open(services, self.big_board(5, 6), size="1280x800")
+        self.root.update()
+        c, lay = fb.canvas, fb.layout
+        self.assertTrue(lay.scrolls)
+        self.assertTrue(shown(fb.scrollbar))
+        self.assertEqual(lay.row_h, hx_ui_monitor.FLOOR_MIN_ROW_PX)
+        self.assertEqual(c.winfo_width(), 1280 - fb.scrollbar.winfo_reqwidth())
+        self.assertEqual([float(v) for v in str(c.cget("scrollregion")).split()], [0, 0, lay.width, lay.rows_h])
+        spans = self.check_rows(fb, "1280x800")
+        self.assertGreater(spans[-1][1], c.winfo_height())                   # the last rows are below ...
+        self.assertEqual(c.yview()[0], 0.0)
+        fb._on_wheel(mock.Mock(num=5, delta=0))                              # ... and the wheel brings them up
+        fb._on_wheel(mock.Mock(num=0, delta=-240))
+        top = c.yview()[0]
+        self.assertGreater(top, 0.0)
+        fb.show(self.big_board(5, 6))                                        # a new board keeps the place
+        self.assertEqual(c.yview()[0], top)
+        c.yview_moveto(1.0)
+        self.root.update()
+        self.assertGreaterEqual(round(c.canvasy(c.winfo_height())), lay.rows_h)    # down to the last row
+        # Back to a board that fits: no scrollbar, from the top, the wheel does nothing
+        fb.show(self.board())
+        self.root.update()
+        self.assertFalse(fb.layout.scrolls)
+        self.assertFalse(shown(fb.scrollbar))
+        self.assertEqual(c.yview()[0], 0.0)
+        fb._on_wheel(mock.Mock(num=5, delta=0))
+        self.assertEqual(c.yview()[0], 0.0)
+
     def test_ages_tick_and_empty_board(self):
         services = self.make()
         services.clock = FakeClock()
-        fb = self.open(services, size="800x600")
+        fb = self.open(services, size="1280x800")
         services.clock.advance(4.0)
         fb.tick()
         self.assertEqual(fb.canvas.itemcget(fb.age_items["mc_1"], "text"), "checked 6 s ago")
+        # An age that outgrows its column before the next redraw is shortened, never run into the status
+        services.clock.advance(10 ** 9)
+        fb.tick()
+        age = fb.canvas.itemcget(fb.age_items["mc_1"], "text")
+        self.assertTrue(age.endswith("…") and age.startswith("checked"), age)
+        lay = fb.layout
+        self.assertGreaterEqual(fb.canvas.bbox(fb.age_items["mc_1"])[0],
+                                lay.bar_w + lay.names_w + lay.origin_w + lay.status_w)
         # An empty board: the next one is on its way while the settings have active lines
         fb.show(board())
         self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Checking...")
@@ -784,10 +1072,20 @@ class FloorBoardTests(UiCase):
         # Standalone: Refresh now, refused within refresh_now_min_s
         fb.show(board(standalone=True, share_ok=False, next_check_s=9.0))
         self.assertTrue(shown(fb.refresh_button))
+        self.assertEqual(fb.header.itemcget(fb.banner_item, "text"),
+                         "Server unreachable: showing this PC's own checks · next check in 9 s")
         with mock.patch.object(services.poller, "refresh_now", return_value=False):
             fb.refresh_button.invoke()
-        self.assertEqual(fb.canvas.itemcget(fb.banner_item, "text"),
+        self.assertEqual(fb.header.itemcget(fb.banner_item, "text"),
                          f"You can refresh once every {int(SCALED.refresh_now_min_s)} s.")
+        fb.destroy()
+        # The banner stops short of the buttons
+        fb = self.open(services, board(standalone=True, share_ok=False, next_check_s=9.0), size="800x600")
+        self.root.update()
+        h = fb.header
+        banner = h.itemcget(fb.banner_item, "text")
+        self.assertTrue(banner.endswith("…"), banner)
+        self.assertLess(h.bbox(fb.banner_item)[2], fb.refresh_button.winfo_x())
 
     def test_floor_board_while_the_settings_are_not_loaded(self):
         # The watcher's board while DataService.current is None (states.md §7 step 1): the
@@ -819,29 +1117,6 @@ class FloorBoardTests(UiCase):
         fb.show(self.board())
         self.assertIsNone(fb.message_item)
         self.assertEqual(len(fb.rows), 4)
-
-    def test_long_origin_shrinks_then_wraps(self):
-        services = self.make()
-        long_origin = "Product of " + ", ".join(["USA", "Canada", "Mexico"] * 12) + ", and Peru"
-        b = board(line("ln_1", "Line 1", [view("mc_1", origin="Product of USA"), view("mc_2", origin=long_origin)]))
-        with mock.patch.object(hx_win, "monitors", return_value=[]):
-            fb = FloorBoard(self.root, services, size="800x600")
-        fb.show(b)
-        c = fb.canvas
-
-        def px(mid):
-            return int(re.search(r"-(\d+)", c.itemcget(fb.origin_items[mid], "font")).group(1))
-        lay = fb.layout
-        room = lay.origin_w - 16
-        family = hx_ui_common.bag_font_family(fb)
-        short = px("mc_1")                                                       # the largest size that fits
-        self.assertLessEqual(fb._font(family, short, "bold").measure("Product of USA"), room)
-        if short < lay.origin_px:
-            self.assertGreater(fb._font(family, short + 1, "bold").measure("Product of USA"), room)
-        self.assertEqual(px("mc_2"), max(8, round(lay.origin_px * 0.4)))         # shrunk as far as allowed ...
-        self.assertEqual(int(float(c.itemcget(fb.origin_items["mc_2"], "width"))), lay.origin_w - 16)  # ... then wraps
-        self.assertEqual(int(float(c.itemcget(fb.origin_items["mc_1"], "width"))), 0)
-        self.assertEqual(c.itemcget(fb.origin_items["mc_2"], "text"), long_origin)    # never cut short
 
 
 class AlertSounderTests(UiCase):
@@ -1594,7 +1869,7 @@ class ServiceTests(UiCase):
         self.assertNotEqual(age, "checked 2 s ago")
         self.assertEqual(age, i18n.tr("checked {seconds} s ago", seconds=2))
         self.assertEqual(floor.canvas.itemcget(floor.status_items["mc_1"], "text"), "Imprimiendo")
-        self.assertEqual(floor.canvas.itemcget(floor.title_item, "text"), "Tablero de planta MapleJet")
+        self.assertEqual(floor.header.itemcget(floor.title_item, "text"), "Tablero de planta MapleJet")
         i18n.set_language("en")
         hx_ui.language_changed(services)
         self.assertEqual(tab.send_button.cget("text"), "Send...")

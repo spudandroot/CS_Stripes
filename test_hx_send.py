@@ -23,6 +23,7 @@ from unittest import mock
 import hx_fake
 import hx_send
 import hx_share
+import i18n
 from hx_core import CancelToken, EventBus, Msg
 from hx_fake import FakePrinter
 from hx_message import (NOTE_TEXTS, STEP_TEXTS, fingerprint, merge_plan, origin_from_design, plan_test,
@@ -48,12 +49,13 @@ FAST = dataclasses.replace(TIMINGS.scaled(0.02), http_timeout_s=0.25, web_repeat
 
 WRITES = ["TD", "CRTMSG", "CTDAT", "CTEXT", "CTEXT", "CPPARM", "SAVEMSG", "PRINTMSG", "PRINT"]
 GOLDEN_DELAY = [       # send.md §6.4
-    "<CRTMSG>EXCO1-PKO01-MN6D-L9</CRTMSG>",
+    "<CRTMSG>EXCO1-PKO01-FDNP-H9</CRTMSG>",
     "<CTDAT><OBJID>10001</OBJID><POS>0,0</POS><MARG>0,0</MARG><FONTIND>2</FONTIND><SIZE>4</SIZE>"
     "<PREF>Packed on </PREF><FRMT>M/D/y</FRMT><DAY>0</DAY><MON>0</MON><YEAR>0</YEAR></CTDAT>",
     "<CTEXT><OBJID>10002</OBJID><XRID>10001</XRID><YRID>10001</YRID><SXAS>1</SXAS><SYAS>0</SYAS><MARG>0,0</MARG>"
     "<FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Product of USA and Canada</TXT></CTEXT>",
-    "<CTEXT><OBJID>10003</OBJID><XRID>10002</XRID><YRID>10002</YRID><SXAS>0</SXAS><SYAS>1</SYAS><MARG>0,0</MARG>"
+    # the lot is right of the origin with gap 0: it is sent SIDE_GAP_MIN (8) away, never touching it
+    "<CTEXT><OBJID>10003</OBJID><XRID>10002</XRID><YRID>10002</YRID><SXAS>0</SXAS><SYAS>1</SYAS><MARG>8,0</MARG>"
     "<FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Lot 4417</TXT></CTEXT>",
     "<CPPARM><ENCST>0</ENCST><DELAY>480000</DELAY><PRNSPD>2400</PRNSPD><ROTAT>0</ROTAT><MIRR>0</MIRR>"
     "<RESMOD>0</RESMOD><BOLD>1</BOLD><WDTH>1</WDTH><QUANT>1</QUANT><REVRS>0</REVRS><AUTREP>0</AUTREP></CPPARM>",
@@ -100,6 +102,24 @@ def dlymm(fake):
 
 def change_lot(body):
     return body.replace(b"<TXT>Lot 4417</TXT>", b"<TXT>Lot 4418</TXT>")
+
+
+def change_lot_and_origin(body):
+    return change_lot(body).replace(b"<TXT>Product of USA and Canada</TXT>", b"<TXT>Product of USA and Mexico</TXT>")
+
+
+# A record id in a text people read: "mc_5d1e2f3a4b", "ln_missing"
+ID_TEXT = re.compile(r"\b(?:mc|ln|pr|fm|pt|pd|sd|tp|ac)_\w+")
+
+
+def spanish(msg):
+    """The Msg as a Spanish screen shows it, nested Msgs included."""
+    values = {k: spanish(v) if isinstance(v, Msg) else v for k, v in msg.values.items()}
+    i18n.set_language("es")
+    try:
+        return i18n.tr(msg.text, **values)
+    finally:
+        i18n.set_language("en")
 
 
 def change_date(body):
@@ -286,7 +306,7 @@ class SendTests(Base):
         r = result.machines[0]
         self.assertEqual((r.colour, r.ok, r.step, r.msg, r.after_switch, r.notes), (AMBER, True, STEP_CONFIRM_2,
                                                                                     None, True, []))
-        self.assertEqual((r.slot, r.message_name, r.content_code), (9, "EXCO1-PKO01-MN6D-L9", "MN6D"))
+        self.assertEqual((r.slot, r.message_name, r.content_code), (9, "EXCO1-PKO01-FDNP-H9", "FDNP"))
         self.assertEqual(r.origin_line, "Product of USA and Canada")
         self.assertEqual(fake.writes, WRITES)
         self.assertEqual(apcmds(fake)[1:7], GOLDEN_DELAY)
@@ -353,7 +373,7 @@ class SendTests(Base):
         result, _, _ = self.send(pc)
         r = result.machines[0]
         self.assertTrue(r.ok)
-        self.assertEqual(r.message_name, "EXCO1-PKO01-5E11-W9")
+        self.assertEqual(r.message_name, "EXCO1-PKO01-G79S-N9")
         self.assertTrue(apcmds(fake)[5].startswith("<CPPARM><ENCST>1</ENCST><DLYMM>348</DLYMM><PRNSPD>2400</PRNSPD>"))
         fake.print_bags(1)
         self.assertEqual(fake.printed[-1]["position_mm"], 348)
@@ -459,6 +479,10 @@ class SendTests(Base):
                 rows = hx_send.failure_rows(result, plan)
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0].after_switch_text is not None, after)
+                # The red window names the machine and line, never their ids
+                shown = [r.msg.english(), spanish(r.msg), rows[0].machine_name, rows[0].line_name]
+                self.assertEqual((rows[0].machine_name, rows[0].line_name), ("Line 1 Bagger 1", "Line 1"))
+                self.assertEqual([t for t in shown if ID_TEXT.search(t)], [])
                 self.assertEqual(self.lock_files(), [])
                 self.assertClean(fake)
 
@@ -771,7 +795,7 @@ class SendTests(Base):
         self.assertEqual(pending.fingerprint, fingerprint(r.readbacks[0]))
         self.assertEqual((pending.previous_message_name, pending.previous_fingerprint), ("", r.previous.fingerprint))
         self.assertEqual((pending.origin_line, pending.content_code, pending.failure), ("Product of USA and Canada",
-                                                                                      "MN6D", None))
+                                                                                      "FDNP", None))
         e = pc.store.read_expected(mid)
         self.assertEqual((e.mode, e.fingerprint), ("running", pending.fingerprint))
         self.assertClean(fake)
@@ -1220,6 +1244,27 @@ class FailureTests(Base):
         self.assertIn(("item 3 (CTEXT)", "TXT", "Lot 4417", "Lot 4418"),
                       [(d.where, d.field, d.sent, d.read) for d in row.differences])
         self.assertEqual(row.msg, result.machines[0].msg)
+        self.assertEqual(row.msg.english(),
+                         "The message read back from Line 1 Bagger 1 differs from what was sent (1 difference).")
+        self.assertEqual(spanish(row.msg), "El mensaje leído de Line 1 Bagger 1 difiere de lo enviado (1 diferencia).")
+        # A machine missing from the plan still shows, by a name and never by its id
+        unknown = hx_send.failure_rows(result, plan.restricted([]))[0]
+        self.assertEqual((unknown.machine_id, unknown.machine_name, unknown.line_name),
+                         (self.mid(), "Unknown machine", ""))
+        i18n.set_language("es")
+        try:
+            self.assertEqual(hx_send.failure_rows(result, plan.restricted([]))[0].machine_name, "Máquina desconocida")
+        finally:
+            i18n.set_language("en")
+        # Two differences: the plural
+        hook_load(fake, 9, 1, change_lot_and_origin)
+        result, plan, _ = self.send(pc)
+        row = hx_send.failure_rows(result, plan)[0]
+        self.assertEqual((row.step, len(row.differences)), (STEP_VERIFY_IDLE, 2))
+        self.assertEqual(row.msg.english(),
+                         "The message read back from Line 1 Bagger 1 differs from what was sent (2 differences).")
+        self.assertEqual(spanish(row.msg),
+                         "El mensaje leído de Line 1 Bagger 1 difiere de lo enviado (2 diferencias).")
         # After the switch: the warning text and the previous picture
         fake.web_reply_hook = None
         fake.override("PRINTMSG", FakePrinter.DROP)
@@ -1270,6 +1315,13 @@ class FailureTests(Base):
         self.assertEqual((entry["machine_ids"], entry["reread_token"]), ([mid], e.reread_token))
         with self.assertRaises(NotAllowed):
             self.pc("nobody", sender=False).pipeline.leave_it(result.send_id, [mid])
+        # A machine the records no longer have can't be updated, and the text doesn't show its id
+        with self.assertRaises(ShareError) as cm:
+            pc.pipeline.leave_it(result.send_id, [mid, "mc_0123456789"])
+        self.assertEqual(cm.exception.msg.english(), "Your answer was logged, but Stripes couldn't update the monitor.")
+        self.assertEqual(spanish(cm.exception.msg),
+                         "Su respuesta quedó registrada, pero Stripes no pudo actualizar el monitor.")
+        self.assertEqual(pc.store.read_expected(mid).left_by, "EXAMPLE\\jsmith")
         self.assertClean()
 
 
@@ -1360,6 +1412,20 @@ class ActionTests(Base):
         self.assertEqual((resumed.machines[0].ok, resumed.machines[0].msg), (False, check.msg))
         self.assertFalse(w.printers[0].printing)
         self.assertClean()
+
+    def test_lock_held_names_the_machine_without_its_line(self):
+        # A sender's lock names the line; a line the records no longer have falls back to the machine's
+        # name, never to an empty name or an id
+        self.world()
+        pc = self.pc()
+        self.hold_lock(self.pc("akim"))
+        result = pc.actions.stop([self.mid()], lambda e: None)
+        self.assertEqual(result.machines[0].msg.english(), "Line 1 is being sent by EXAMPLE\\akim.")
+        del pc.data.current.lines[self.w.ids["line"]]
+        result = pc.actions.stop([self.mid()], lambda e: None)
+        self.assertEqual(result.machines[0].msg.english(), "Line 1 Bagger 1 is being sent by EXAMPLE\\akim.")
+        self.assertEqual(spanish(result.machines[0].msg), "EXAMPLE\\akim está enviando a Line 1 Bagger 1.")
+        self.assertUntouched()
 
     def test_not_a_sender(self):
         self.world()
@@ -1537,7 +1603,7 @@ class TestPrintTests(Base):
                                                                                       bag_counter="none"))
         plan = self.plan(admin, TestRanges(vary="delay", start=470, stop=480, step=10))
         self.assertTrue(plan.timed)
-        plan.base.machine.seconds_per_bag = 0.02            # 0.1 s a step
+        plan.base.machine.seconds_per_bag = 0.04            # 0.2 s a step
         events = []
         result = admin.print_run(plan).run(events.append)
         self.assertEqual((result.ok, result.steps_done), (True, 2))
@@ -1547,7 +1613,9 @@ class TestPrintTests(Base):
             printing = [e for e in test_events if e.status == "printing" and e.step_index == k]
             done = [e for e in test_events if e.status == "ok" and e.step_index == k]
             self.assertEqual([e.bags for e in printing], [None])
-            self.assertGreaterEqual(done[0].at - printing[0].at, 0.08)
+            # The step's time runs from before its expected-state and lock writes, which the "printing"
+            # event follows: a loaded machine can spend tens of ms on them, so allow 50 ms
+            self.assertGreaterEqual(done[0].at - printing[0].at, 0.15)
         self.assertClean(fake)
 
     def test_stop_test(self):
@@ -1924,7 +1992,7 @@ class TestPrintTests(Base):
 class LogTests(unittest.TestCase):
     def test_design_round_trip(self):
         from hx_model import DesignItem, MessageDesign
-        design = MessageDesign(slot=9, name="EXCO1-PKO01-MN6D-L9", empty=False,
+        design = MessageDesign(slot=9, name="EXCO1-PKO01-FDNP-H9", empty=False,
                                items=[DesignItem(tag="CTEXT", pairs=[("TXT", "Lot 4417"), ("LANG", "4")])],
                                settings={"PRNSPD": "2400"}, width=256, height=160, black_pixels=12,
                                preview_bmp=b"BM\x00\x01", read_at=1.5, tn="42", xid=3)

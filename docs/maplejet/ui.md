@@ -121,7 +121,10 @@ class PictureView(tk.Canvas):                       # architecture §6.10, compl
 
 def bmp_to_image(bmp: bytes) -> "PIL.Image.Image"   # architecture §6.10
 def png_preview(path: str) -> bytes | None          # §11.7.6; None when Pillow can't open the file
-def photo_from_png(master, png: bytes) -> "ImageTk.PhotoImage"
+def photo_from_png(master, png: bytes, *, height: int | None = None,
+                   box: tuple[int, int] | None = None) -> "ImageTk.PhotoImage"
+    # scaled to height, or to fit inside box (width, height); either way its shape is kept
+def fit_size(size: tuple[int, int], box: tuple[int, int]) -> tuple[int, int]   # size scaled to fit box
 def alert_wav_bytes() -> bytes                      # §9.4: the exact bytes of assets/alert.wav
 
 class Scroller(ttk.Frame):
@@ -175,8 +178,18 @@ class HxSettings:                                   # architecture §6.10; field
     MIN_WINDOW = (640, 360)
     def size_tuple(self) -> tuple[int, int] | None: ...   # None for "full"
 
-class PhotoWindow(HxWindow):                        # a film photo, larger (Send window and film editor)
-    def __init__(self, master, services, *, png: bytes, caption: str): ...   # caption is data, not translated
+PHOTO_SCREEN_SHARE = 0.9                            # PhotoWindow: at most 90% of the screen's width and height
+
+class PhotoWindow(HxWindow):                        # a film photo, large (Send window and film editor), §5.11
+    def __init__(self, master, services, *, png: bytes, caption: str,
+                 original: FileRef | None = None): ...   # caption is data, not translated
+    # key f"photo:{original.sha256}" when original is given
+    def toggle_zoom(self, focus: tuple[float, float] = (0.5, 0.5)) -> None: ...
+    def open_file(self) -> None: ...
+    source: str                                     # "preview" | "original"
+    full: bool                                      # True: full size; False: fitted to the window
+def show_photo(master, services, *, png: bytes, caption: str,
+               original: FileRef | None = None) -> PhotoWindow   # shows the photo's open window instead, if any
 ```
 
 ### 1.2 hx_ui_send
@@ -187,6 +200,11 @@ def origin_preview(film: Film, countries: list[str]) -> str
     # the origin line the Send window shows before the plan can be merged: film.origin_preprinted ->
     # f"{film.preprinted_origin} (pre-printed)"; else hx_message.origin_phrase(countries) when countries
     # isn't empty; else "". A test asserts it equals MachinePlan.origin_line for the same choice.
+def placement_text(position: PositionWorking) -> Msg
+    # what a sender reads (§5.4): "Delay {ms} ms" (ms = position.sent / 1000) on a delay machine,
+    # "Print position {mm} mm" (mm = film_value + adjustment, from the bag's bottom edge) on an encoder one
+def sorted_films(films: list[Film]) -> list[Film]   # by natural_key(code), natural_key(artwork_revision), id
+THUMB_BOX = (100, 150)                              # film photo thumbnails fit this box (width, height)
 def run_send(master, services, plan: SendPlan) -> "SendWindow | None"
     # Try again (§5.9): through the Navigator's one Send window; None when it couldn't start
 
@@ -231,15 +249,19 @@ class SetClocksDialog(HxWindow):                    # key "clocks:" + ",".join(s
 ```python
 ES: dict[str, str]                                  # §16.3
 FLOOR_MIN_ROWS = 4                                  # a floor-board row is never taller than 1/4 of the rows area
+FLOOR_MIN_ROW_PX = 44                               # nor shorter than this: past it the floor board scrolls
+FLOOR_GROUP_SHARE = 0.5                             # a line's band is half a row tall
 FLOOR_FLASH_MS = 1000
 
 @dataclass(frozen=True, kw_only=True)
 class FloorLayout:
-    header_h: int
-    row_h: float
+    width: int; header_h: int; group_h: float; row_h: float; rows_h: int; scrolls: bool
     bar_w: int; names_w: int; origin_w: int; status_w: int; age_w: int
     header_px: int; line_px: int; machine_px: int; origin_px: int; status_px: int; age_px: int
-def floor_layout(width: int, height: int, rows: int) -> FloorLayout   # §10.3; pure
+def floor_layout(width: int, height: int, rows: int, lines: int = 0, scrollbar_w: int = 0) -> FloorLayout  # §10.3; pure
+def fit_px(texts, measure, start: int, smallest: int, room: float) -> int   # §10.3; pure
+def ellipsize(value: str, measure, room: float) -> str                    # §10.3; pure, never on bag text
+def short_name(machine_name: str, line_name: str, code: str = "") -> str  # §10.3; pure
 def board_summary(board: BoardView) -> list[Msg]    # "{n} red" ... by colour, worst first, non-zero only
 
 class LineBoard(ttk.Frame):                         # architecture; §9.1
@@ -357,7 +379,7 @@ is added to `i18n.ES` by architecture §10.6; the UI modules use the same pair.
    | `PrinterActions.stop`, `check_resume`, `resume`, `set_clocks`; `TestPrintRun.run` | every `hx_message`, `hx_state`, `hx_model` function and the pure helpers of §1.4 |
    | `TimeSource.now(fresh=True)`; `hx_win.lookup_group_sid` | `hx_win.current_identity` (at start-up), `monitors`, `play_alert`, `stop_alert` |
    | `LocalStore` calls, except `HxSettings.load` at start-up (storage.md §7.1 rule 5) | `HxSettings.load` in `make_services` |
-   | `HxSettings.save`; `png_preview`; opening an original file (`os.startfile`) | `photo_from_png`, `bmp_to_image` (Pillow on bytes already in memory) |
+   | `HxSettings.save`; `png_preview`; reading an original photo for `PhotoWindow`; opening an original file (`os.startfile`) | `photo_from_png`, `bmp_to_image` (Pillow on bytes already in memory), `PhotoImage`s of a picture already read |
 
 3. Short blocking work goes through `services.bg.run(work, done)`: `work` runs on a worker thread and
    must not touch Tk; `done(result, error)` runs on the Tk thread and starts with
@@ -493,7 +515,8 @@ sizes (negative Tk sizes, §10.3). Colours for states are always `COLOUR_HEX[vie
    | `AdminWindow` | 1180x820 | 900x600 |
    | `TestPrintWindow`, `CalibrationWindow` | 1000x760 | 760x560 |
    | `AlertPopup` | 520x320 | 420x240 |
-   | `UserSettingsDialog`, `AdjustmentDialog`, `PhotoWindow` | 480x320 / 480x300 / 560x560 | |
+   | `UserSettingsDialog`, `AdjustmentDialog` | 480x320 / 480x300 | |
+   | `PhotoWindow` | sized to the photo, at most 90% of the screen (§5.11) | 320x240 |
 
 4. Windows open centred on the main window when it is visible, else on the primary screen.
 5. A window that is running something refuses a plain close: its `close()` explains or asks (each
@@ -772,8 +795,14 @@ the plan's order; a row is shown only when the one before it has a value.
 ┌ Line 1 ────────────────────────────────────────────────────────────────────────────────────┐
 │ 1 Machines    [x] Line 1 Bagger 1  Printing             [x] Line 1 Bagger 2  Printer off   │  machine_vars
 │ 2 Product     [Example Co 2lb Onion                         v]                              │  product_box
-│ 3 Film        (•) EXCO1 · Rev C   Code on the back of the bag    [front 96px] [back 96px]   │  film_var, film_radios
-│               ( ) EXCO2 · Rev D   Code on the front of the bag   [front]      No photo      │
+│ 3 Film                                                                                      │
+│   ┏━━━━━━━━━━━━━━━━━━━━━━━┓ ┌───────────────────────┐ ┌───────────────────────┐             │  film_cards (the chosen
+│   ┃(•) EXCO1 · Rev C      ┃ │( ) EXCO2 · Rev D      │ │( ) EXCO3 · Rev A      │             │  one has a blue border)
+│   ┃Code on the back of the┃ │Code on the front of   │ │Code on the back of the│             │  film_var, film_radios
+│   ┃bag                    ┃ │the bag                │ │bag                    │             │
+│   ┃[front    ] [back     ]┃ │[front    ]  No photo  │ │ No photo    No photo  │             │  thumbs, each in a
+│   ┃[100x150  ] [100x150  ]┃ │[100x150  ]            │ │                       │             │  100x150 box
+│   ┗━━━━━━━━━━━━━━━━━━━━━━━┛ └───────────────────────┘ └───────────────────────┘             │
 │ 4 Print text  [Packed on + origin                           v]                              │  print_text_box
 │ 5 Lot         [4417      ]  (4 to 8 digits)                                                 │  lot_entry
 │   Countries, in the order they print:                                                       │
@@ -787,7 +816,8 @@ the plan's order; a row is shown only when the one before it has a value.
 │   {Product of USA and Canada}                                       BagText 20 bold         │  origin_text
 │   Line 1 Bagger 1   {USA → USA and Canada} (highlighted)                                    │  change_texts[mid]
 │                     Prints: {Packed on 10/29/26 / Product of USA and CanadaLot 4417}        │  bag_texts[mid]
-│                     (150 - 412 + 0) mod 610 = 348 mm                                        │  position_labels[mid]
+│                     Print position 150 mm   (150 - 412 + 0) mod 610 = 348 mm                │  position_labels[mid],
+│                                             (administrators only)                           │  working_labels[mid]
 │                     ! The print would still be running when the film stops ...              │  warning_labels[mid]
 │   Line 1 Bagger 2   Same origin as now.                                                     │
 │                     Prints: {...}                                                           │
@@ -803,17 +833,27 @@ the plan's order; a row is shown only when the one before it has a value.
    `hx_message.films_for_line(line, product_id, data)`, sorted by `natural_key(name)`, shown by name.
    None at all: the row shows "No films are ready for this line's cartridge type." instead. Choosing a
    product clears the film and the print text.
-3. **Film.** One row per film of `films_for_line(line, product_id, data)` (their order):
+3. **Film.** The heading "Film" on its own row, then one card per film of `films_for_line(line,
+   product_id, data)`, ordered as the admin list orders them, by code, then artwork revision
+   (`sorted_films`). The cards (`film_cards[film_id]`, a `tk.Frame` with a 2 px border, `COLOUR_HEX[BLUE]`
+   for the chosen film and `DIM_FG` for the others) sit in a grid that takes the block's whole width
+   (indented 20 px) and wraps: as many cards to a row as fit, all as wide as each other, so four films
+   sit side by side in the 1000x780 window and the print text, lot, countries and origin stay in view.
+   Each card holds:
    - a `ttk.Radiobutton` with variable `film_var` (value = film id, initially `""`: no film is
      pre-selected, plan), text `f"{film.code} · {film.artwork_revision}"` (data; just the code when the
      revision is empty);
-   - "Code on the back of the bag" / "Code on the front of the bag" (`film.side`);
-   - the front and back photo thumbnails: the film's last `FileRef` of kind `front_photo` and of kind
-     `back_photo`. Each is a `ttk.Label` with a `PhotoImage` 96 px tall made by `photo_from_png` from
-     `data.preview_bytes(film_id, sha256)` (one `bg.run` per photo, started when the row is built).
-     Missing or unreadable: "No photo" (`Muted.TLabel`). Clicking a thumbnail opens `PhotoWindow`
-     with the same PNG and the caption `f"{film.code} · {film.artwork_revision}: "` + the translated
-     kind (§16.1 "Front photo"/"Back photo").
+   - "Code on the back of the bag" / "Code on the front of the bag" (`film.side`, `Muted.TLabel`, wrapped
+     to the card's width). Clicking the card or this text picks the film too;
+   - the front and back photo thumbnails side by side: the film's last `FileRef` of kind `front_photo` and
+     of kind `back_photo`. Each is a `ttk.Label` centred in a fixed `THUMB_BOX` (100x150) frame, with a
+     `PhotoImage` made by `photo_from_png(..., box=THUMB_BOX)` from `data.preview_bytes(film_id, sha256)`
+     (one `bg.run` per photo, started when the cards are built): a tall bag photo is 150 px tall, and
+     every photo keeps its shape. Missing or unreadable: "No photo" (`Muted.TLabel`) in the same box. A
+     load that finishes after the cards were built again is ignored. Clicking a thumbnail calls
+     `show_photo` with the same PNG, the photo's `FileRef` as `original` and the caption
+     `f"{film.code} · {film.artwork_revision}: "` + the translated kind (§16.1 "Front photo"/"Back
+     photo"); a second click shows the window already open (§5.11).
    Choosing a film sets the print text to `film.default_print_text_id` when it is in the offered list
    (plan: "the print text defaults to the film's"), else to none, and clears the countries when the
    film is pre-printed.
@@ -854,7 +894,8 @@ the plan's order; a row is shown only when the one before it has a value.
    | `change_texts[mid]` (`BagText` 11 bold, background `HIGHLIGHT_BG`) | `origin_change_text(view.origin_line, plan.origin_line)` when it isn't `""` and `view.origin_line` isn't `""` (plan: "USA → USA and Canada") |
    | instead, a `Muted.TLabel` | "Same origin as now." when the change text is `""`; "(origin unknown) →" followed by a highlighted `BagText` with the new origin when `view.origin_line` is `""` |
    | `bag_texts[mid]` (`BagText` 11, `wrap_px` 620) after "Prints:" | `plan.bag_text` |
-   | `position_labels[mid]` (`Muted.TLabel`) | `plan.position.text` (English working, shown as data) |
+   | `position_labels[mid]` (`Hx.Small.TLabel`) | `text(placement_text(plan.position))`: "Delay 480 ms" on a delay machine (the machine's adjustment included), "Print position 150 mm" on an encoder one. Senders don't need the arithmetic |
+   | `working_labels[mid]` (`Hx.Small.TLabel`, after it; administrators only, `roles(services).admin`) | `plan.position.text`, the English working (data): "480 + 0 = 480 ms = 480000 µs", "(150 - 412 + 0) mod 610 = 348 mm" |
    | `warning_labels[mid]` (`Warn.TLabel`, one per warning) | `text(w)` for each `plan.warnings` (film-stop warning, "Print length unknown: ...") |
 
    `view` is that machine's `MachineView` in `watcher.latest` (None: treated as origin `""`). A
@@ -1006,10 +1047,63 @@ problem during the Send. Check each machine's card on the MapleJet tab." and `te
 with `mark_label`, `step_label`, `msg_label`, `picture`).
 
 `LineBlock`: `line`, `machine_vars`, `product_box`, `film_var`, `film_radios: dict[str,
-ttk.Radiobutton]`, `thumbs: dict[tuple[str, str], ttk.Label]` (film id, kind), `print_text_box`,
-`lot_entry`, `country_list`, `country_box`, `add_country_button`, `countries`, `free_entries`,
-`origin_text`, `change_texts`, `bag_texts`, `position_labels`, `warning_labels`, `problems_label`,
-`unticked_warnings: dict[str, tk.Frame]` (machine id), `two_origins_var`, `trial: SendPlan | None`.
+ttk.Radiobutton]`, `film_cards: dict[str, tk.Frame]` (film id, in the order shown), `thumbs:
+dict[tuple[str, str], ttk.Label]` (film id, kind), `print_text_box`, `lot_entry`, `country_list`,
+`country_box`, `add_country_button`, `countries`, `free_entries`, `origin_text`, `change_texts`,
+`bag_texts`, `position_labels`, `working_labels` (administrators only), `warning_labels`,
+`problems_label`, `unticked_warnings: dict[str, tk.Frame]` (machine id), `two_origins_var`, `trial:
+SendPlan | None`.
+
+### 5.11 PhotoWindow: a film photo, large
+
+`PhotoWindow(master, services, png=..., caption=..., original=FileRef | None)` shows a film photo so the
+sender can tell films apart and read the small print (a nutrition panel, a barcode). The caption is data
+and is also the window title.
+
+```
+┌ EXCO1 · Rev C: Front photo ─────────────┐
+│ EXCO1 · Rev C: Front photo  (Hx.Section) │  caption_label
+│ ┌──────────────────────────────────────┐ │
+│ │ {the photo, fitted to the window}    │ │  canvas (scroll bars at full size only)
+│ └──────────────────────────────────────┘ │
+│ Loading the original photo...  (Muted)   │  note_label
+│ [Full size] [Open the file]      [Close] │  zoom_button, open_button, close_button
+└──────────────────────────────────────────┘
+```
+
+1. **Size.** It opens at once with the PNG preview it was given, sized to the photo and at most
+   `PHOTO_SCREEN_SHARE` (90%) of the primary screen's width and height. The buttons and the note are
+   packed before the picture, so a small window squeezes the picture and never hides Close. With an
+   `original`, the picture fills that room (the preview has the original's shape, so nothing moves when
+   the original arrives); without one (the film editor's `PhotoWindow`), the preview is shown no larger
+   than it is, and the zoom and open buttons aren't shown. Resizing the window fits the picture again,
+   100 ms after the last change.
+2. **The original.** With an `original`, `after(0)` starts one `bg.run`: on the worker thread,
+   `data.share_path("templates/" + original.path)`, then Pillow opens it, `ImageOps.exif_transpose` (as
+   the preview was made), `convert("RGB")` unless it is RGB or L, and a copy shrunk to the screen for
+   fitting. Nothing of this touches Tk or runs on the Tk thread. Until it is in, the preview shows with
+   "Loading the original photo..." and `zoom_button` disabled. No path (no share), a missing file or a file
+   Pillow can't read (an artwork PDF): the preview stays, with "Showing the preview: Stripes couldn't read
+   the original photo." (`Warn.TLabel`). There is no local copy of originals: each PC caches previews only
+   (storage.md §7.3).
+3. **Fit and full size.** Fitted, the picture is scaled to the canvas keeping its shape (`fit_size`,
+   Lanczos) and centred. `zoom_button` "Full size" (or a double click on the picture, which opens full size
+   on the point clicked) shows the original pixel for pixel on a canvas with both scroll bars, opened on the
+   middle of the photo; the window grows to what the photo needs, still at most 90% of the screen. The
+   picture drags with the mouse, and the wheel scrolls it (Shift+wheel sideways). The note reads "Drag the
+   photo to move around it."; the button reads "Fit to window" and brings the earlier size back.
+4. **Open the file** (`open_button`): `bg.run` of `data.share_path(...)`, then on Windows
+   (`hx_win.is_windows()`) another `bg.run` of `os.startfile(path)`, which opens it in the PC's default
+   viewer; an error shows "Stripes couldn't open the file: {error}". Elsewhere it opens nothing and the
+   note reads "Opening files works on Windows only. The file is at {path}.". No path: "Stripes can't reach
+   the server, so the original can't be opened now."
+5. **One window per photo.** With an `original`, the window's key is `f"photo:{original.sha256}"`;
+   `show_photo(...)` shows that window when it is open instead of opening a second one. Escape and Close
+   close it.
+
+Test attributes: `caption_label`, `canvas`, `xscroll`, `yscroll`, `picture_label` ("No photo" when there
+is no picture), `note_label`, `zoom_button`, `open_button`, `close_button`, `image` (the Pillow image on
+show), `photo`, `shown_size`, `source`, `full`, `original`.
 
 ## 6. The result and confirmation window
 
@@ -1181,7 +1275,8 @@ all text `RED_FG` in plain `tk.Label`s, content in a `Scroller` with background 
    doesn't know what this machine was last confirmed printing." when the name is `""`; a
    `PictureView` (width 768) with `row.previous_preview`; a `BagText` (24, bold, foreground `RED_FG`,
    background `RED_BG`) with `row.previous_origin`, or "(origin unknown)".
-5. `passed_label`, when some machines passed: "{machines} went live. Confirm them in the result window."
+5. `passed_label`, when some machines passed: "{machine} went live. Confirm it in the result window." for
+   one machine, "{machines} went live. Confirm them in the result window." for more.
 6. Buttons `try_button` "Try again" and `leave_button` "Leave it" (`Hx.Big.TButton`), bottom right,
    shown when `same_user(result.sender, identity.user)` and `roles.sender`; otherwise "Only {user} can
    choose Try again or Leave it." (Never the case on the PC that sent, where this window opens.)
@@ -1552,81 +1647,137 @@ board rings for `"floor"` alerts). Closing it does the same in reverse.
 
 ### 10.3 Drawing
 
-The whole board is one `tk.Canvas` (`canvas`, background `CARD_BG`, `highlightthickness=0`), filling
-the window; the window is `hx_no_translate`, and the origin items on it are bag text drawn as canvas
-text, so no language switch can touch them. It is redrawn completely on `<Configure>` (debounced
-100 ms), on every `BoardUpdate` and on `retranslate()`. Ages and the clock change every 1 s, and the
-colour bars flash every `FLOOR_FLASH_MS`, by `itemconfigure` only.
+The board is two `tk.Canvas`es (background `CARD_BG`, `highlightthickness=0`) filling the window:
+`header`, `header_h` tall, and under it `canvas`, which holds the rows and scrolls when they can't all
+fit, with a vertical `ttk.Scrollbar` (`scrollbar`) at its right shown only then. The window is
+`hx_no_translate`, and the origins are bag text drawn as canvas text, so no language switch can touch
+them. Both are redrawn completely on `<Configure>` of `canvas` (debounced 100 ms), on every
+`BoardUpdate` and `DataUpdate` and on `retranslate()`; a redraw keeps the scroll position. Ages and the
+clock change every 1 s, and the colour bars flash every `FLOOR_FLASH_MS`, by `itemconfigure` only.
+
+The rows are grouped under their line's name, and every row has the same fixed columns: name, origin,
+status, age. Nothing wraps and nothing runs into the next column: a name, status or age too long for
+its column shrinks, then ends in "…"; an origin is never shortened, it shrinks instead, and every
+origin on the board is drawn at one size, so the rows look even. All rows fit, or the board scrolls.
+(This replaces the build's first layout, which put the line's name above each machine's full name,
+sized each origin on its own row, wrapped long texts and never scrolled; where states.md §8.1 still
+describes that, this section is the one to follow.)
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────────────┐
-│ MapleJet floor board        2:05 PM     Server unreachable: ...     [Refresh now][Acknowledge][Close] │  header (header_h)
-├──┬──────────────────┬──────────────────────────────────────────┬──────────────────────┬────────┤
-│██│ Line 1           │                                          │                      │checked │
-│██│ Line 1 Bagger 1  │ Product of USA and Canada                │ Printing             │ 3 s ago│  one row per machine
-├──┼──────────────────┼──────────────────────────────────────────┼──────────────────────┼────────┤
-│██│ Line 1           │ Product of USA                           │ Different origins on │checked │
-│██│ Line 1 Bagger 2  │                                          │ this line            │ 4 s ago│
-╞══╪══════════════════╪══════════════════════════════════════════╪══════════════════════╪════════╡  2 px between lines
-│░░│ Line 2           │ USA (pre-printed)                        │ NOT MONITORED        │checked │  NOT MONITORED: grey text
-│░░│ Line 2 Bagger 3  │                                          │                      │ 41 s ago│
-└──┴──────────────────┴──────────────────────────────────────────┴──────────────────────┴────────┘
-   3 %     17 %                        45 %                              25 %              10 %
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ MapleJet floor board  2:05 PM  Server unreachable: ...  [Refresh now][Acknowledge][Close]       │  header (header_h)
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Line 1                                                                                          │  line band (group_h), PAGE_BG
+├──┬────────────┬────────────────────────────────────┬─────────────────────────┬──────────────────┤
+│██│ Bagger 1   │ Product of USA and Canada          │ Printing                │ checked 3 s ago  │  one row per machine (row_h)
+├──┼────────────┼────────────────────────────────────┼─────────────────────────┼──────────────────┤
+│██│ Bagger 2   │ Product of USA                     │ Different origins on t… │ checked 4 s ago  │  1 px between rows of a line
+╞══╧════════════╧════════════════════════════════════╧═════════════════════════╧══════════════════╡  2 px above each later band
+│ Line 2                                                                                          │
+├──┬────────────┬────────────────────────────────────┬─────────────────────────┬──────────────────┤
+│░░│ Bagger 3   │ USA (pre-printed)                  │ NOT MONITORED           │ checked 41 s ago │  NOT MONITORED: grey text
+└──┴────────────┴────────────────────────────────────┴─────────────────────────┴──────────────────┘
+ 2.5 %   14 %                     44 %                           27 %                  12.5 %
 ```
 
-`floor_layout(width, height, rows)` (pure, tested):
+`floor_layout(width, height, rows, lines=0, scrollbar_w=0)` (pure, tested), for `rows` machines under
+`lines` line bands:
 
 | Value | Formula |
 |---|---|
 | `header_h` | `max(48, round(height * 0.07))` |
-| `row_h` | `(height - header_h) / max(rows, FLOOR_MIN_ROWS)`: rows fill the screen, at most a quarter of it each; beyond 12 they keep shrinking, never scroll (states §8.1) |
-| `bar_w`, `names_w`, `origin_w`, `status_w` | `round(width * 0.03)`, `round(width * 0.17)`, `round(width * 0.45)`, `round(width * 0.25)` |
+| `row_h` | `max(room / max(units, FLOOR_MIN_ROWS), FLOOR_MIN_ROW_PX)`, with `room = height - header_h` and `units = rows + FLOOR_GROUP_SHARE * lines` (`FLOOR_MIN_ROWS` 4, `FLOOR_GROUP_SHARE` 0.5, `FLOOR_MIN_ROW_PX` 44): the rows and bands fill the room under the header, a row at most a quarter of it, and rows never get shorter than 44 px |
+| `group_h` | `row_h * FLOOR_GROUP_SHARE`: a line's band is half a row |
+| `rows_h`, `scrolls` | `round(row_h * units)`; `scrolls` when `rows_h > room` |
+| `width` | the rows' width: `width`, less `scrollbar_w` when it scrolls (the window passes `scrollbar.winfo_reqwidth()`) |
+| `bar_w`, `names_w`, `origin_w`, `status_w` | `round(width * 0.025)`, `round(width * 0.14)`, `round(width * 0.44)`, `round(width * 0.27)` of the rows' width |
 | `age_w` | `width - bar_w - names_w - origin_w - status_w` |
 | `header_px` | `max(12, round(header_h * 0.45))` |
-| `line_px`, `machine_px`, `origin_px`, `status_px`, `age_px` | `max(8, round(row_h * 0.20))`, `max(9, round(row_h * 0.28))`, `max(10, round(row_h * 0.50))`, `max(9, round(row_h * 0.30))`, `max(8, round(row_h * 0.20))` |
+| `line_px` | `max(9, round(group_h * 0.60))` |
+| `machine_px`, `origin_px`, `status_px`, `age_px` | `max(9, round(row_h * 0.30))`, `max(10, round(row_h * 0.50))`, `max(9, round(row_h * 0.30))`, `max(9, round(row_h * 0.24))`: the largest each column's text is drawn |
 
-Example: 1920x1080 with 12 rows gives `header_h` 76, `row_h` 83.67, `origin_px` 42, `status_px` 25.
+Examples: 1920x1080 with 12 machines on 4 lines gives `header_h` 76, `row_h` 71.71, `group_h` 35.86,
+`origin_px` 36, `status_px` 22, and everything fits; 1280x800 with 6 machines on 2 lines gives
+`header_h` 56, `row_h` 106.29 and columns of 32, 179, 563, 346 and 160 px; 1280x800 fits 14 machines on
+4 lines, and with 30 machines on 5 lines it scrolls, with 44 px rows.
 
-Rows come from `floor_board_rows(board)` in their order; row `i` spans `header_h + i * row_h` to
-`header_h + (i + 1) * row_h`, rounded. Fonts are pixel sizes: `(family, -px, weight)`. Each text is
-vertically centred in its row, with 8 px left padding in its column. For each `FloorRow` `r` (and its
-`MachineView` `v` from the board):
+Rows come from `floor_board_rows(board)` in their order. Before the first row of each line comes that
+line's band, `group_h` tall; each row is `row_h` tall; positions are summed as floats and rounded when
+drawn. Fonts are pixel sizes: `(family, -px, weight)`. Each text is vertically centred in its row or
+band, is one line (`width` 0), starts 12 px into its column and ends at least 12 px before the next.
 
-1. **Colour bar**: a rectangle the full row height in `COLOUR_HEX[r.colour]`; while `v.unacked_sound`,
-   it alternates with `CARD_BG` every `FLOOR_FLASH_MS` (states §8.1).
-2. **Names**: `r.line_name` (`line_px`, normal, `MUTED_FG`) above `r.machine_name` (`machine_px`,
-   bold, `TEXT_FG`).
-3. **Origin** (`origin_items[r.machine_id]`): `r.origin_line` in the bag font, bold. Size: start at
-   `origin_px` and step down 1 px until `tkinter.font.Font(...).measure(text) <= origin_w - 16`, but not
-   below `max(8, round(origin_px * 0.4))`; if it still doesn't fit, draw it at that size with
-   `width=origin_w - 16`, so it wraps. The origin is never cut short. When `r.origin_line` is `""`,
-   "(origin unknown)" in `MUTED_FG` at `status_px` (a translated item, redrawn on `retranslate`).
-4. **Status** (`status_items`): `text(r.status)`, (UI_FONT, `-status_px`, bold), fill
-   `COLOUR_HEX[r.colour]`, `width=status_w - 16`.
-5. **Age** (`age_items`): `text(checked_text(age))`, `age_px`, `MUTED_FG`, `anchor="e"` at the right
-   edge minus 8 px; `age = r.checked_age_s + <seconds since the BoardUpdate>` (None stays None).
+**One size per column.** At each redraw every column's text gets one size for all rows, from
+`fit_px(texts, measure, start, smallest, room)` (pure): the largest size from `start` down to
+`smallest` at which the widest of the column's texts fits `room`, the column's width less 24 px
+(`smallest` when none does). `measure(px, text)` is `tkinter.font.Font(...).measure` at that size.
+
+| Column | `start` | `smallest` | Still too wide at `smallest` |
+|---|---|---|---|
+| name | `machine_px` | 14 | `ellipsize` |
+| origin | `origin_px` | 1 | can't happen: origins shrink until the longest fits, and are never cut short |
+| status | `status_px` | 16 | `ellipsize` |
+| age | `age_px` | 9 | `ellipsize`. Sized for the rows' ages and also "Not checked yet" and "checked 119 s ago"; an age that outgrows its column before the next redraw is shortened by the 1 s tick |
+
+`ellipsize(value, measure, room)` (pure) returns `value` when `measure(value) <= room`, else its longest
+start that fits with "…" after it (spaces before the "…" dropped; `""` when not even "…" fits). It is
+never used on bag text.
+
+For each line's band (`LineView` `l` from the board):
+
+1. A `PAGE_BG` rectangle the rows' full width; above every band but the first, a 2 px `RULE_FG` line.
+2. `line_items[line_id]`: the line's name, (UI_FONT, `-line_px`, bold), `TEXT_FG`, at x 16, ellipsized
+   to the width; `DIM_FG` when none of the line's machines is monitored (as the line cards, §9.1).
+
+For each `FloorRow` `r` (and its `MachineView` `v`):
+
+1. **Colour bar** (`bar_items`): a rectangle `bar_w` wide, the full row height, in
+   `COLOUR_HEX[r.colour]`; while `v.unacked_sound`, it alternates with `CARD_BG` every `FLOOR_FLASH_MS`
+   (states §8.1). A redraw in the "off" half keeps it off until the next beat.
+2. **Name** (`name_items`): `short_name(r.machine_name, r.line_name, code)` (pure), bold, `TEXT_FG`. It
+   is the machine's name without its line's name in front, when the name starts with the line's name
+   as a whole word (any case; the separators after it, such as a space or " - ", dropped): "Line 1
+   Bagger 1" under "Line 1" is "Bagger 1", and "Line 10 Bagger 1" stays as it is. When nothing else
+   is left, it is the machine's printed code (`Machine.code` from `services.data.current`), and
+   without one the whole name.
+3. **Origin** (`origin_items[r.machine_id]`): `r.origin_line` in the bag font, bold, at the board's
+   one origin size. When `r.origin_line` is `""` the origin item is empty, and "(origin unknown)"
+   (`unknown_items`; a translated item, redrawn on `retranslate`) is drawn in its place in `MUTED_FG`,
+   normal, at the smaller of the status and origin sizes, ellipsized to the column.
+4. **Status** (`status_items`): `text(r.status)`, bold, fill `COLOUR_HEX[r.colour]`.
+5. **Age** (`age_items`): `text(checked_text(age))`, normal, `MUTED_FG`, `anchor="e"` at the rows' right
+   edge minus 12 px; `age = r.checked_age_s + <seconds since the BoardUpdate>` (None stays None).
 6. **NOT MONITORED** rows (`v.code == "not_monitored"`): every text of the row in `DIM_FG`; the bar
    keeps its colour (states keeps a last known red or amber).
-7. **Dividers**: a 2 px `RULE_FG` line where the line changes (rows of one line sit together); a 1 px
-   `#e5e7eb` line between rows of the same line. When a line's origins differ, each of its rows shows
-   its own origin (states §5.6), so every origin is listed.
+7. **Dividers**: a 1 px `#e5e7eb` line between rows of the same line; the bands divide the lines. When
+   a line's origins differ, each of its rows shows its own origin (states §5.6), so every origin is
+   listed.
 
-Header (`header_h` tall, bottom border 1 px `RULE_FG`):
+**Scrolling.** While `scrolls`, `scrollbar` is packed at the right of `canvas`, `canvas`'s
+`scrollregion` is `(0, 0, width, rows_h)` and its `yscrollincrement` half a row; the mouse wheel
+anywhere on the board scrolls it (`<MouseWheel>`, `<Button-4>` and `<Button-5>` bound on the window).
+Otherwise the scrollbar is hidden, the view is at the top and the wheel does nothing.
+
+Header (`header`, `header_h` tall, bottom border 1 px `RULE_FG`):
 
 1. Left: "MapleJet floor board", (UI_FONT, `-header_px`, bold).
 2. Then the time, `time.strftime("%I:%M %p").lstrip("0")`, updated every second.
-3. Then `text(board_banner(board))` in `COLOUR_HEX[AMBER]` at `round(header_px * 0.6)` px when it isn't
-   None.
+3. Then `text(board_banner(board))` in `COLOUR_HEX[AMBER]` at `max(8, round(header_px * 0.6))` px when
+   it isn't None, ellipsized, also as it counts down, so it stops 16 px short of the buttons.
 4. Right, as canvas windows (`create_window`): `refresh_button` "Refresh now" (standalone only;
    `poller.refresh_now()`, refused within `refresh_now_min_s`), `ack_button` "Acknowledge" (only when
    `roles.acknowledge` and `sounding_alerts(board, identity, floor_board=True)` isn't empty; it
    acknowledges those alerts) and `close_button` "Close". Escape does nothing; the board stays until
    Close.
-5. No lines: "No lines are set up yet." centred in the rows area.
+5. No rows: centred in the rows area, (UI_FONT, `-status_px`, bold), `message_item` says "Checking..."
+   before the first board, else what `no_lines_texts` says ("No lines are set up yet.", "Checking..."
+   while the settings have active lines, "Loading the MapleJet settings..." or the settings' problems,
+   these in `COLOUR_HEX[AMBER]`).
 
-Test attributes: `canvas`, `layout: FloorLayout`, `rows: list[FloorRow]`, `origin_items`,
-`status_items`, `age_items`, `bar_items`, `flash_on: bool`, `refresh_button`, `ack_button`,
-`close_button`.
+Test attributes: `header`, `canvas`, `scrollbar`, `layout: FloorLayout`, `font_px` (the size of each
+column: `"name"`, `"origin"`, `"status"`, `"age"`, `"unknown"`), `rows: list[FloorRow]`, `line_items`,
+`name_items`, `origin_items`, `unknown_items`, `status_items`, `age_items`, `bar_items` (on `canvas`),
+`title_item`, `clock_item`, `banner_item` (on `header`), `message_item` (on `canvas`),
+`flash_on: bool`, `refresh_button`, `ack_button`, `close_button`.
 
 ## 11. Admin screens
 
@@ -2644,6 +2795,15 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Stripes couldn't stop printing on {machines}. | Stripes no pudo detener la impresión en {machines}. |
 | Press Print On/Off on that printer now. Its card shows "Stop it at the printer" until Stripes reads that printing is off. | Presione Print On/Off en esa impresora ahora. Su tarjeta muestra "Deténgala en la impresora" hasta que Stripes lea que la impresión está apagada. |
 | You can refresh once every {seconds} s. | Puede actualizar una vez cada {seconds} s. |
+| Full size | Tamaño real |
+| Fit to window | Ajustar a la ventana |
+| Open the file | Abrir el archivo |
+| Loading the original photo... | Cargando la foto original... |
+| Showing the preview: Stripes couldn't read the original photo. | Se muestra la vista previa: Stripes no pudo leer la foto original. |
+| Drag the photo to move around it. | Arrastre la foto para moverse por ella. |
+| Stripes can't reach the server, so the original can't be opened now. | Stripes no puede conectar con el servidor, así que el original no se puede abrir ahora. |
+| Opening files works on Windows only. The file is at {path}. | Abrir archivos solo funciona en Windows. El archivo está en {path}. |
+| Stripes couldn't open the file: {error} | Stripes no pudo abrir el archivo: {error} |
 
 ### 16.2 hx_ui_send
 
@@ -2677,6 +2837,8 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | I know this line will print two origins | Sé que esta línea imprimirá dos orígenes |
 | (origin unknown) → | (origen desconocido) → |
 | Prints: | Imprime: |
+| Delay {ms} ms | Retardo de {ms} ms |
+| Print position {mm} mm | Posición de impresión de {mm} mm |
 | Still needed: | Falta: |
 | Send to {n} machines | Enviar a {n} máquinas |
 | Send to 1 machine | Enviar a 1 máquina |
@@ -2723,6 +2885,7 @@ Rules (with architecture §10.6 and `test_i18n.py`):
 | Try again was cancelled. | Se canceló Intentar de nuevo. |
 | Stripes doesn't know what this machine was last confirmed printing. | Stripes no sabe qué fue lo último confirmado que imprimía esta máquina. |
 | {machines} went live. Confirm them in the result window. | {machines} quedaron activas. Confírmelas en la ventana de resultados. |
+| {machine} went live. Confirm it in the result window. | {machine} quedó activa. Confírmela en la ventana de resultados. |
 | Only {user} can choose Try again or Leave it. | Solo {user} puede elegir Intentar de nuevo o Dejarlo así. |
 | Choose Try again or Leave it. | Elija Intentar de nuevo o Dejarlo así. |
 | Leave {machines} red? The line stays red until a Send succeeds, the line's notify user is alerted, and this is logged. | ¿Dejar {machines} en rojo? La línea queda en rojo hasta que un envío funcione, se avisa al usuario a notificar de la línea y queda registrado. |
@@ -3162,6 +3325,10 @@ last.
 | `test_tab_builds_and_gates_roles` | `test_hx_ui.py` | `MapleJetTab` builds for a plain user, a sender and an administrator: `send_button`/`clocks_button` mapped only for the sender, `admin_button` only for the administrator; `who_label` texts of §4.2 |
 | `test_zebra_shortcut_guard` | `test_stripes.py` | `stripes.App._zebra_shortcut(fake_self, event, action)` with `fake_self` holding a two-tab notebook: the action runs for a widget on the Zebra tab while it is selected; not while the MapleJet tab is selected; never for a widget inside an `HxWindow` or the `ask` dialog |
 | `test_send_flow` | `test_hx_ui_send.py` | Send window: tick Line 1, choose the product, the film (no film pre-selected before), the default print text is pre-filled, lot "4417", countries USA then Canada; `origin_text.get() == "Product of USA and Canada"`; `change_texts` highlight against the board's origin; `send_button` enabled and reads "Send to 1 machine"; invoke; pump until a `ResultWindow` for the send is open; its `pictures[mid].bmp` is the second running read; invoke "Everything is right"; the machine's expected state is `confirmed`; the fake's `writes` ⊆ `ALLOWED_WRITE_TAGS`, `max_in_flight == 1`, no `violations` |
+| `test_film_cards` | `test_hx_ui_send.py` | four films of the product with Pillow-drawn photos (never real artwork): cards in code-then-revision order, all in one row at 1000x780 and as wide as each other, with the print text, lot, countries and origin in view; tall photos 60x150 and a wide one 100x67 in the 100x150 box, "No photo" for the missing ones; clicking a card picks its film and marks it blue; at 760x560 fewer cards to a row; clicking a photo twice opens one `PhotoWindow`, whose `original` is the photo's `FileRef` and which reads the original |
+| `test_delay_for_senders_and_the_working_for_administrators` | `test_hx_ui_send.py` | `position_labels[mid]` reads "Delay 480 ms" (`Hx.Small.TLabel`); `working_labels[mid]` the working for an administrator, and nothing with "µs" for a sender who isn't one; Spanish "Retardo de 480 ms" |
+| `test_one_machine_went_live`, `test_machines_went_live` | `test_hx_ui_send.py` | the red window's `passed_label` for one machine ("Line 1 Bagger 2 went live. Confirm it in the result window.") and for two, in English and Spanish |
+| `test_original_fitted_then_full_size`, `test_preview_when_the_original_cant_be_read`, `test_open_the_file`, `test_show_photo_opens_one_window_per_photo` | `test_hx_ui_common.py` | `PhotoWindow` with a Pillow-drawn 600x1600 original behind a threaded background: the preview first, the original read on a worker thread, the window taller than wide and at most 90% of the screen with its buttons in view, the picture fitted with its shape kept; Full size shows 600x1600 with scroll bars, grows the window, scrolls with the wheel and a drag, and Fit to window brings the size back; no path, a PDF or a missing file keep the preview with the note; Open the file calls `os.startfile` on a worker thread on Windows and only shows the path elsewhere; one window per photo |
 | `test_send_blocked_banners` | `test_hx_ui_send.py` | data from the local copy shows `local_banner`; `can_send()` False shows `blocked_banner` and disables `send_button`; Retry calls `probe_now` and `reload` |
 | `test_countdown_cancel_sends_nothing` | `test_hx_ui_send.py` | invoke `cancel_button` at once; pump until `page == "choose"`; "Cancelled. Nothing was sent."; the fake printer received no write |
 | `test_cancel_disappears_at_go` | `test_hx_ui_send.py` | with a scaled countdown, `cancel_button` is gone and `page == "working"` as soon as the whole-send `SendEvent(step=STEP_LOCK, status="ok")` is pumped, before any `STEP_CHECK_MACHINE` event |
@@ -3174,8 +3341,11 @@ last.
 | `test_result_from_log` | `test_hx_ui_send.py` | after a Send, closing the result window and `nav.open_result(send_id)` refills it from the log with the pending machine; for another identity the buttons are absent and "Only {user} can confirm this Send." shows |
 | `test_result_from_log_no_entry` | `test_hx_ui_send.py` | with the `send` entry removed from the share and the queue, `nav.open_result(send_id)` lists the live machine from its expected state with its `read_preview` picture and the note "This PC can't find the full record of this Send. These are the printers' latest pictures."; the sender's "Everything is right" confirms it; another identity sees no buttons; a second active machine not in the Send whose expected.json has a newer `format_version` doesn't stop it |
 | `test_line_board` | `test_hx_ui.py` | a hand-made board renders one card per line and one row per machine in order; origins in `BagText`; "(origin unknown)" for `""`; machine buttons follow `can_stop`, `can_resume`, `needs_send`, `confirm_pending_by` (same user only) and roles; BLUE rows have no buttons; with a `FakeClock` advanced 3 s, `age_label` reads 3 s more |
-| `test_floor_layout` | `test_hx_ui.py` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2 |
-| `test_floor_board` | `test_hx_ui.py` | rows in board order; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="800x600"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
+| `test_row_closes_up_when_alerts_end` | `test_hx_ui.py` | a machine row whose alerts end is as tall as one that never had any: `alerts_frame` (like the details and the buttons) is unpacked when empty, and details, alerts and buttons keep that order |
+| `test_floor_layout` | `test_hx_ui.py` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2; 12 machines on 4 lines give `row_h` 71.71 and fit; 30 machines on 5 lines at 1280x800 give 44 px rows, `scrolls` and the rows narrower by the scrollbar; `fit_px`, `ellipsize` and `short_name` as §10.3 says |
+| `test_floor_board` | `test_hx_ui.py` | rows in board order under their lines' bands; names without the line's name; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="1280x800"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
+| `test_rows_fit_without_overlap` | `test_hx_ui.py` | at 1280x800 and 1920x1080, 6 machines on 2 lines and 12 on 4: no scrolling, the last row on screen, every text inside its column and row with `width` 0, one size per column, and the origin size the largest at which the widest origin fits |
+| `test_one_origin_size_never_cut_short`, `test_long_names_and_statuses_get_an_ellipsis`, `test_scrolls_when_the_rows_cannot_fit` | `test_hx_ui.py` | a very long origin shrinks every origin and is drawn whole; long names and statuses end in "…", origins never; 30 machines scroll with the wheel, a new board keeps the place, and a board that fits hides the scrollbar |
 | `test_alert_sounder` | `test_hx_ui.py` | `hx_win.play_alert`/`stop_alert` patched: a board with a sound alert to `user:EXAMPLE\jsmith` plays once (a second board doesn't replay); an acknowledged board stops it; a `"floor"` alert rings only while the floor board is open; the `AlertPopup` opens for the personal alert only |
 | `test_alert_wav` | `test_hx_ui.py` | `assets/alert.wav` matches `alert_wav_bytes()` within 1 per sample; 22,050 Hz, mono, 16-bit, 66,150 frames |
 | `test_admin_save_and_conflict` | `test_hx_ui_admin.py` | change a line's name and save: revision + 1 and "Saved Line 1." ; after another store writes a newer revision, Save shows the `RevisionConflict` text and `reload_button` |

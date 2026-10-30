@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import math
+import os
 import re
 import struct
 import threading
@@ -33,6 +34,8 @@ from PIL import Image, ImageOps
 
 if TYPE_CHECKING:
     from PIL import ImageTk
+
+    from hx_model import FileRef
 
 import hx_share
 import hx_state
@@ -97,6 +100,19 @@ ES = {
         "Presione Print On/Off en esa impresora ahora. Su tarjeta muestra \"Deténgala en la impresora\" "
         "hasta que Stripes lea que la impresión está apagada.",
     "You can refresh once every {seconds} s.": "Puede actualizar una vez cada {seconds} s.",
+    # PhotoWindow
+    "Full size": "Tamaño real",
+    "Fit to window": "Ajustar a la ventana",
+    "Open the file": "Abrir el archivo",
+    "Loading the original photo...": "Cargando la foto original...",
+    "Showing the preview: Stripes couldn't read the original photo.":
+        "Se muestra la vista previa: Stripes no pudo leer la foto original.",
+    "Drag the photo to move around it.": "Arrastre la foto para moverse por ella.",
+    "Stripes can't reach the server, so the original can't be opened now.":
+        "Stripes no puede conectar con el servidor, así que el original no se puede abrir ahora.",
+    "Opening files works on Windows only. The file is at {path}.":
+        "Abrir archivos solo funciona en Windows. El archivo está en {path}.",
+    "Stripes couldn't open the file: {error}": "Stripes no pudo abrir el archivo: {error}",
 }
 add_spanish(ES)
 
@@ -117,6 +133,7 @@ APP_TITLE = "Stripes"               # title of tell/ask dialogs (a name, not tra
 STRICT_THREADS = False              # tests set True (ui.md §2.1 rule 7)
 ALERT_WAV = "assets/alert.wav"
 PREVIEW_MAX_SIDE = 480              # film photo previews (storage.md §18)
+PHOTO_SCREEN_SHARE = 0.9            # PhotoWindow: at most this share of the screen's width and height
 
 _PREVIEW_SIDES = (PREVIEW_MAX_SIDE, 360, 240)   # tried in turn until the PNG is small enough
 _EMPTY_FILL = "#e5e7eb"             # PictureView with no picture
@@ -129,6 +146,8 @@ _ALERT_AMPLITUDE = 0.45
 _ALERT_RAMP_S = 0.01                # fade in and out, so the tones don't click
 _SHOW_TOPMOST_MS = 200
 _ASK_WRAP_PX = 420
+_PHOTO_FIT_MS = 100                 # PhotoWindow: fitted again this long after the last resize
+_PHOTO_SCROLL_PX = 40               # PhotoWindow: one wheel step at full size
 
 
 # --------------------------------------------------------------------------
@@ -588,15 +607,28 @@ def png_preview(path: str) -> bytes | None:
     return None
 
 
-def photo_from_png(master, png: bytes, *, height: int | None = None) -> "ImageTk.PhotoImage":
-    """A PhotoImage of PNG bytes already in memory (Tk thread), scaled to height when given.
-    The caller keeps a reference to it. Raises for bytes Pillow can't read."""
+def fit_size(size: tuple[int, int], box: tuple[int, int]) -> tuple[int, int]:
+    """(width, height) of a picture of that size scaled to fit inside box, keeping its shape."""
+    width, height = size
+    scale = min(box[0] / width, box[1] / height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def photo_from_png(master, png: bytes, *, height: int | None = None,
+                   box: tuple[int, int] | None = None) -> "ImageTk.PhotoImage":
+    """A PhotoImage of PNG bytes already in memory (Tk thread), scaled to height, or to fit inside
+    box (width, height), when given; either way it keeps its shape. The caller keeps a reference
+    to it. Raises for bytes Pillow can't read."""
     image = Image.open(io.BytesIO(png))
     image.load()
-    if height and image.height and image.height != height:
-        width = max(1, round(image.width * height / image.height))
-        resample = Image.LANCZOS if height < image.height else Image.NEAREST
-        image = image.resize((width, height), resample)
+    size = image.size
+    if box and image.width and image.height:
+        size = fit_size(image.size, box)
+    elif height and image.height:
+        size = (max(1, round(image.width * height / image.height)), height)
+    if size != image.size:
+        resample = Image.LANCZOS if size[1] < image.height else Image.NEAREST
+        image = image.resize(size, resample)
     return _photo_image(image, master)
 
 
@@ -942,29 +974,334 @@ def open_windows() -> list[HxWindow]:
 
 
 class PhotoWindow(HxWindow):
-    """A film photo, larger (Send window and film editor). The caption is data, not translated."""
+    """A film photo, large (Send window and film editor). The caption is data, not translated.
 
-    def __init__(self, master, services, *, png: bytes, caption: str):
+    It opens at once with the PNG preview, sized to the photo and at most 90% of the screen, with
+    its buttons always in view. Given the photo's FileRef (original), it reads the original file
+    from the share on a worker thread and shows it scaled to fit the window; "Full size" shows it
+    pixel for pixel on a canvas that scrolls and drags, so the small print (a nutrition panel, a
+    barcode) can be read, and "Open the file" opens it in the PC's own viewer. Until the original
+    is in, or when it can't be read, the preview is shown."""
+
+    def __init__(self, master, services, *, png: bytes, caption: str, original: "FileRef | None" = None):
+        if original is not None:
+            self.key = f"photo:{original.sha256}"       # one window per photo (show_photo)
         super().__init__(master, services)
         self.title(caption or APP_TITLE)
-        self.geometry("560x560")
-        self.photo = None
+        self.original = original
+        self.image = None           # the Pillow image on show: the preview, then the original
+        self.source = "preview"     # "preview" | "original"
+        self.full = False           # True: pixel for pixel, scrolling; False: fitted to the window
+        self.photo = None           # the PhotoImage on show (Tk drops it if nothing keeps it)
+        self.shown_size = None      # (width, height) of the picture as drawn
+        self._screen_image = None   # the original shrunk to the screen: what fitting starts from
+        self._full_photo = None     # (image, PhotoImage) of the last full-size view
+        self._fitted_for = None     # the canvas size the fitted picture was drawn for
+        self._fit_timer = None
+        self._most = (1, 1)         # the largest the window may be
+        self._around = (0, 0)       # what the window needs around the picture (caption, note, buttons)
+        self._fit_geometry = ""     # the window's geometry before Full size, for Fit to window
+        try:
+            image = Image.open(io.BytesIO(png))
+            image.load()
+            self.image = image if image.mode in ("RGB", "L") else image.convert("RGB")
+        except Exception:   # not a picture Pillow reads: "No photo"
+            self.image = None
+        self._build(caption)
+        self._size_window()
+        self._draw()
+        self.bind("<Escape>", lambda e: self.close())
+        if original is not None and services is not None:
+            self._note(Msg(N_("Loading the original photo...")))
+            self.later(0, self._load_original)
+
+    def _build(self, caption):
+        texts = self.texts
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
-        self.caption_label = ttk.Label(body, text=caption, style="Hx.Section.TLabel")
-        self.caption_label.pack(anchor="w", pady=(0, 8))
-        self.picture_label = ttk.Label(body, anchor="center")
-        self.picture_label.pack(fill="both", expand=True)
+        self.caption_label = ttk.Label(body, text=caption, style="Hx.Section.TLabel")   # data
+        self.caption_label.pack(side="top", anchor="w", pady=(0, 8))
+        # The buttons and the note are packed before the picture, so a small window squeezes the
+        # picture and never them
+        bar = ttk.Frame(body)
+        bar.pack(side="bottom", fill="x", pady=(8, 0))
+        self.close_button = ttk.Button(bar, command=self.close)
+        texts.set(self.close_button, N_("Close"))
+        self.close_button.pack(side="right")
+        self.zoom_button = ttk.Button(bar, command=self.toggle_zoom)
+        texts.set(self.zoom_button, N_("Full size"))
+        self.open_button = ttk.Button(bar, command=self.open_file)
+        texts.set(self.open_button, N_("Open the file"))
+        if self.original is not None:   # without one there is only the preview: nothing to zoom or open
+            self.zoom_button.pack(side="left")
+            self.zoom_button.state(["disabled"])     # until the original is in
+            self.open_button.pack(side="left", padx=(8, 0))
+        self.note_label = ttk.Label(body, style="Muted.TLabel", justify="left")
+        self.note_label.pack(side="bottom", fill="x", pady=(6, 0))
+        body.bind("<Configure>", lambda e: self.note_label.configure(wraplength=max(200, e.width - 24)), add="+")
+        area = ttk.Frame(body)
+        area.pack(side="top", fill="both", expand=True)
+        area.rowconfigure(0, weight=1)
+        area.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(area, highlightthickness=0, borderwidth=0,
+                                xscrollincrement=_PHOTO_SCROLL_PX, yscrollincrement=_PHOTO_SCROLL_PX)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.yscroll = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview)
+        self.yscroll.grid(row=0, column=1, sticky="ns")
+        self.xscroll = ttk.Scrollbar(area, orient="horizontal", command=self.canvas.xview)
+        self.xscroll.grid(row=1, column=0, sticky="ew")
+        self.canvas.configure(xscrollcommand=self.xscroll.set, yscrollcommand=self.yscroll.set)
+        self.yscroll.grid_remove()      # only at full size
+        self.xscroll.grid_remove()
+        self.picture_label = ttk.Label(area, anchor="center", style="Muted.TLabel")
+        self.picture_label.grid(row=0, column=0, sticky="nsew")
+        texts.set(self.picture_label, N_("No photo"))
+        if self.image is None:
+            self.canvas.grid_remove()
+        else:
+            self.picture_label.grid_remove()
+        self.canvas.bind("<Configure>", self._on_resize, add="+")
+        self.canvas.bind("<Double-Button-1>", self._on_double, add="+")
+        self.canvas.bind("<ButtonPress-1>", self._on_press, add="+")
+        self.canvas.bind("<B1-Motion>", self._on_drag, add="+")
+        # On the window, so the wheel works wherever Windows sends it (the focus, not the pointer)
+        for sequence, axis, step in (("<MouseWheel>", "y", 0), ("<Shift-MouseWheel>", "x", 0),
+                                     ("<Button-4>", "y", -1), ("<Button-5>", "y", 1),
+                                     ("<Shift-Button-4>", "x", -1), ("<Shift-Button-5>", "x", 1)):
+            self.bind(sequence, lambda e, a=axis, s=step: self._wheel(e, a, s), add="+")
+
+    def _note(self, msg: Msg | None, style: str = "Muted.TLabel") -> None:
+        self.texts.msg(self.note_label, msg)
+        self.note_label.configure(style=style)
+
+    def _gone(self):
         try:
-            self.photo = photo_from_png(self, png)
-            self.picture_label.configure(image=self.photo)
-        except Exception:
-            self.picture_label.configure(style="Muted.TLabel")
-            self.texts.set(self.picture_label, N_("No photo"))
-        self.close_button = ttk.Button(body, command=self.close)
-        self.texts.set(self.close_button, N_("Close"))
-        self.close_button.pack(anchor="e", pady=(8, 0))
-        self.bind("<Escape>", lambda e: self.close())
+            return self._hx_destroyed or not self.winfo_exists()
+        except tk.TclError:
+            return True
+
+    # size and drawing
+
+    def _size_window(self):
+        """Sized to the photo, buttons included, and at most PHOTO_SCREEN_SHARE of the screen. With an
+        original on the way, the picture fills that room (the preview has the original's shape, so
+        nothing moves when it arrives); with only the preview, it is shown no larger than it is."""
+        _x, _y, screen_w, screen_h = _primary_screen(self)
+        most_w, most_h = self._most = int(screen_w * PHOTO_SCREEN_SHARE), int(screen_h * PHOTO_SCREEN_SHARE)
+        if self.image is None:
+            self.geometry(f"{min(480, most_w)}x{min(320, most_h)}")
+            return
+        probe = 1000        # a canvas this big drives the window's size: the rest is what's around it
+        self.canvas.configure(width=probe, height=probe)
+        self.update_idletasks()
+        around_w, around_h = self._around = self.winfo_reqwidth() - probe, self.winfo_reqheight() - probe
+        room = (max(1, most_w - around_w), max(1, most_h - around_h))
+        if self.original is None:
+            room = (min(room[0], self.image.width), min(room[1], self.image.height))
+        width, height = fit_size(self.image.size, room)
+        self.canvas.configure(width=width, height=height)
+        self.update_idletasks()
+        self.geometry(f"{min(most_w, self.winfo_reqwidth())}x{min(most_h, self.winfo_reqheight())}")
+        self.minsize(min(320, most_w), min(240, most_h))
+
+    def _canvas_size(self):
+        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if width <= 1 or height <= 1:       # not laid out yet
+            width, height = self.canvas.winfo_reqwidth(), self.canvas.winfo_reqheight()
+        return max(1, width), max(1, height)
+
+    def _draw(self):
+        """The picture fitted to the canvas, or pixel for pixel at full size."""
+        self._fit_timer = None
+        canvas = self.canvas
+        canvas.delete("all")
+        self.photo = None
+        if self.image is None:
+            self.shown_size = None
+            return
+        if self.full:
+            if self._full_photo is None or self._full_photo[0] is not self.image:
+                self._full_photo = (self.image, _photo_image(self.image, self))
+            self.photo = self._full_photo[1]
+            self.shown_size = self.image.size
+            canvas.create_image(0, 0, anchor="nw", image=self.photo)
+            canvas.configure(scrollregion=(0, 0, *self.image.size))
+            return
+        width, height = self._canvas_size()
+        size = fit_size(self.image.size, (width, height))
+        source = self._screen_image
+        if source is None or size[0] > source.width or size[1] > source.height:
+            source = self.image
+        image = source if source.size == size else source.resize(size, Image.LANCZOS)
+        self.photo = _photo_image(image, self)
+        self.shown_size = size
+        self._fitted_for = (width, height)
+        canvas.create_image(width // 2, height // 2, anchor="center", image=self.photo)
+        canvas.configure(scrollregion=(0, 0, width, height))
+        canvas.xview_moveto(0)
+        canvas.yview_moveto(0)
+
+    def _on_resize(self, event):
+        if self.full or self.image is None or (event.width, event.height) == self._fitted_for:
+            return
+        if self._fit_timer is not None:
+            try:
+                self.after_cancel(self._fit_timer)
+            except tk.TclError:
+                pass
+        self._fit_timer = self.later(_PHOTO_FIT_MS, self._draw)
+
+    # zoom
+
+    def toggle_zoom(self, focus: tuple[float, float] = (0.5, 0.5)) -> None:
+        """Full size and back. focus is the point of the picture (as shares of its width and height)
+        that full size opens on."""
+        if self.source != "original" or self.image is None:
+            return
+        self.full = not self.full
+        self.texts.set(self.zoom_button, N_("Fit to window") if self.full else N_("Full size"))
+        if self.full:
+            self.xscroll.grid()
+            self.yscroll.grid()
+            self.canvas.configure(cursor="fleur")
+            self._note(Msg(N_("Drag the photo to move around it.")))
+        else:
+            self.xscroll.grid_remove()
+            self.yscroll.grid_remove()
+            self.canvas.configure(cursor="")
+            self._note(None)
+        self.update_idletasks()     # the scroll bars take their room before the picture is placed
+        if self.full:
+            view = self._grow_for_full_size()
+        elif self._fit_geometry:
+            self.geometry(self._fit_geometry)
+        self._draw()
+        if self.full:
+            width, height = view
+            image_w, image_h = self.image.size
+            self.canvas.xview_moveto(max(0.0, (focus[0] * image_w - width / 2) / image_w))
+            self.canvas.yview_moveto(max(0.0, (focus[1] * image_h - height / 2) / image_h))
+
+    def _grow_for_full_size(self):
+        """At full size the window grows to the room the photo needs, at most PHOTO_SCREEN_SHARE of
+        the screen; Fit to window brings the size before back. Returns the canvas size to expect."""
+        self._fit_geometry = self.geometry()
+        (most_w, most_h), (around_w, around_h) = self._most, self._around
+        bars_w, bars_h = self.yscroll.winfo_reqwidth(), self.xscroll.winfo_reqheight()
+        now_w, now_h = self.winfo_width(), self.winfo_height()
+        if now_w <= 1 or now_h <= 1:        # not on screen yet
+            now_w, now_h = self.winfo_reqwidth(), self.winfo_reqheight()
+        width = max(now_w, min(most_w, self.image.width + around_w + bars_w))
+        height = max(now_h, min(most_h, self.image.height + around_h + bars_h))
+        if (width, height) == (now_w, now_h):
+            return self._canvas_size()
+        self.geometry(f"{width}x{height}")
+        return max(1, width - around_w - bars_w), max(1, height - around_h - bars_h)
+
+    def _on_double(self, event):
+        if self.full or self.shown_size is None:
+            self.toggle_zoom()
+            return
+        width, height = self._canvas_size()
+        shown_w, shown_h = self.shown_size
+        fx = (event.x - (width - shown_w) / 2) / shown_w
+        fy = (event.y - (height - shown_h) / 2) / shown_h
+        self.toggle_zoom(focus=(min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy))))
+
+    def _on_press(self, event):
+        if self.full:
+            self.canvas.scan_mark(event.x, event.y)
+
+    def _on_drag(self, event):
+        if self.full:
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def _wheel(self, event, axis, step):
+        if not self.full:
+            return None
+        if not step:
+            step = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+        (self.canvas.xview_scroll if axis == "x" else self.canvas.yview_scroll)(step, "units")
+        return "break"
+
+    # the original
+
+    def _load_original(self):
+        """Read the original on a worker thread (the share can take seconds); the preview stays
+        until it is in."""
+        services, original = self.services, self.original
+        _x, _y, screen_w, screen_h = _primary_screen(self)
+
+        def work():
+            # Worker thread: the share, then Pillow. Nothing here touches Tk
+            path = services.data.share_path("templates/" + original.path)
+            if not path:
+                return None
+            with Image.open(path) as opened:
+                picture = ImageOps.exif_transpose(opened)   # as the preview was made
+                if picture.mode not in ("RGB", "L"):
+                    picture = picture.convert("RGB")
+                picture.load()
+            screen = picture.copy()
+            screen.thumbnail((screen_w, screen_h), Image.LANCZOS)
+            return picture, screen
+
+        def done(result, error):
+            if self._gone():
+                return
+            if error is not None or result is None:
+                self._note(Msg(N_("Showing the preview: Stripes couldn't read the original photo.")),
+                           style="Warn.TLabel")
+                return
+            had_picture = self.image is not None
+            self.image, self._screen_image = result
+            self.source = "original"
+            self.zoom_button.state(["!disabled"])
+            self._note(None)
+            if not had_picture:     # the preview was unreadable: size the window for the original
+                self.picture_label.grid_remove()
+                self.canvas.grid()
+                self._size_window()
+            self._draw()
+
+        services.bg.run(work, done)
+
+    def open_file(self) -> None:
+        """The original in the PC's default viewer (Windows); elsewhere this only says where it is."""
+        services, original = self.services, self.original
+        if original is None or services is None:
+            return
+
+        def opened(_result, error):
+            if error is not None and not self._gone():
+                self._note(Msg(N_("Stripes couldn't open the file: {error}"),
+                               {"error": str(error) or type(error).__name__}), style="Bad.TLabel")
+
+        def found(path, error):
+            if self._gone():
+                return
+            if error is not None or not path:
+                self._note(Msg(N_("Stripes can't reach the server, so the original can't be opened now.")),
+                           style="Bad.TLabel")
+                return
+            if not hx_win.is_windows():
+                self._note(Msg(N_("Opening files works on Windows only. The file is at {path}."), {"path": path}))
+                return
+            services.bg.run(lambda: os.startfile(path), opened)
+
+        services.bg.run(lambda: services.data.share_path("templates/" + original.path), found)
+
+
+def show_photo(master, services, *, png: bytes, caption: str, original: "FileRef | None" = None) -> PhotoWindow:
+    """A film photo in a PhotoWindow; the photo's window is brought to the front when it is open
+    already (a double click on a thumbnail opens one window, not two)."""
+    windows = getattr(getattr(services, "nav", None), "windows", None)
+    if original is not None and isinstance(windows, dict):
+        window = windows.get(f"photo:{original.sha256}")
+        if isinstance(window, PhotoWindow) and not window._gone():
+            window.show()
+            return window
+    return PhotoWindow(master, services, png=png, caption=caption, original=original)
 
 
 # --------------------------------------------------------------------------

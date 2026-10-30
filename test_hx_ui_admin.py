@@ -273,6 +273,26 @@ class PureTests(unittest.TestCase):
                                                               PrintTextItem(id="i2", kind="origin")])
         self.assertFalse(hx_ui_admin.origin_rule_ok(plain, two) or hx_ui_admin.origin_rule_ok(pre, two))
 
+    def test_films_by_code_then_revision(self):
+        """The Send window's order: by code, then artwork revision, both naturally ("EXCO2" before
+        "EXCO10", "Rev 9" before "Rev 10"); film_choices keeps the product first."""
+        data = small_data()
+        product_id = next(iter(data.products))
+        films = [Film(id=f"fm_00000000a{n}", product_id=product_id, code=code, artwork_revision=revision)
+                 for n, (code, revision) in enumerate((("EXCO10", "Rev A"), ("EXCO2", "Rev B"), ("EXCO2", "Rev 10"),
+                                                       ("EXCO2", "Rev 9")))]
+        ordered = sorted(films, key=hx_ui_admin._film_key)
+        self.assertEqual([hx_ui_admin.film_name(f) for f in ordered],
+                         ["EXCO2 · Rev 9", "EXCO2 · Rev 10", "EXCO2 · Rev B", "EXCO10 · Rev A"])
+        other = Product(id="pd_0000000002", name="Example Co 5lb Onion", customer="Example Co")
+        last = Film(id="fm_00000000b0", product_id=other.id, code="AA1", artwork_revision="Rev A")
+        data = dataclasses.replace(data, products={**data.products, other.id: other},
+                                   films={**data.films, last.id: last, **{f.id: f for f in films}})
+        pko = data.print_texts["pt_0000000001"]
+        self.assertEqual([hx_ui_admin.film_name(f) for f in hx_ui_admin.film_choices(pko, data)],
+                         ["EXCO1 · Rev C", "EXCO2 · Rev 9", "EXCO2 · Rev 10", "EXCO2 · Rev B", "EXCO10 · Rev A",
+                          "AA1 · Rev A"])
+
     def test_membership_saves(self):
         data = small_data()
         pkd = data.print_texts["pt_0000000003"]
@@ -1303,6 +1323,182 @@ class AdminTests(UiCase):
             window.retranslate()
         self.assertEqual(w.notebook.tab(w.pages["products"], "text"), "Products and films")
         self.assertEqual(editor.items_tree.item("i2", "values")[1], "Country of origin")
+
+
+    def test_test_print_hint_only_while_the_button_is_disabled(self):
+        """ui.md §11.7.5: "Save the film first." says why Test print... is disabled, so it shows only then."""
+        services, film_id = self.services, self.world.ids["film"]
+        w = AdminWindow(self.root, services, page="products", record_id=film_id)
+        page = w.pages["products"]
+        editor = page.editor
+        self.assertTrue(enabled(editor.test_button))
+        self.assertFalse(shown(editor.test_hint))
+        page.fields["artwork_revision"].set("Rev C2")
+        self.assertFalse(enabled(editor.test_button))
+        self.assertTrue(shown(editor.test_hint))
+        self.assertEqual(editor.test_hint.cget("text"), "Save the film first.")
+        page.save_button.invoke()
+        self.assertEqual(page.status_label.cget("text"), "Saved EXCO1 · Rev C2.")
+        self.assertTrue(enabled(editor.test_button))
+        self.assertFalse(shown(editor.test_hint))
+        # A new film was never saved
+        page.new_version_button.invoke()
+        self.assertIs(page.editor, editor)
+        self.assertFalse(enabled(editor.test_button))
+        self.assertTrue(shown(editor.test_hint))
+        self.settle()
+        self.assertGreater(editor.test_hint.winfo_x(), editor.test_button.winfo_x())     # beside the button
+
+    def test_films_by_code_then_revision(self):
+        """Every admin list of films is in the Send window's order: by code, then artwork revision."""
+        services, product_id, film_id = self.services, self.world.ids["product"], self.world.ids["film"]
+        store = self.admin_store()
+        base = services.data.current.films[film_id]                    # EXCO1 · Rev C
+        for n, (code, revision) in enumerate((("EXCO10", "Rev A"), ("EXCO2", "Rev B"), ("EXCO2", "Rev 10"),
+                                              ("EXCO2", "Rev 9"))):
+            hx_share.write_record(store, dataclasses.replace(base, id=f"fm_00000000a{n}", code=code,
+                                                             artwork_revision=revision, status="development",
+                                                             print_text_ids=[], default_print_text_id=""))
+        self.bump_changes(store)
+        self.reload()
+        names = ["EXCO1 · Rev C", "EXCO2 · Rev 9", "EXCO2 · Rev 10", "EXCO2 · Rev B", "EXCO10 · Rev A"]
+        ids = [film_id, "fm_00000000a3", "fm_00000000a2", "fm_00000000a1", "fm_00000000a0"]
+        w = AdminWindow(self.root, services, page="products", record_id=product_id)
+        page = w.pages["products"]
+        self.assertEqual(list(page.tree.get_children(product_id)), ids)
+        self.assertEqual(page.editor.films_label.cget("text"), "\n".join(names))
+        self.assertEqual(list(w.pages["adjustments"].film_filter.cget("values")), ["All films"] + names)
+        dialog = AdjustmentDialog(self.root, services, machine_id=self.mid(), film_id=film_id)
+        self.assertEqual(list(dialog.film_box.cget("values")), names)
+        dialog.destroy()
+        w.select("print_texts", self.world.ids["print_text"])
+        self.assertEqual(list(w.pages["print_texts"].editor.film_vars), ids)
+
+
+class LayoutTests(UiCase):
+    """The admin window at its own size, and wider: screenshots of the finished app showed the Lines,
+    Machines and film forms with no fields at all (the field column squeezed to nothing) and the
+    print-text designer's hints running together off the right edge."""
+    FIELDS = ("TEntry", "TCombobox", "TSpinbox")
+    TEXTS = ("TLabel", "TCheckbutton", "TRadiobutton", "TButton")
+    CODE_HINT = "Up to 3 capital letters or digits, used in the printer's message name."
+    REVISION_HINT = "Goes up on every save. The send log records which one printed."
+
+    def steady(self, *widgets, timeout_s=3.0):
+        """Pump until the window has its size and the widgets' sizes have stopped changing: wrapped
+        hints take a few layout passes to settle."""
+        deadline = time.monotonic() + timeout_s
+        last, same = None, 0
+        while same < 5 and time.monotonic() < deadline:
+            self.root.update()
+            self.services.bus.pump()
+            now = [(w.winfo_width(), w.winfo_height()) for w in widgets]
+            same = same + 1 if now == last else 0
+            last = now
+            time.sleep(0.01)
+
+    def resize(self, w, size):
+        w.geometry(f"{size}+0+0")
+        deadline = time.monotonic() + 3.0
+        while f"{w.winfo_width()}x{w.winfo_height()}" != size and time.monotonic() < deadline:
+            self.root.update()
+            time.sleep(0.01)
+        self.steady(w)
+        return f"{w.winfo_width()}x{w.winfo_height()}" == size
+
+    def open_at(self, size):
+        w = AdminWindow(self.root, self.services)
+        self.addCleanup(lambda: alive(w) and w.destroy())
+        w.maxsize(4000, 4000)           # Tk on Windows caps a window at the screen's size unless told otherwise
+        w.deiconify()
+        if not self.resize(w, size):
+            self.skipTest(f"this screen can't show a {size} window")
+        return w
+
+    def check_editor(self, w, page_key, record_id="", item=""):
+        """Every field of the editor is shown at the width it asks for (so at least 120 px, or all of
+        its own width when it asks for less), and nothing in it is cut off or past its right edge."""
+        w.select(page_key, record_id)
+        page = w.pages[page_key]
+        form = page.editor
+        if item:
+            form.items_tree.selection_set(item)
+        self.steady(form, page.editor_scroller.canvas)
+        where = f"{page_key} {type(form).__name__} {item}".strip()
+        canvas = page.editor_scroller.canvas
+        right = canvas.winfo_rootx() + canvas.winfo_width()
+        self.assertEqual(page.editor_xbar.winfo_manager(), "", f"{where} scrolls sideways")
+        fields = [c for c in descendants(form) if c.winfo_class() in self.FIELDS]
+        self.assertTrue(any(f.winfo_width() >= 120 for f in fields), f"{where}: no field of 120 px")
+        for field in fields:
+            name = f"{where}: {field.winfo_class()} {field}"
+            width, asked = field.winfo_width(), field.winfo_reqwidth()
+            self.assertTrue(field.winfo_ismapped(), f"{name} isn't shown")
+            self.assertGreaterEqual(width, min(120, asked), f"{name} is squeezed to {width} px")
+            self.assertGreaterEqual(width, asked - 1, f"{name} is {width} px, not the {asked} px it asks for")
+            self.assertLessEqual(field.winfo_rootx() + width, right, f"{name} runs past the editor's right edge")
+        for widget in descendants(form):
+            if widget.winfo_class() not in self.TEXTS or not widget.winfo_ismapped():
+                continue
+            name = f"{where}: {widget.cget('text')!r}"
+            self.assertGreaterEqual(widget.winfo_width(), widget.winfo_reqwidth() - 1, f"{name} is cut off")
+            self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(), right,
+                                 f"{name} runs past the editor's right edge")
+        return form
+
+    def check_window(self, size):
+        ids = self.world.ids
+        w = self.open_at(size)
+        try:
+            for page_key, record_id, item in (("company", "", ""), ("lines", ids["line"], ""),
+                                              ("machines", ids["machine1"], ""), ("printers", ids["printer1"], ""),
+                                              ("products", ids["product"], ""), ("products", ids["film"], ""),
+                                              ("print_texts", ids["print_text"], ""),
+                                              ("print_texts", ids["print_text"], "i1"),
+                                              ("print_texts", ids["print_text"], "i3")):
+                self.check_editor(w, page_key, record_id, item)
+        finally:
+            w.destroy()
+
+    def test_editors_fit_the_window(self):
+        for size, language in (("1180x820", "en"), ("1400x820", "en"), ("1180x820", "es")):
+            with self.subTest(size=size, language=language):
+                i18n.set_language(language)
+                self.check_window(size)
+        i18n.set_language("en")
+
+    def test_print_text_hints_beside_their_own_fields(self):
+        """The Code hint and the revision hint each sit on their own field's row, apart and whole."""
+        w = self.open_at("1180x820")
+        editor = self.check_editor(w, "print_texts", self.world.ids["print_text"])
+        hints = {widget.cget("text"): widget for widget in descendants(editor) if widget.winfo_class() == "TLabel"}
+        code_hint, revision_hint = hints[self.CODE_HINT], hints[self.REVISION_HINT]
+        code_entry = next(e for e in descendants(editor)
+                          if e.winfo_class() == "TEntry" and str(e.cget("textvariable")) == str(editor.fields["code"]))
+        self.assertEqual(code_hint.grid_info()["row"], code_entry.grid_info()["row"])
+        self.assertEqual(revision_hint.grid_info()["row"], editor.revision_text.grid_info()["row"])
+        self.assertLessEqual(code_hint.winfo_y() + code_hint.winfo_height(), revision_hint.winfo_y())
+
+    def test_narrow_editor_scrolls_sideways(self):
+        """Below FORM_MIN_PX the editor keeps that width, with a sideways scrollbar, instead of
+        squeezing its fields; wide again, the scrollbar goes."""
+        w = self.open_at("1180x820")
+        w.select("machines", self.world.ids["machine1"])
+        page = w.pages["machines"]
+        self.steady(page.editor)
+        self.assertEqual(page.editor_xbar.winfo_manager(), "")
+        w.minsize(400, 400)
+        self.assertTrue(self.resize(w, "700x820"))
+        self.assertEqual(page.editor_xbar.winfo_manager(), "pack")
+        self.assertGreaterEqual(page.editor.winfo_width(), hx_ui_admin.FORM_MIN_PX - 8)
+        name = next(e for e in descendants(page.editor) if e.winfo_class() == "TEntry")
+        self.assertGreaterEqual(name.winfo_width(), name.winfo_reqwidth() - 1)
+        page.editor_scroller.canvas.xview_moveto(0.5)
+        self.steady(page.editor)
+        self.assertGreater(page.editor_scroller.canvas.xview()[0], 0.0)
+        self.assertTrue(self.resize(w, "1180x820"))
+        self.assertEqual(page.editor_xbar.winfo_manager(), "")
+        self.assertEqual(page.editor_scroller.canvas.xview()[0], 0.0)
 
 
 class TestPrintTests(UiCase):

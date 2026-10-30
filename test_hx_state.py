@@ -417,6 +417,115 @@ class StateTableTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# 2b. Names, never ids, in every text people read
+# --------------------------------------------------------------------------
+
+# A record id in a text: "mc_5d1e2f3a4b", "ln_missing", "sd_8a7b6c5d4e"
+ID_TEXT = re.compile(r"\b(?:mc|ln|pr|fm|pt|pd|sd|tp)_\w+")
+ALL_IDS = (MID, ENC_MID, MID2, LINE_ID, LINE2_ID, PID, ENC_PID, PID2, SID, SID2, RUN_ID)
+ENC_DAILY = {"values": {"ENWHD": 60, "ENPPR": 5000}, "encoder_ref": {"ENWHD": 56, "ENPPR": 5000},
+             "fonts": list(COMPANY.standard_fonts)}
+# The alert kinds ROWS doesn't raise: (name, facts, E, keywords, alert kind)
+MORE_ALERTS = [
+    ("low ink", facts(ink_level=2), expected(), {}, "low_ink"),
+    ("very low ink", facts(ink_level=3), expected(), {}, "low_ink"),
+    ("no ink, not printing", facts(printing=False, ink_level=4), STOPPED, {}, "low_ink"),
+    ("clock off", facts(clock_offset_s=600.0, clock_source="pc"), expected(), {}, "clock_off"),
+    ("foreign client", facts(foreign_client=True), expected(), {}, "foreign_client"),
+    ("fonts differ", facts(daily=dict(ENC_DAILY, fonts=["CourierN", "Arial"])), expected(), {}, "fonts_differ"),
+    ("encoder changed", facts(daily=ENC_DAILY), expected(), {"machine": ENC}, "encoder_changed"),
+    ("message unreadable", facts(running=None, running_unchecked=True), expected(), {}, "message_unreadable"),
+]
+
+
+def rendered(msg):
+    """The Msg as an English and a Spanish screen show it, nested Msgs included."""
+    def spanish(m):
+        return i18n.tr(m.text, **{k: spanish(v) if isinstance(v, Msg) else v for k, v in m.values.items()})
+    i18n.set_language("es")
+    try:
+        es = spanish(msg)
+    finally:
+        i18n.set_language("en")
+    return [msg.english(), es]
+
+
+def alerts_of(outcome, machine):
+    """The Alerts judge() would start for an outcome's needs."""
+    return [Alert(id=hs.alert_id(machine.id, n.kind, ref=n.ref, at=T0), machine_id=machine.id, line_id=machine.line_id,
+                  kind=n.kind, sound=hs.ALERT_KINDS[n.kind].sound, msg=n.msg, started_at=T0,
+                  recipients=["user:" + AKIM, "floor"], colour=n.colour, ref=n.ref, active=True)
+            for n in outcome.alerts]
+
+
+class NameNotIdTests(unittest.TestCase):
+    """Alerts, headlines, details, line and board texts name the machine, line and printer: a screenshot
+    once read "... on mc_l2b1"."""
+
+    def assertNoIds(self, msgs, what):
+        self.assertTrue(msgs, what)
+        for m in msgs:
+            for text in rendered(m):
+                self.assertIsNone(ID_TEXT.search(text), f"{what}: {text!r}")
+                for rid in ALL_IDS:
+                    self.assertNotIn(rid, text, what)
+
+    def test_no_id_in_any_rendered_alert_or_headline(self):
+        cases = [(name, f, e, kw) for name, f, e, kw, _, _ in ROWS] + [(n, f, e, kw) for n, f, e, kw, _ in MORE_ALERTS]
+        kinds_seen, views = set(), []
+        for name, f, e, kw in cases:
+            kw = dict(kw)
+            machine = kw.pop("machine", MACHINE)
+            out = classify(f, e, machine=machine, **kw)
+            headline = Msg(hs.STATE_TEXTS[out.code], dict(out.values))
+            alerts = alerts_of(out, machine)
+            self.assertNoIds([headline] + out.details + [a.msg for a in alerts], name)
+            for need in out.alerts:
+                kinds_seen.add(need.kind)
+                english = need.msg.english()
+                text = need.msg.text
+                if "{machine}" in text:
+                    self.assertIn(machine.name, english, name)
+                if "{printer}" in text:
+                    self.assertIn(DATA.printers[machine.printer_id].name, english, name)
+                self.assertNotIn("{", english, name)            # every blank filled
+            # What the monitor card shows: the headline, or the alert that replaces it, and every detail
+            snap = MachineSnapshot(code=out.code, colour=hs.STATE_CODES[out.code], headline=headline, since=T0,
+                                   detail=list(out.details))
+            p = poll(out.code, alerts=alerts, state=snap, machine_id=machine.id, printer_id=machine.printer_id)
+            view = hs.machine_view(machine, p, 5.0, e, kw.get("lk"), 70.0, {})
+            self.assertNoIds([view.headline] + view.details, name)
+            views.append(view)
+        self.assertEqual(kinds_seen, set(hs.ALERT_KINDS))           # every kind's text was checked
+
+        # A line headline names its worst machine; the board and floor rows carry the views' texts
+        for view in views:
+            ok = hs.machine_view(ENC, poll(machine_id=ENC_MID, printer_id=ENC_PID), 5.0, expected(machine_id=ENC_MID),
+                                 None, None, {})
+            lv = hs.line_view(LINE, [ok, view], None)
+            self.assertNoIds([lv.headline], view.code)
+            if lv.headline.text == hs.T_MACHINE_STATE:
+                self.assertEqual(lv.headline.values["machine"], view.name)
+        board = hs.board_view(DATA, {MID: poll("drift", alerts=[alert("drift")]), ENC_MID: poll(machine_id=ENC_MID)},
+                              {MID: 5.0, ENC_MID: 5.0}, {MID: expected(), ENC_MID: expected(machine_id=ENC_MID)},
+                              {PID2: lock("send", printer_id=PID2, line_id=LINE2_ID, machine_id=MID2)}, {PID2: 5.0},
+                              {}, {}, share_ok=True, standalone=False, now=T0)
+        texts = [lv.headline for lv in board.lines] + [m.headline for lv in board.lines for m in lv.machines]
+        texts += [d for lv in board.lines for m in lv.machines for d in m.details]
+        texts += [r.status for r in hs.floor_board_rows(board)]
+        self.assertNoIds(texts, "board")
+        self.assertEqual(board.lines[0].headline.values["machine"], "Line 1 Bagger 1")
+
+    def test_a_real_judgement_names_the_machine(self):
+        # Through judge() and its second reading, as the poller runs it
+        j = commit_second(poll(), reading(running=OLD), expected())
+        self.assertEqual([a.kind for a in j.alerts], ["drift"])
+        self.assertEqual(rendered(j.alerts[0].msg), ["Line 1 Bagger 1 isn't printing what Stripes sent",
+                                                     "Line 1 Bagger 1 no imprime lo que envió Stripes"])
+        self.assertEqual(j.alerts[0].machine_id, MID)              # the id stays in the record, not the text
+
+
+# --------------------------------------------------------------------------
 # 3. Crash recovery
 # --------------------------------------------------------------------------
 

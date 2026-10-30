@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import os
 import random
+import re
 import tempfile
 import time
 import unittest
@@ -14,6 +15,7 @@ from datetime import date, datetime
 
 import hx_fake
 import hx_message as hm
+import i18n
 from hx_core import Msg
 from hx_model import (AMBER, GREEN, STEPS, Calibration, Company, Country, DesignItem, Difference, ExpectedState,
                       FailureInfo, Film, HxData, Identity, Ink, Line, LineChoice, Machine, MachineFilmAdjustment,
@@ -28,18 +30,19 @@ ADMIN = Identity(user="EXAMPLE\\akim", computer="FLOOR02", sids=frozenset([ADMIN
 NOBODY = Identity(user="EXAMPLE\\akim", computer="FLOOR02", sids=frozenset(), pid=3)
 
 GOLDEN_DELAY = [
-    "<CRTMSG>EXCO1-PKO01-MN6D-L9</CRTMSG>",
+    "<CRTMSG>EXCO1-PKO01-FDNP-H9</CRTMSG>",
     "<CTDAT><OBJID>10001</OBJID><POS>0,0</POS><MARG>0,0</MARG><FONTIND>2</FONTIND><SIZE>4</SIZE><PREF>Packed on "
     "</PREF><FRMT>M/D/y</FRMT><DAY>0</DAY><MON>0</MON><YEAR>0</YEAR></CTDAT>",
     "<CTEXT><OBJID>10002</OBJID><XRID>10001</XRID><YRID>10001</YRID><SXAS>1</SXAS><SYAS>0</SYAS><MARG>0,0</MARG>"
     "<FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Product of USA and Canada</TXT></CTEXT>",
-    "<CTEXT><OBJID>10003</OBJID><XRID>10002</XRID><YRID>10002</YRID><SXAS>0</SXAS><SYAS>1</SYAS><MARG>0,0</MARG>"
+    # the lot is right of the origin with gap 0, so it is sent SIDE_GAP_MIN (8) away from it (§3.4)
+    "<CTEXT><OBJID>10003</OBJID><XRID>10002</XRID><YRID>10002</YRID><SXAS>0</SXAS><SYAS>1</SYAS><MARG>8,0</MARG>"
     "<FONTIND>2</FONTIND><SIZE>4</SIZE><TXT>Lot 4417</TXT></CTEXT>",
     "<CPPARM><ENCST>0</ENCST><DELAY>480000</DELAY><PRNSPD>2400</PRNSPD><ROTAT>0</ROTAT><MIRR>0</MIRR><RESMOD>0"
     "</RESMOD><BOLD>1</BOLD><WDTH>1</WDTH><QUANT>1</QUANT><REVRS>0</REVRS><AUTREP>0</AUTREP></CPPARM>",
     "<SAVEMSG>9</SAVEMSG>",
 ]
-GOLDEN_ENCODER = (["<CRTMSG>EXCO1-PKO01-5E11-W9</CRTMSG>"] + GOLDEN_DELAY[1:4]
+GOLDEN_ENCODER = (["<CRTMSG>EXCO1-PKO01-G79S-N9</CRTMSG>"] + GOLDEN_DELAY[1:4]
                   + [GOLDEN_DELAY[4].replace("<ENCST>0</ENCST><DELAY>480000</DELAY>",
                                              "<ENCST>1</ENCST><DLYMM>348</DLYMM>")] + GOLDEN_DELAY[5:])
 
@@ -487,9 +490,10 @@ class JoinedOriginTests(unittest.TestCase):
             hm.build_message(plan, 9)
 
     def test_text_joined_to_the_origin_without_a_new_word_still_sends(self):
-        # The FakeWorld print text has the lot right of the origin with gap 0 (send.md §3.5)
+        # The FakeWorld print text has the lot right of the origin with gap 0, which still prints
+        # SIDE_GAP_MIN away from it, so the bag text has the space (send.md §3.4, §3.5)
         plan = plan_for().machines[0]
-        self.assertEqual(plan.bag_text, "Packed on 10/29/26 / Product of USA and CanadaLot 4417")
+        self.assertEqual(plan.bag_text, "Packed on 10/29/26 / Product of USA and Canada Lot 4417")
         hm.build_message(plan, 9)
         # A lot, a code or punctuation next to the phrase makes no origin word
         for item in (PrintTextItem(id="i4", kind="machine_code", placement="right"),
@@ -536,17 +540,26 @@ class BuilderTests(unittest.TestCase):
                  PrintTextItem(id="i2", kind="fixed", text="B", placement="right", gap=2),
                  PrintTextItem(id="i3", kind="fixed", text="C", placement="below", gap=3),
                  PrintTextItem(id="i4", kind="fixed", text="D", placement="right"),
-                 PrintTextItem(id="i5", kind="fixed", text="E", placement="below")]
+                 PrintTextItem(id="i5", kind="fixed", text="E", placement="below"),
+                 PrintTextItem(id="i6", kind="fixed", text="F", placement="right", gap=12)]
         got, parts = self.placed(items)
-        self.assertEqual([d["OBJID"] for d in got], ["10001", "10002", "10003", "10004", "10005"])
+        self.assertEqual([d["OBJID"] for d in got], ["10001", "10002", "10003", "10004", "10005", "10006"])
         # The first item is absolute; its placement and gap are ignored
         self.assertEqual(parts[0], ("CTEXT", [("OBJID", "10001"), ("POS", "0,0"), ("MARG", "0,0"), ("FONTIND", "2"),
                                               ("SIZE", "4"), ("TXT", "A")]))
         rel = lambda d: (d["XRID"], d["YRID"], d["SXAS"], d["SYAS"], d["MARG"])
-        self.assertEqual(rel(got[1]), ("10001", "10001", "0", "1", "2,0"))     # right of item 1
+        # Side by side, MARG is measured from the previous item's right edge, so a gap under
+        # SIDE_GAP_MIN would print the two texts as one word: it is raised to SIDE_GAP_MIN
+        self.assertEqual(hm.SIDE_GAP_MIN, 8)
+        self.assertEqual(rel(got[1]), ("10001", "10001", "0", "1", "8,0"))     # right of item 1, gap 2 raised
         self.assertEqual(rel(got[2]), ("10001", "10002", "1", "0", "0,3"))     # below, lined up with item 1
-        self.assertEqual(rel(got[3]), ("10003", "10003", "0", "1", "0,0"))     # right of item 3
-        self.assertEqual(rel(got[4]), ("10003", "10004", "1", "0", "0,0"))     # below, at item 4's line start
+        self.assertEqual(rel(got[3]), ("10003", "10003", "0", "1", "8,0"))     # right of item 3, gap 0 raised
+        self.assertEqual(rel(got[4]), ("10003", "10004", "1", "0", "0,0"))     # below keeps gap 0
+        self.assertEqual(rel(got[5]), ("10005", "10005", "0", "1", "12,0"))    # a larger gap is sent as it is
+        self.assertEqual([hm.sent_gap(p, g) for p, g in (("right", 0), ("right", 7), ("right", 8), ("right", 50),
+                                                         ("below", 0), ("below", 3))], [8, 8, 8, 50, 0, 3])
+        # The font samples of a test print are side by side too, and never closer
+        self.assertGreaterEqual(hm.TEST_SAMPLE_GAP, hm.SIDE_GAP_MIN)
         for d in got[1:]:
             self.assertNotIn("POS", d)
         self.assertEqual(list(dict(parts[1][1])), ["OBJID", "XRID", "YRID", "SXAS", "SYAS", "MARG", "FONTIND",
@@ -584,7 +597,7 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual((dict(parts[4][1])["YEAR"], dict(parts[4][1])["DAY"]), ("1", "0"))
         self.assertNotIn("PREF", dict(parts[3][1]))
         self.assertEqual(hm._plan_bag_text(plan, date(2026, 10, 29)),
-                         "MB1. L1Best by 12 NOV 26 or sooner / DEC 202610/27")
+                         "MB1. L1 Best by 12 NOV 26 or sooner / DEC 2026 10/27")
 
     def test_print_text_rules(self):
         company = make_company()
@@ -663,10 +676,26 @@ class BuilderTests(unittest.TestCase):
                                                                                                     many)))
 
     def test_bag_text(self):
-        self.assertEqual(golden().bag_text, "Packed on 10/29/26 / Product of USA and CanadaLot 4417")
+        # Items on one line are joined by a space whatever their gap, because a right-placed item is
+        # always sent at least SIDE_GAP_MIN away (§3.4 rule 4, §3.5): the preview never shows
+        # "CanadaLot", and the printer never prints it
+        self.assertEqual(golden().bag_text, "Packed on 10/29/26 / Product of USA and Canada Lot 4417")
+        lot_marg, codes = {}, {}
+        for gap in (0, 4, 8, 12):
+            data = seed()
+            data.print_texts[PT].items[2].gap = gap
+            plan = golden(data=data)
+            self.assertEqual(plan.bag_text, "Packed on 10/29/26 / Product of USA and Canada Lot 4417", gap)
+            lot_marg[gap] = dict(hm.design_parts(plan)[0][2][1])["MARG"]
+            codes[gap] = hm.content_code(plan)
+        self.assertEqual(lot_marg, {0: "8,0", 4: "8,0", 8: "8,0", 12: "12,0"})
+        # Gaps that print alike make the same message; a wider one is a new message
+        self.assertEqual(len({codes[0], codes[4], codes[8]}), 1)
+        self.assertNotEqual(codes[12], codes[0])
         data = seed()
-        data.print_texts[PT].items[2].gap = 4
-        self.assertEqual(golden(data=data).bag_text, "Packed on 10/29/26 / Product of USA and Canada Lot 4417")
+        data.print_texts[PT].items[2].placement = "below"
+        self.assertEqual(golden(data=data).bag_text, "Packed on 10/29/26 / Product of USA and Canada / Lot 4417")
+        self.assertEqual(dict(hm.design_parts(golden(data=data))[0][2][1])["MARG"], "0,0")     # below: as given
 
 
 # --------------------------------------------------------------------------
@@ -694,7 +723,7 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(p.countries, ["USA", "Canada"])
             self.assertEqual(p.free_text, {})
             self.assertEqual(p.origin_line, "Product of USA and Canada")
-            self.assertEqual(p.bag_text, "Packed on 10/29/26 / Product of USA and CanadaLot 4417")
+            self.assertEqual(p.bag_text, "Packed on 10/29/26 / Product of USA and Canada Lot 4417")
             self.assertIsNone(p.test_step)
         self.assertEqual(delay.adjustment, data.adjustments[adjustment_id(M1, FILM)])
         self.assertIsNot(delay.adjustment, data.adjustments[adjustment_id(M1, FILM)])
@@ -719,7 +748,7 @@ class ValidationTests(unittest.TestCase):
             PrintTextItem(id="i5", kind="free_text", label="Note?", max_len=10, required=False, placement="right")]
         p = hm.merge_plan(request(choice(free_text={"i4": "  No. 1 "})), data, SENDER).machines[0]
         self.assertEqual(p.free_text, {"i4": "No. 1"})
-        self.assertEqual(p.bag_text, "Packed on 10/29/26 / Product of USA and CanadaLot 4417 No. 1")
+        self.assertEqual(p.bag_text, "Packed on 10/29/26 / Product of USA and Canada Lot 4417 No. 1")
 
     def test_preprinted(self):
         data = seed()
@@ -784,12 +813,13 @@ class ValidationTests(unittest.TestCase):
         check("Tick at least one machine on {line}.", edit(machine_ids=[]))
         check("{machine} isn't an active machine on {line}.", edit(machine_ids=[M3]))
         check("{machine} isn't an active machine on {line}.", setattr_(("machines", M2, "active"), False))
-        check("{machine} isn't an active machine on {line}.", edit(machine_ids=["mc_missing"]))
+        check("A machine chosen for {line} no longer exists.", edit(machine_ids=["mc_missing"]))
         check("{machine} is in this Send twice.", edit(machine_ids=[M1, M1]))
         check("Choose a product for {line}.", edit(product_id=""))
         check("The product chosen for {line} isn't active.", setattr_(("products", PRODUCT, "active"), False))
         check("The product chosen for {line} isn't active.", edit(product_id="pd_missing"))
         check("Choose a film for {line}.", edit(film_id=""))
+        check("The film chosen for {line} no longer exists.", edit(film_id="fm_missing"))
         film_text = ("Film {film} can't be sent to {line}: it must be active, belong to the product and use the "
                      "line's cartridge type.")
         e = check(film_text, setattr_(("films", FILM, "status"), "development"))
@@ -799,7 +829,7 @@ class ValidationTests(unittest.TestCase):
         check("Choose a print text for {line}.", edit(print_text_id=""))
         check("Print text {print_text} can't be used with film {film}.",
               setattr_(("print_texts", PT, "status"), "inactive"))
-        check("Print text {print_text} can't be used with film {film}.", edit(print_text_id="pt_missing"))
+        check("The print text chosen for {line} no longer exists.", edit(print_text_id="pt_missing"))
         check("Enter the lot for {line}.", edit(lot="  "))
         e = check("The lot for {line} must be {min} to {max} digits.", edit(lot="123"))
         self.assertIn(Msg("The lot for {line} must be {min} to {max} digits.", {"line": "Line 1", "min": 4, "max": 8}),
@@ -859,6 +889,60 @@ class ValidationTests(unittest.TestCase):
         e = check("Film {film} has no length, which encoder machines need.", setattr_(("films", FILM, "length_mm"),
                                                                                      None), choices=[choice()])
         self.assertEqual(len(e.problems), len(set(map(repr, e.problems))))
+
+    def test_problems_name_records_never_ids(self):
+        """A record that no longer exists has no name to show, and its id means nothing to a sender: the
+        texts say what is missing instead."""
+        id_text = re.compile(r"\b(?:mc|ln|pr|fm|pt|pd|sd)_\w+")
+
+        def spanish(m):
+            return i18n.tr(m.text, **{k: spanish(v) if isinstance(v, Msg) else v for k, v in m.values.items()})
+
+        def shown(problems):
+            i18n.set_language("es")
+            try:
+                es = [spanish(p) for p in problems]
+            finally:
+                i18n.set_language("en")
+            return [p.english() for p in problems] + es
+
+        gone = dict(machine_ids=[M1, "mc_missing", "mc_missing"], film_id="fm_missing", print_text_id="pt_missing",
+                    product_id="pd_missing")
+        requests = [
+            request(choice(**gone)),
+            request(choice(line_id="ln_missing"), choice(line_id="ln_missing")),
+            request(choice(machine_ids=["mc_missing"]), choice(line_id=L2, machine_ids=["mc_missing", M3])),
+            request(choice(machine_ids=[M1, M3, M1])),
+            request(choice(film_id="fm_missing")),
+        ]
+        found = []
+        for req in requests:
+            problems = []
+            try:
+                hm.merge_plan(req, seed(), SENDER)
+            except PlanError as e:
+                problems = e.problems
+            self.assertTrue(problems, req)
+            found += problems
+        ok = TestRanges(vary="delay", start=470, stop=490, step=10)
+        data = seed()
+        data.machines[M3].active = False
+        data.machines[M3].line_id = "ln_missing"
+        for machine_id, film_id in (("mc_missing", FILM), (M1, "fm_missing"), (M3, FILM)):
+            try:
+                hm.plan_test(machine_id, film_id, ok, data, ADMIN)
+                self.fail(f"{machine_id} {film_id} planned")
+            except PlanError as e:
+                found += e.problems
+        self.assertIn("A machine chosen for {line} no longer exists.", texts(found))
+        self.assertIn("The film chosen for {line} no longer exists.", texts(found))
+        self.assertIn("The print text chosen for {line} no longer exists.", texts(found))
+        self.assertIn("The machine chosen for this test no longer exists.", texts(found))
+        self.assertIn(Msg("A machine chosen for {line} no longer exists.", {"line": "Line 2"}), found)
+        self.assertIn(Msg("{machine} is in this Send twice.", {"machine": "Line 1 Bagger 1"}), found)
+        for text in shown(found):
+            self.assertIsNone(id_text.search(text), text)
+            self.assertNotIn("{", text)
 
     def test_validate_choice(self):
         data = seed()
@@ -1161,7 +1245,7 @@ class BuildTests(unittest.TestCase):
         self.assertEqual([c.tag for c in built.commands], ["CRTMSG", "CTDAT", "CTEXT", "CTEXT", "CPPARM", "SAVEMSG"])
         self.assertTrue(all(c.write for c in built.commands))
         self.assertEqual((built.slot, built.name, built.content_code, built.origin_line, built.bag_text),
-                         (9, "EXCO1-PKO01-MN6D-L9", "MN6D", "Product of USA and Canada", delay.bag_text))
+                         (9, "EXCO1-PKO01-FDNP-H9", "FDNP", "Product of USA and Canada", delay.bag_text))
         self.assertEqual([i.tag for i in built.expected_items], ["CTDAT", "CTEXT", "CTEXT"])
         self.assertEqual(built.expected_items[0].pairs[-4:], [("FRMT", "M/D/y"), ("DAY", "0"), ("MON", "0"),
                                                               ("YEAR", "0")])
@@ -1237,14 +1321,14 @@ class BuildTests(unittest.TestCase):
 
     def test_names(self):
         delay, encoder = golden(M1), golden(M2)
-        self.assertEqual(hm.content_code(delay), "MN6D")
+        self.assertEqual(hm.content_code(delay), "FDNP")
         self.assertEqual((hm.message_name(delay, 9), hm.message_name(delay, 10)),
-                         ("EXCO1-PKO01-MN6D-L9", "EXCO1-PKO01-MN6D-U0"))
-        self.assertEqual(hm.content_code(encoder), "5E11")
+                         ("EXCO1-PKO01-FDNP-H9", "EXCO1-PKO01-FDNP-D0"))
+        self.assertEqual(hm.content_code(encoder), "G79S")
         self.assertEqual((hm.message_name(encoder, 9), hm.message_name(encoder, 10)),
-                         ("EXCO1-PKO01-5E11-W9", "EXCO1-PKO01-5E11-D0"))
+                         ("EXCO1-PKO01-G79S-N9", "EXCO1-PKO01-G79S-U0"))
         other = hm.merge_plan(request(choice(lot="4418")), seed(), SENDER).machines[0]
-        self.assertEqual(hm.content_code(other), "RVFJ")
+        self.assertEqual(hm.content_code(other), "RSA0")
         longest = hm._name("ABCDEF", "XYZ", 123, "ZZZZ", 10)
         self.assertEqual(longest, "ABCDEF-XYZ23-ZZZZ-V0")
         self.assertEqual(len(longest), 20)
@@ -1253,23 +1337,23 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(len(canonical), 679)
         self.assertTrue(canonical.startswith(b'{"v":1,"items":[["CTDAT",[["OBJID","10001"],["POS","0,0"],'))
         self.assertEqual(hashlib.sha256(canonical).hexdigest(),
-                         "a54cde6dbf91adca88911db3bf74c1bfa9f6ee5516f245e8bd71c13f50d3166b")
+                         "7b6b6d64a5f307e0941bd6a0b848024de687a8b8dce2bbdaa3198c17bb3b42d0")
         # The content code follows anything printed, but not the slot, the name or the date
         data = seed()
         data.print_texts[PT].revision = 2
-        self.assertEqual(hm.content_code(golden(M1, data)), "MN6D")
+        self.assertEqual(hm.content_code(golden(M1, data)), "FDNP")
         self.assertEqual(hm.message_name(golden(M1, data), 9)[:12], "EXCO1-PKO02-")
         self.assertNotEqual(hm.content_code(hm.merge_plan(request(choice(countries=["Canada", "USA"])), seed(),
-                                                          SENDER).machines[0]), "MN6D")
+                                                          SENDER).machines[0]), "FDNP")
         # Parsing
-        self.assertEqual(hm.parse_message_name("EXCO1-PKO01-MN6D-L9"), MessageName("EXCO1", "PKO", 1, "MN6D", 9))
-        self.assertEqual(hm.parse_message_name("EXCO1-PKO01-5E11-D0"), MessageName("EXCO1", "PKO", 1, "5E11", 10))
-        for bad in ("EXCO1-PKO01-MN6D-M9", "STRIPES TEST", "1", "", None, "None", "EXCO1-PKO01-MN6D-L0",
-                    "EXCO1-PKO01-MN6D-L9 ", "exco1-PKO01-MN6D-L9", "EXCO1-PKO1-MN6D-L9"):
+        self.assertEqual(hm.parse_message_name("EXCO1-PKO01-FDNP-H9"), MessageName("EXCO1", "PKO", 1, "FDNP", 9))
+        self.assertEqual(hm.parse_message_name("EXCO1-PKO01-G79S-U0"), MessageName("EXCO1", "PKO", 1, "G79S", 10))
+        for bad in ("EXCO1-PKO01-FDNP-M9", "STRIPES TEST", "1", "", None, "None", "EXCO1-PKO01-FDNP-H0",
+                    "EXCO1-PKO01-FDNP-H9 ", "exco1-PKO01-FDNP-H9", "EXCO1-PKO1-FDNP-H9"):
             self.assertIsNone(hm.parse_message_name(bad), bad)
         for letter in hm.CHECK_LETTERS:
-            if letter != "L":
-                self.assertIsNone(hm.parse_message_name(f"EXCO1-PKO01-MN6D-{letter}9"), letter)
+            if letter != "H":
+                self.assertIsNone(hm.parse_message_name(f"EXCO1-PKO01-FDNP-{letter}9"), letter)
         rng = random.Random(1109)
         alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         for _ in range(200):
@@ -1282,8 +1366,8 @@ class BuildTests(unittest.TestCase):
             self.assertLessEqual(len(name), 20)
             self.assertGreaterEqual(len(name), 13)
             self.assertEqual(hm.parse_message_name(name), MessageName(film_code, code, revision % 100, content, slot))
-        self.assertIn(hm.check_letter("EXCO1-PKO01-MN6D-9"), hm.CHECK_LETTERS)
-        self.assertEqual(hm.check_letter("EXCO1-PKO01-MN6D-9"), "L")
+        self.assertIn(hm.check_letter("EXCO1-PKO01-FDNP-9"), hm.CHECK_LETTERS)
+        self.assertEqual(hm.check_letter("EXCO1-PKO01-FDNP-9"), "H")
 
     def test_empty_and_idle(self):
         self.assertEqual([c.xml for c in hm.empty_message_commands(10)], ["<CRTMSG></CRTMSG>", "<SAVEMSG>10</SAVEMSG>"])
@@ -1363,8 +1447,8 @@ class CompareTests(unittest.TestCase):
         d.black_pixels = 0
         self.assertEqual(self.one(d), Difference("picture", "BPIX", "more than 0", "0"))
         d = self.readback()
-        d.name = "EXCO1-PKO01-MN6D-U0"
-        self.assertEqual(self.one(d), Difference("name", "MSGNAM", "EXCO1-PKO01-MN6D-L9", "EXCO1-PKO01-MN6D-U0"))
+        d.name = "EXCO1-PKO01-FDNP-D0"
+        self.assertEqual(self.one(d), Difference("name", "MSGNAM", "EXCO1-PKO01-FDNP-H9", "EXCO1-PKO01-FDNP-D0"))
         d = self.readback()
         d.slot = 10
         self.assertEqual(self.one(d), Difference("slot", "MSNO", "9", "10"))
@@ -1397,7 +1481,7 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(self.one(d).field, "BOUND")
         d = self.readback()
         d.items[2].pairs = [(k, v) for k, v in d.items[2].pairs if k != "MARG"]
-        self.assertEqual(self.one(d), Difference("item 3 (CTEXT)", "MARG", "0,0", "(missing)"))
+        self.assertEqual(self.one(d), Difference("item 3 (CTEXT)", "MARG", "8,0", "(missing)"))
         d = self.readback()
         d.items[2].pairs = [(k, v) for k, v in d.items[2].pairs if k != "SIZE"]
         self.assertEqual(self.one(d), Difference("item 3 (CTEXT)", "SIZE", "3", "(missing)"))
@@ -1496,7 +1580,7 @@ class CompareTests(unittest.TestCase):
         self.assertTrue(hm.cleared(MessageDesign(slot=9, name="", empty=True)))
         self.assertTrue(hm.cleared(MessageDesign(slot=10, name="", empty=False, settings={"ROTAT": "0"})))
         self.assertFalse(hm.cleared(self.readback()))
-        self.assertFalse(hm.cleared(MessageDesign(slot=9, name="EXCO1-PKO01-MN6D-L9", empty=False)))
+        self.assertFalse(hm.cleared(MessageDesign(slot=9, name="EXCO1-PKO01-FDNP-H9", empty=False)))
 
     def test_print_area(self):
         d = self.readback()
@@ -1533,7 +1617,7 @@ class CompareTests(unittest.TestCase):
 class ResumeTests(unittest.TestCase):
     def test_rules(self):
         machine = seed().machines[M1]
-        live = dict(machine_id=M1, mode="running", confirmed=True, message_name="EXCO1-PKO01-MN6D-L9", slot=9)
+        live = dict(machine_id=M1, mode="running", confirmed=True, message_name="EXCO1-PKO01-FDNP-H9", slot=9)
         failure = FailureInfo(step="build", msg=Msg("x"), after_switch=False, at=T0)
         cases = [
             (None, "No Send is recorded for {machine}. Send instead."),
@@ -1562,7 +1646,7 @@ class ResumeTests(unittest.TestCase):
         self.assertIsNone(hm.resume_mismatch(expected, design, machine))
         mismatch = Msg("The message on {machine} isn't the last confirmed Send. Send again instead.",
                        {"machine": "Line 1 Bagger 1"})
-        for change in (lambda d: setattr(d, "name", "EXCO1-PKO01-MN6D-U0"), lambda d: setattr(d, "slot", 10),
+        for change in (lambda d: setattr(d, "name", "EXCO1-PKO01-FDNP-D0"), lambda d: setattr(d, "slot", 10),
                        lambda d: set_pair(d, 2, "TXT", "Product of USA")):
             d = copy.deepcopy(design)
             change(d)
@@ -1650,7 +1734,7 @@ class TestPlanTests(unittest.TestCase):
             (M2, dataclasses.replace(ok, fonts=[(2, 3)] * 7), "At most {n} fonts can be printed side by side."),
             (M2, dataclasses.replace(ok, fonts=[(7, 3)]), "A tested value is out of range."),
             (M2, dataclasses.replace(ok, fonts=[(2, 11)]), "A tested value is out of range."),
-            ("mc_missing", ok, "{machine} isn't an active machine on {line}."),
+            ("mc_missing", ok, "The machine chosen for this test no longer exists."),
         ]
         for machine_id, ranges, text in cases:
             self.assertIn(text, problems_of(hm.plan_test, machine_id, FILM, ranges, data, ADMIN), ranges)
