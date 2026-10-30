@@ -269,8 +269,12 @@ class _Worker:
                     self._leave()
                     return
                 if now - self.settle_from < settle_s(self.timings):
-                    self._write_status()          # settle: keep P fresh, no request yet
-                    self.next_wake = min(self.next_wake, self.settle_from + settle_s(self.timings))
+                    # Settle: keep P fresh, no request yet. P is read before each write, so a write by
+                    # another PC that starts at about the same time is never overwritten unseen
+                    if self._rival_check(self.poller.live):
+                        self._write_status()
+                    if not self.done:
+                        self.next_wake = min(self.next_wake, self.settle_from + settle_s(self.timings))
                     return
                 self._cycle()
             except _Abandon:
@@ -367,6 +371,15 @@ class _Worker:
         age = store.poll_age(self.machine_id) or 0.0
         if found is not None:
             self.poller._note_counter(self.machine_id, found.counter)
+            if (found.poller and found.poller != self.key and found.yielded_to != self.key and age < t.stale_s
+                    and found.poller not in {hb.key for hb in self.poller.live}):
+                # The invariant (storage.md §12.6 rule 1) on the file as it is now: a PC this one doesn't
+                # see as live wrote it since the coordinator's read (a slow share, or a new file the share
+                # hid from this PC for a moment), so it polls or is starting too, and no rank check can
+                # settle it. Don't start; the next pass decides again. Between two PCs that both see each
+                # other the rank check settles a start race (§6.3 step 2)
+                self.done = True
+                return
             base = found
         else:
             base = PollStatus(machine_id=self.machine_id, printer_id=self.printer_id, poller=self.key)
@@ -1008,15 +1021,20 @@ class _Worker:
         self._judge_and_write(r, e, lock, machine, line, data, cyc)
 
     def _rival_check(self, live):
-        """True when this cycle may make requests. Two PCs can both pass their rank check while they
-        disagree about who is live (on a slow share each can see the other's heartbeat as stale), and
-        architecture §7.3 rule 2 says two pollers never overlap even then. So right before its first
-        request, and at every cycle after it, the worker reads P. A write by another PC since this
-        worker's own (and not a yield to this PC) means that PC polls, or is starting, too:
+        """True when this cycle may make requests (or, while settling, write P). Two PCs can both pass
+        their rank check while they disagree about who is live (on a slow share each can see the
+        other's heartbeat as stale), and architecture §7.3 rule 2 says two pollers never overlap even
+        then. So before every settle write, right before its first request, and at every cycle after
+        it, the worker reads P. Reading before each settle write matters: two starters a few seconds
+        apart would otherwise each overwrite the other's writes and find only their own at the rank
+        check. A write by another PC since this worker's own (and not a yield to this PC) means that PC
+        polls, or is starting, too:
         - one this PC doesn't see as live is yielded to at once, without a request;
-        - a live one ranks below this PC (the rank check passed) and yields at its own rank check. Until
-          P shows that yield, or P has been quiet for stale_s, this worker makes no request and doesn't
-          write P (P keeps one writer), and continues from what that PC wrote."""
+        - a live one that ranks above this PC (possible while settling, before the rank check): this
+          PC hands over to rank 0 at once, without a request;
+        - a live one ranks below this PC and yields at its own rank check. Until P shows that yield,
+          or P has been quiet for stale_s, this worker makes no request and doesn't write P (P keeps
+          one writer), and continues from what that PC wrote."""
         try:
             found = self.store.read_poll(self.machine_id)
         except FormatTooNew:
@@ -1041,7 +1059,12 @@ class _Worker:
             other = found.poller
         if other:
             if other not in {hb.key for hb in live}:
+                self._adopt(found)      # the yield carries that PC's latest P, not this worker's older copy
                 self._finish("rank", other)
+                return False
+            order = assign(self.poller.printer_ids, live).get(self.printer_id) or []
+            if order and order[0] != me:
+                self._finish("rank", order[0])
                 return False
             self.rival = other
         if not self.rival:
@@ -1365,34 +1388,56 @@ class _StandaloneCheck:
         if printer is None or machine is None or line is None:
             return
         e = poller._cached_expected(self.machine_id)
-        r = Reading(at=clock.time(), reachable=True, standalone=True)
-        cyc = _Cycle(None, self.failures)
         try:
             client = poller.clients.client(printer)
         except AuthFailed:
             client = None
             self.problem = "login_failed"
-            r.problem, r.failures = self.problem, self.failures
-            r.reachable = self.failures < _STANDALONE_UNREACHABLE_AFTER
-        if client is not None:
-            self._quick(cyc, client, r, printer, data, ("HXUI", "PRIN", "MSGNAM", "counter"))
-        self.failures = r.failures
-        j = hx_state.judge(self.status, r, e, None, machine, line, data, t)
-        if j.recheck and client is not None:
-            if not clock.sleep(t.second_reading_s, poller._cancel):
-                return
-            r2 = dataclasses.replace(r, second=True, at=clock.time(), pending_code=j.candidate.code,
-                                     pending_alerts=j.candidate_alerts)
-            items = []
-            for item in j.recheck:
-                mapped = {"reach": "PRIN", "PRIN": "PRIN", "uid": "HXUI", "MSGNAM": "MSGNAM"}.get(item)
-                if mapped and mapped not in items:
-                    items.append(mapped)
-            again = _Cycle(None, self.failures)
-            self._quick(again, client, r2, printer, data, items)
-            self.failures = r2.failures
-            r = r2
+        answered = None              # wall time of the last reading that got a reply
+        for attempt in (1, 2):
+            r = Reading(at=clock.time(), reachable=True, standalone=True)
+            cyc = _Cycle(None, self.failures)
+            if client is None:
+                r.problem, r.failures = self.problem, self.failures
+                r.reachable = self.failures < _STANDALONE_UNREACHABLE_AFTER
+            else:
+                self._quick(cyc, client, r, printer, data, ("HXUI", "PRIN", "MSGNAM", "counter"))
+                if cyc.replied:
+                    answered = r.at
+            self.failures = r.failures
             j = hx_state.judge(self.status, r, e, None, machine, line, data, t)
+            if j.recheck and client is None:
+                # Nothing can be read again (a password that can't be unscrambled): it commits at once,
+                # as in share mode (§6.4 step 10)
+                r = dataclasses.replace(r, second=True, pending_code=j.candidate.code,
+                                        pending_alerts=j.candidate_alerts)
+                j = hx_state.judge(self.status, r, e, None, machine, line, data, t)
+            elif j.recheck:
+                if not clock.sleep(t.second_reading_s, poller._cancel):
+                    return
+                r2 = dataclasses.replace(r, second=True, at=clock.time(), pending_code=j.candidate.code,
+                                         pending_alerts=j.candidate_alerts)
+                items = []
+                for item in j.recheck:
+                    mapped = {"reach": "PRIN", "PRIN": "PRIN", "uid": "HXUI", "MSGNAM": "MSGNAM"}.get(item)
+                    if mapped and mapped not in items:
+                        items.append(mapped)
+                again = _Cycle(None, self.failures)
+                self._quick(again, client, r2, printer, data, items)
+                if again.replied:
+                    answered = r2.at
+                self.failures = r2.failures
+                r = r2
+                j = hx_state.judge(self.status, r, e, None, machine, line, data, t)
+                if not j.committed and attempt == 1:
+                    # The second reading contradicts the first (say printing read off, then no reply):
+                    # nothing commits (§3.8 step 6). Share mode starts afresh at its next cycle, 5 s
+                    # later; the next standalone check is standalone_poll_s away, so check again now
+                    # rather than leave the machine as it was (green, say) until then
+                    if not clock.sleep(t.second_reading_s, poller._cancel):
+                        return
+                    continue
+            break
         old = self.status
         f = j.facts
         self.counter += 1
@@ -1405,7 +1450,8 @@ class _StandaloneCheck:
             since = r.at
         self.status = dataclasses.replace(
             base, printer_id=self.printer_id, poller=poller.identity.key, counter=self.counter, written_at=r.at,
-            reachable=f.reachable, failures=f.failures, last_answer_at=r.at if cyc.replied else base.last_answer_at,
+            reachable=f.reachable, failures=f.failures,
+            last_answer_at=answered if answered is not None else base.last_answer_at,
             printing=f.printing, message_name=f.message_name, bag_count=f.bag_count, bags_recent=f.bags_recent,
             ink_name=f.ink_name, ink_level=f.ink_level, head_temp_c=f.head_temp_c, clock_offset_s=f.clock_offset_s,
             running=f.running, daily=f.daily, state=j.state, alerts=j.alerts, foreign_client=f.foreign_client,

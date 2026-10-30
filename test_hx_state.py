@@ -1157,6 +1157,25 @@ class MessageCheckTests(unittest.TestCase):
         self.assertEqual([x.kind for x in j2.ended], ["message_unreadable"])
         self.assertEqual(classify(facts(running=None), expected(), standalone=True).code, "running_confirmed")
 
+    def test_standalone_without_a_prin_reading(self):
+        # Standalone checks never load the message: when printing hasn't been read either (a busy or
+        # nonsense PRIN since the outage began), nothing stands behind green "Printing" (C12)
+        out = classify(facts(running=None, printing=None), expected(), standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("unknown_while_down", []))
+        self.assertEqual(hs.STATE_CODES[out.code], AMBER)
+        self.assertEqual(classify(facts(running=None), expected(), standalone=True).code, "running_confirmed")
+        # Share mode keeps "printing on or not yet read" with R known (§2.2 running_confirmed)
+        self.assertEqual(classify(facts(printing=None), expected()).code, "running_confirmed")
+        # Other modes, no E and an untrusted printer are as before
+        stopped = expected("stopped_by_user", stopped_by=AKIM)
+        self.assertEqual(classify(facts(running=None, printing=None), stopped, standalone=True).code, "stopped")
+        self.assertEqual(classify(facts(running=None, printing=None), None, standalone=True).code, "idle")
+        self.assertEqual(classify(facts(running=None, printing=None, reachable=False), expected(),
+                                  standalone=True).code, "off")
+        # The first standalone check (no prev) commits it after its second reading
+        j = commit_second(None, reading(running=None, printing=None, standalone=True), expected())
+        self.assertEqual(j.state.code, "unknown_while_down")
+
     def test_origin_unknown_while_unchecked(self):
         self.assertEqual(hs.effective_origin(poll("message_unchecked", running=None), expected()), "")
         self.assertEqual(hs.effective_origin(poll("message_unchecked"), expected()), "")

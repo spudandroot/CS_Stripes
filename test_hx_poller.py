@@ -25,7 +25,7 @@ import hx_share
 import hx_state
 import hx_time
 from hx_core import SYSTEM_CLOCK, EventBus, FakeClock, Msg
-from hx_model import (AMBER, RED, TIMINGS, Ack, BoardUpdate, DesignItem, ExpectedState, FailureInfo,
+from hx_model import (AMBER, RED, TIMINGS, Ack, AuthFailed, BoardUpdate, DesignItem, ExpectedState, FailureInfo,
                       HeartbeatInfo, MessageDesign, PollerUpdate, PollStatus)
 
 EDT = lambda utc: -14400.0               # a fixed offset: the fake printer's clock doesn't follow the host
@@ -1014,6 +1014,80 @@ class StandaloneTests(Base):
         self.assertEqual(len(a.entries("state_changed")), n)
         self.assertEqual(st.alerts, [])
 
+    def green_standalone(self, sim):
+        """A confirmed machine, then the share down with the monitor open: standalone with a green check."""
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        a.poller.set_monitor_open(True, False)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        self.assertTrue(sim.run(LOGIC.standalone_poll_s + 1,
+                                until=lambda: a.poller.local_statuses().get(sim.mid) is not None))
+        sim.run(LOGIC.standalone_poll_s + 1)
+        self.assertEqual(a.poller.local_statuses()[sim.mid].state.code, "running_confirmed")
+        return a
+
+    def test_off_then_no_reply_is_checked_again_at_once(self):
+        # A check reads printing off and its second reading gets no reply: the two disagree, so nothing
+        # commits (§3.8 step 6). The check then checks again at once instead of leaving the machine
+        # green "Printing" for another standalone_poll_s
+        sim = self.sim()
+        a = self.green_standalone(sim)
+        st = a.poller._standalone
+        sim.clock.advance(st.next_check - sim.clock.monotonic() - 0.2)
+        replies = []
+
+        def prin():
+            replies.append(1)
+            return "0" if len(replies) == 1 else sim.fake.SILENT
+        sim.fake.override("PRIN", prin)
+        t0 = sim.clock.monotonic()
+        sim.run(8)
+        a.watcher.run_once()
+        mv = machine_on_board(a, sim.mid)
+        self.assertNotEqual(mv.colour, "green")
+        self.assertEqual((mv.code, a.poller.local_statuses()[sim.mid].reachable), ("off", False))
+        self.assertEqual(len(sim.requests(since=t0, tag="HXUI")), 2)        # the check, and once more
+        self.assertLess(sim.clock.monotonic() - t0, LOGIC.standalone_poll_s)
+
+    def test_printing_never_read_in_standalone_is_not_green(self):
+        # PRIN answers busy at every check from the first one (no prev): standalone checks never load
+        # the message, so without a PRIN reading the machine is amber, not green "Printing"
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        sim.fake.override("PRIN", "6")
+        a.poller.set_monitor_open(True, False)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        self.t0 = sim.clock.monotonic()
+        seen = self.board_samples(sim, a, 8, 10)
+        self.assertEqual([s for s in seen if s[2] == "green"], [], seen)
+        self.assertEqual(seen[-1][1:], ("unknown_while_down", "amber"))
+        # PRIN answers again: green after the check and its second reading
+        sim.fake.override("PRIN", None)
+        self.assertTrue(sim.run(LOGIC.standalone_poll_s + 5,
+                                until=lambda: a.poller.local_statuses()[sim.mid].state.code == "running_confirmed"))
+
+    def test_a_client_that_cant_be_made_commits_at_once(self):
+        # No client for the printer (a password that can't be unscrambled): nothing can be read again,
+        # so login_failed commits at the check, as in share mode, instead of the old green never moving
+        sim = self.sim()
+        a = self.green_standalone(sim)
+
+        def no_client(printer):
+            raise AuthFailed(Msg("Stripes can't log in to this printer."))
+        a.poller.clients.client = no_client
+        sim.run(LOGIC.standalone_poll_s + 1)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual((st.state.code, st.problem), ("login_failed", "login_failed"))
+        a.watcher.run_once()
+        self.assertEqual(machine_on_board(a, sim.mid).colour, RED)
+
     def test_standalone_waits_for_lock_stale(self):
         sim = self.sim()
         sim.expect()
@@ -1463,10 +1537,12 @@ class FreshnessTests(Base):
         self.no_violations(sim)
 
 
-    def disagreement_race(self, hiding, seconds=40.0):
+    def disagreement_race(self, hiding, seconds=40.0, stagger=None):
         """Two PCs start a worker for a printer without P in the same moment while, for `seconds`, the
         rank-0 PC ("r0"), the rank-1 PC ("r1") or both don't see the other's heartbeat as live (a slow
-        share). Returns the sim, both PCs, when the disagreement ends and (time, computer) for every
+        share). With `stagger`, the PC "akim" starts first and "bob" that many seconds later, its share
+        still hiding akim's new poll.json from it at that moment (the SMB not-found cache, storage.md
+        §19). Returns the sim, both PCs, when the disagreement ends and (time, computer) for every
         printer request each PC's client sent."""
         sim = self.sim()
         sim.expect()
@@ -1475,6 +1551,11 @@ class FreshnessTests(Base):
         hidden = {"both": (a, b), "r0": (r0,), "r1": (r1,)}[hiding]
         hide_until = sim.clock.monotonic() + seconds
         sent = []
+        sim.polling_at_request = []         # (time, computer, PCs whose worker is past its rank check)
+
+        def polling():
+            return frozenset(pc.identity.computer for pc in (a, b)
+                             if pc.worker() is not None and pc.worker().rank_checked and not pc.worker().done)
         for pc, other in ((a, b), (b, a)):
             if pc in hidden:
                 real = pc.store.live_heartbeats
@@ -1493,11 +1574,30 @@ class FreshnessTests(Base):
                     for name in ("read", "command", "load_slot", "fonts", "firmware"):
                         def call(*args, _fn=getattr(c, name), **kw):
                             sent.append((sim.clock.monotonic(), pc.identity.computer))
+                            sim.polling_at_request.append((sim.clock.monotonic(), pc.identity.computer, polling()))
                             return _fn(*args, **kw)
                         setattr(c, name, call)
                     c._logged = True
                 return c
             pc.clients.client = client
+        if stagger is not None:
+            # bob's share doesn't show akim's new file until just after bob's worker has read it at its start
+            shown_from = [None]
+            real_read, real_age = b.store.read_poll, b.store.poll_age
+
+            def hidden_file(mid):
+                return mid == sim.mid and (shown_from[0] is None or sim.clock.monotonic() < shown_from[0])
+            b.store.read_poll = lambda mid: None if hidden_file(mid) else real_read(mid)
+            b.store.poll_age = lambda mid: 1e9 if hidden_file(mid) else real_age(mid)
+            while not a.poller._workers:
+                a.poller._coordinate()
+                sim.clock.advance(LOGIC.heartbeat_s)
+            sim.run(stagger, pcs=[a])
+            shown_from[0] = sim.clock.monotonic() + 0.5
+            while not b.poller._workers:
+                b.poller._coordinate()
+            b.poller._next_coord = sim.clock.monotonic() + LOGIC.heartbeat_s
+            return sim, a, b, hide_until, sent
         # Both coordinators see the missing poll.json for stale_s and decide in the same moment
         while not (a.poller._workers and b.poller._workers):
             for pc in (a, b):
@@ -1523,6 +1623,49 @@ class FreshnessTests(Base):
                 late = {pc for t, pc in sent if t >= sim.clock.monotonic() - 30}
                 self.assertEqual(late, {active[0].identity.computer})
                 self.no_violations(sim)
+
+    def test_staggered_start_race_while_pcs_disagree(self):
+        # Two PCs that don't see each other as live start a few seconds apart, the second one's share
+        # still hiding the first one's new poll.json. The second starter's settle writes used to
+        # overwrite the first starter's, so each found only its own write at its rank check and both
+        # polled the printer: the first one stopped only at its next cycle, after the second one's
+        # first request (on a real printer a cycle lasts seconds, so their requests overlapped). Each
+        # starter now reads P before every settle write, and whichever finds the other's write first
+        # yields before any request. At every request only one PC is past its rank check
+        for stagger in (0.5, 2.0, 3.5, 6.5, 9.5):
+            with self.subTest(stagger=stagger):
+                sim, a, b, hide_until, sent = self.disagreement_race("both", seconds=60.0, stagger=stagger)
+                self.assertTrue(sim.run(hide_until - sim.clock.monotonic() + 1))
+                both = [(round(t, 1), who, sorted(p)) for t, who, p in sim.polling_at_request if len(p) > 1]
+                self.assertEqual(both, [])
+                self.assertTrue(all(p == {who} for _, who, p in sim.polling_at_request))
+                sim.run(90)
+                active = [pc for pc in (a, b) if pc.worker() is not None and not pc.worker().done]
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0].key, assign_order(sim, a, b)[0])
+                self.assertEqual(sim.code(), "running_confirmed")
+                self.assertEqual({pc for t, pc in sent if t >= sim.clock.monotonic() - 30},
+                                 {active[0].identity.computer})
+                self.no_violations(sim)
+
+    def test_worker_doesnt_start_over_a_new_write(self):
+        # Between the coordinator's read and the worker's start, a PC this one doesn't see as live wrote P
+        # (it started too): the worker doesn't start and leaves the file alone; the next pass decides again
+        sim = self.sim()
+        sim.expect()
+        a, b = sim.pc("akim"), sim.pc("bob")
+        while not a.poller._workers:
+            a.poller._coordinate()
+            sim.clock.advance(LOGIC.heartbeat_s)
+        w = a.worker()
+        b.store.write_poll(bare_poll(sim, b.key, counter=7))
+        w.tick()
+        self.assertTrue(w.done)
+        self.assertEqual(a.entries("polling_started"), [])
+        self.assertEqual((sim.p().poller, sim.p().counter), (b.key, 7))
+        # The same file left alone for stale_s: the next pass starts a worker (a takeover)
+        sim.run(LOGIC.stale_s + 2 * LOGIC.heartbeat_s, pcs=[a])
+        self.assertEqual([e["reason"] for e in a.entries("polling_started")], ["takeover"])
 
 
     def test_another_writer_in_p_while_polling(self):
@@ -1597,6 +1740,11 @@ def machine_on_board(pc, machine_id):
             if m.machine_id == machine_id:
                 return m
     return None
+
+
+def bare_poll(sim, poller, *, counter):
+    """A bare poll.json for the sim's machine, as a starting poller writes it."""
+    return PollStatus(machine_id=sim.mid, printer_id=sim.pid, poller=poller, counter=counter)
 
 
 def assign_order(sim, *pcs):

@@ -857,11 +857,14 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
         else:
             carry("message_unreadable")
 
-    # C12: standalone, and the message on record can't be checked
+    # C12: standalone, and the message on record can't be checked. Also while printing hasn't been
+    # read since the outage began (a busy or nonsense PRIN at every check): standalone checks never
+    # load the message, so without a PRIN reading nothing at all stands behind green "Printing"
     if standalone:
         name_differs = (names_message and trusted and F.message_name is not None
                         and norm_name(F.message_name) != norm_name(e.message_name))
-        if name_differs or mode in ("switch_pending", "test_running"):
+        unread = trusted and mode == "running" and failure is None and not e.rejected and F.printing is None
+        if name_differs or unread or mode in ("switch_pending", "test_running"):
             codes.add("unknown_while_down")
 
     # C13 to C15: ink
