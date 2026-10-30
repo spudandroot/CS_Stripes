@@ -254,9 +254,15 @@ def _alive(widget):
 
 
 def _full_screen(window, on=True):
-    """The red windows: full screen and on top of everything."""
+    """The red windows: full screen and on top of everything. A window already on screen is taken
+    off and shown again, so a window manager that only reads the state at mapping applies it too."""
+    mapped = bool(window.winfo_ismapped())
+    if mapped:
+        window.withdraw()
     window.attributes("-fullscreen", bool(on))
     window.attributes("-topmost", bool(on))
+    if mapped:
+        window.deiconify()
 
 
 class _Lines(ttk.Label):

@@ -453,7 +453,15 @@ class Navigator:
             self.offline_sends.append(send_id)
 
     def note_offline_answer(self, send_id: str, machine_ids: list[str], everything_right: bool) -> None:
+        check_tk_thread()
         self.offline_answers[send_id] = (list(machine_ids), bool(everything_right))
+        # The share may have come back, and its run dropped this Send, while the answer was on its
+        # way: keep the Send until its answer is on the share, and run now when the share is up
+        # (no ShareHealth(ok=True) comes while it stays up)
+        self.note_offline_send(send_id)
+        services = self.services
+        if services is not None and services.store.available and not self._offline_running:
+            self._record_offline()
 
     def _on_share_health(self, event):
         check_tk_thread()
@@ -463,7 +471,7 @@ class Navigator:
     def _record_offline(self):
         services = self.services
         ids = list(self.offline_sends)
-        answers = dict(self.offline_answers)
+        answers = dict(self.offline_answers)    # the answers this run passes to confirm
         self._offline_running = True
 
         def work():
@@ -489,10 +497,18 @@ class Navigator:
             self._offline_running = False
             if error is not None:
                 return
+            again = False
             for send_id in done or []:
+                if self.offline_answers.get(send_id) != answers.get(send_id):
+                    # The sender answered while this run was going (bg's done() runs later on the
+                    # Tk thread): that answer isn't on the share yet, so the Send stays
+                    again = True
+                    continue
                 if send_id in self.offline_sends:
                     self.offline_sends.remove(send_id)
                 self.offline_answers.pop(send_id, None)
+            if again and services.store.available:
+                self._record_offline()      # record_offline again writes nothing; then confirm
 
         services.bg.run(work, finished)
 
@@ -617,6 +633,9 @@ class MapleJetTab(ttk.Frame):
         self.received = self.services.clock.monotonic()
         self._show_banner()
         self._show_admin()
+        if self.services.data.current is None:
+            # No DataUpdate comes while the settings fail to load; the watcher's boards do
+            self._show_board_area()
 
     def _on_data(self):
         self.roles = roles(self.services)

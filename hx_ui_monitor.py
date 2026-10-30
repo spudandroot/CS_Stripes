@@ -64,6 +64,8 @@ ES = {
     "{n}: {width} x {height}": "{n}: {width} x {height}",
     "This screen": "Esta pantalla",
     "Open the floor board now": "Abrir el tablero de planta ahora",
+    # Also hx_ui's (ui.md §16.5): the monitor and floor board say it while the settings load
+    "Loading the MapleJet settings...": "Cargando la configuración de MapleJet...",
 }
 add_spanish(ES)
 
@@ -133,6 +135,29 @@ def banner_now(board: BoardView | None, elapsed_s: float = 0.0) -> Msg | None:
     if board.standalone and board.next_check_s is not None:
         board = dataclasses.replace(board, next_check_s=max(0.0, board.next_check_s - max(0.0, elapsed_s)))
     return hx_state.board_banner(board)
+
+
+def no_lines_texts(services) -> tuple[list[Msg], bool]:
+    """What a board with no lines stands for, and whether it is a warning. While the settings
+    aren't loaded the watcher posts an empty board (states.md §7 step 1): that is their problems,
+    or that they are still loading (as the tab says, ui.md §4.6), not "No lines are set up yet.".
+    Settings with active lines that the board doesn't show yet: the next board is on its way."""
+    data = getattr(services.data, "current", None)
+    if data is None:
+        problems = list(getattr(services.data, "problems", None) or [])
+        if problems:
+            return problems, True
+        return [Msg(N_("Loading the MapleJet settings..."))], False
+    if any(line.active for line in data.lines.values()):
+        return [Msg(N_("Checking..."))], False
+    return [Msg(N_("No lines are set up yet."))], False
+
+
+def _joined(msgs: list[Msg]) -> Msg:
+    """Several texts as one, one per line, each still translated on its own."""
+    if len(msgs) == 1:
+        return msgs[0]
+    return Msg("\n".join("{m%d}" % i for i in range(len(msgs))), {f"m{i}": m for i, m in enumerate(msgs)})
 
 
 def _age(age_s, elapsed_s):
@@ -410,7 +435,7 @@ class LineBoard(ttk.Frame):
         if latest is not None:
             self.show(latest)
         else:
-            self._message(N_("Checking..."))
+            self._message([Msg(N_("Checking..."))])
         self._timer = self.after(_TICK_MS, self._tick)
 
     # events and timers
@@ -461,12 +486,14 @@ class LineBoard(ttk.Frame):
             return 0.0
         return max(0.0, self.services.clock.monotonic() - self.received)
 
-    def _message(self, english, **values):
+    def _message(self, msgs: list[Msg], *, warn: bool = False):
+        """Text in place of the cards: "Checking...", the settings' problems or "No lines are set up yet."."""
         for card in self.cards.values():
             card.destroy()
         self.cards = {}
         self._shape = None
-        self.texts.set(self.message_label, english, **values)
+        self.message_label.configure(foreground=COLOUR_HEX[AMBER] if warn else MUTED_FG)
+        self.texts.msg(self.message_label, _joined(msgs))
         self.message_label.grid(row=0, column=0, padx=16, pady=24, sticky="w")
 
     def show(self, board) -> None:
@@ -476,10 +503,11 @@ class LineBoard(ttk.Frame):
         self.received = self.services.clock.monotonic()
         self.roles = roles(self.services)
         if board is None:
-            self._message(N_("Checking..."))
+            self._message([Msg(N_("Checking..."))])
             return
         if not board.lines:
-            self._message(N_("No lines are set up yet."))
+            msgs, warn = no_lines_texts(self.services)
+            self._message(msgs, warn=warn)
             return
         shape = [(line.line_id, [m.machine_id for m in line.machines]) for line in board.lines]
         if shape != self._shape:
@@ -673,6 +701,7 @@ class FloorBoard(HxWindow):
         self.bar_items: dict[str, int] = {}
         self.flash_on = True
         self.title_item = self.clock_item = self.banner_item = None
+        self.message_item = None        # the text that stands in for the rows when there are none
         self._fonts = {}
         self._redraw_timer = None
         self._refused_until = None
@@ -813,15 +842,25 @@ class FloorBoard(HxWindow):
         check_tk_thread()
         c = self.canvas
         c.delete("all")
+        self.message_item = None
         self.origin_items, self.unknown_items, self.status_items = {}, {}, {}
         self.age_items, self.bar_items = {}, {}
         width, height = self._canvas_size()
         self.layout = lay = floor_layout(width, height, len(self.rows))
         self._draw_header(width, lay)
         if not self.rows:
-            words = N_("Checking...") if self.board is None else N_("No lines are set up yet.")
-            c.create_text(width / 2, lay.header_h + (height - lay.header_h) / 2, text=tr(words),
-                          font=(UI_FONT, -lay.status_px, "bold"), fill=MUTED_FG)
+            # No board yet, the settings not loaded (their problems), or no machines to show
+            warn = False
+            if self.board is None:
+                msgs = [Msg(N_("Checking..."))]
+            elif not self.board.lines:
+                msgs, warn = no_lines_texts(self.services)
+            else:
+                msgs = [Msg(N_("No lines are set up yet."))]
+            self.message_item = c.create_text(
+                width / 2, lay.header_h + (height - lay.header_h) / 2, text=text(_joined(msgs)),
+                font=(UI_FONT, -lay.status_px, "bold"), fill=COLOUR_HEX[AMBER] if warn else MUTED_FG,
+                justify="center", width=max(1, width - 32))
             return
         family = bag_font_family(self)
         elapsed = self.elapsed()
@@ -938,6 +977,7 @@ class AlertSounder:
     def __init__(self, services):
         self.services = services
         self.playing = False
+        self.stopped = False            # stop() was called: Stripes is quitting, nothing rings again
         self.shown_ids: set[str] = set()
         self._token = services.bus.subscribe(BoardUpdate, self._on_board)
 
@@ -950,6 +990,8 @@ class AlertSounder:
         return bool(is_open()) if is_open is not None else False
 
     def evaluate(self, board) -> None:
+        if self.stopped:
+            return      # e.g. the floor board destroyed by App.destroy() after stop_services
         identity = self.services.identity
         ringing = (hx_state.sounding_alerts(board, identity, floor_board=self._floor_board_open())
                    if board is not None else [])
@@ -982,6 +1024,7 @@ class AlertSounder:
         return popup if popup is not None and _alive(popup) else None
 
     def stop(self) -> None:
+        self.stopped = True
         if self.playing:
             hx_win.stop_alert()
             self.playing = False

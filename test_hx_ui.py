@@ -75,6 +75,33 @@ def board(*lines, standalone=False, share_ok=True, next_check_s=None):
                      generated_at=1_793_275_200.0)
 
 
+class DeferredBackground:
+    """Like stripes.Background: work() runs at once (on its thread there), done() later, when the
+    Tk thread gets round to it (finish())."""
+
+    def __init__(self):
+        self.pending = []
+
+    def run(self, work, done):
+        try:
+            result, error = work(), None
+        except Exception as e:
+            result, error = None, e
+        self.pending.append((done, result, error))
+
+    def finish(self):
+        while self.pending:
+            done, result, error = self.pending.pop(0)
+            done(result, error)
+
+
+def no_active_lines(services):
+    """The loaded settings with every line set Not active."""
+    data = services.data.current
+    services.data.current = dataclasses.replace(data, lines={
+        k: dataclasses.replace(v, active=False) for k, v in data.lines.items()})
+
+
 def shown(widget):
     """Packed, gridded or on a canvas (the root is withdrawn, so nothing is ever mapped)."""
     return widget.winfo_manager() != ""
@@ -311,6 +338,17 @@ class TabTests(UiCase):
         self.assertEqual(tab.admin_labels, [])
         self.assertFalse(shown(tab.admin_frame))
 
+    def test_tab_shows_problems_that_come_with_the_boards(self):
+        # DataService posts no DataUpdate while current is None, but the watcher's boards keep coming
+        services = self.make(load=False)
+        tab = hx_ui.MapleJetTab(self.root, services)
+        self.assertEqual(self.labels(tab.empty_frame), ["Loading the MapleJet settings..."])
+        services.data.problems = [Msg("Update Stripes")]
+        services.bus.post(BoardUpdate(board=BoardView(lines=[], share_ok=True, generated_at=0.0)))
+        services.bus.pump()
+        self.assertEqual(self.labels(tab.empty_frame), ["Update Stripes"])
+        self.assertFalse(shown(tab.board))
+
     def test_tab_banner_and_footer(self):
         services = self.make()
         services.clock = FakeClock()
@@ -359,6 +397,30 @@ class TabTests(UiCase):
             self.assertFalse(nav.tab_shown)
         # The main window is withdrawn here, so the shown tab doesn't count as an open monitor
         self.assertEqual(flag.call_args_list, [mock.call(False, floor_board=False)])
+
+    def test_tab_counts_as_a_monitor_while_viewable(self):
+        # ui.md §15.3 rule 2, §4.7, decision 25: the tab shown in a visible main window is an open
+        # monitor; hidden to the tray (seen on the next BoardUpdate) it isn't
+        services = self.make()
+        nav = services.nav
+        tab = hx_ui.MapleJetTab(self.root, services)
+        tab.pack()
+        self.root.deiconify()
+        self.addCleanup(self.root.withdraw)
+        self.root.update()
+        self.assertTrue(self.root.winfo_viewable())
+        with mock.patch.object(services.poller, "set_monitor_open") as flag:
+            tab.on_shown()
+            self.assertEqual(flag.call_args_list, [mock.call(True, floor_board=False)])
+            self.root.withdraw()                            # hidden to the tray
+            self.root.update()
+            nav.update_monitor_flag()                       # what each BoardUpdate does
+            self.root.deiconify()
+            self.root.update()
+            nav.update_monitor_flag()
+            tab.on_hidden()
+        self.assertEqual(flag.call_args_list, [mock.call(True, floor_board=False), mock.call(False, floor_board=False),
+                                               mock.call(True, floor_board=False), mock.call(False, floor_board=False)])
 
 
 class LineBoardTests(UiCase):
@@ -496,9 +558,42 @@ class LineBoardTests(UiCase):
         # One machine still watched: the line keeps its colours
         lb.show(board(line("ln_1", "Line 1", [lost, view("mc_2", colour=RED)], colour=RED)))
         self.assertEqual(lb.cards["ln_1"].name_label.cget("foreground"), hx_ui_common.TEXT_FG)
+        # An empty board while the settings have active lines: the next board is on its way
         lb.show(board())
         self.assertEqual(lb.cards, {})
+        self.assertEqual(self.labels(lb.scroller.inner), ["Checking..."])
+        no_active_lines(services)
+        lb.show(board())
         self.assertEqual(self.labels(lb.scroller.inner), ["No lines are set up yet."])
+
+    def test_empty_board_while_the_settings_are_not_loaded(self):
+        # What the watcher posts while DataService.current is None (states.md §7 step 1) isn't
+        # "No lines are set up yet." (ui.md §4.6, §9.1 rule 4)
+        services = self.make(load=False)
+        lb = LineBoard(self.root, services)
+        services.nav.open_monitor()
+        monitor = services.nav.window("monitor")
+        services.bus.post(BoardUpdate(board=BoardView(lines=[], share_ok=True, generated_at=0.0)))
+        services.bus.pump()
+        self.assertEqual(self.labels(lb.scroller.inner), ["Loading the MapleJet settings..."])
+        self.assertEqual(self.labels(monitor.board.scroller.inner), ["Loading the MapleJet settings..."])
+        services.data.problems = [Msg("Update Stripes"), Msg("No server folder is set up for Stripes on this PC.")]
+        services.bus.post(BoardUpdate(board=BoardView(lines=[], share_ok=True, generated_at=0.0)))
+        services.bus.pump()
+        self.assertEqual(self.labels(lb.scroller.inner),
+                         ["Update Stripes\nNo server folder is set up for Stripes on this PC."])
+        self.assertEqual(lb.message_label.cget("foreground"), COLOUR_HEX[AMBER])
+        i18n.set_language("es")
+        lb.retranslate()
+        self.assertEqual(self.labels(lb.scroller.inner), ["Update Stripes\nEsta PC no tiene una carpeta del servidor "
+                                                          "configurada para Stripes."])
+        i18n.set_language("en")
+        services.data.problems = []
+        services.bus.post(BoardUpdate(board=BoardView(lines=[], share_ok=True, generated_at=0.0)))
+        services.bus.pump()
+        self.assertEqual(self.labels(lb.scroller.inner), ["Loading the MapleJet settings..."])
+        self.assertEqual(lb.message_label.cget("foreground"), hx_ui_common.MUTED_FG)
+        lb.destroy()
 
     def test_strict_threads(self):
         services = self.make()
@@ -656,6 +751,10 @@ class FloorBoardTests(UiCase):
         services.clock.advance(4.0)
         fb.tick()
         self.assertEqual(fb.canvas.itemcget(fb.age_items["mc_1"], "text"), "checked 6 s ago")
+        # An empty board: the next one is on its way while the settings have active lines
+        fb.show(board())
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Checking...")
+        no_active_lines(services)
         fb.show(board())
         texts = [fb.canvas.itemcget(i, "text") for i in fb.canvas.find_all() if fb.canvas.type(i) == "text"]
         self.assertIn("No lines are set up yet.", texts)
@@ -666,6 +765,37 @@ class FloorBoardTests(UiCase):
             fb.refresh_button.invoke()
         self.assertEqual(fb.canvas.itemcget(fb.banner_item, "text"),
                          f"You can refresh once every {int(SCALED.refresh_now_min_s)} s.")
+
+    def test_floor_board_while_the_settings_are_not_loaded(self):
+        # The watcher's board while DataService.current is None (states.md §7 step 1): the
+        # settings' problems or that they are loading, never "No lines are set up yet."
+        services = self.make(load=False)
+        with mock.patch.object(hx_win, "monitors", return_value=[]):
+            fb = FloorBoard(self.root, services, size="800x600")
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Checking...")     # no board yet
+        services.bus.post(BoardUpdate(board=BoardView(lines=[], share_ok=True, generated_at=0.0)))
+        services.bus.pump()
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Loading the MapleJet settings...")
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "fill"), hx_ui_common.MUTED_FG)
+        services.data.problems = [Msg("Update Stripes")]
+        services.bus.post(BoardUpdate(board=BoardView(lines=[], share_ok=True, generated_at=0.0)))
+        services.bus.pump()
+        texts = [fb.canvas.itemcget(i, "text") for i in fb.canvas.find_all() if fb.canvas.type(i) == "text"]
+        self.assertNotIn("No lines are set up yet.", texts)
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Update Stripes")
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "fill"), COLOUR_HEX[AMBER])
+        i18n.set_language("es")
+        services.data.problems = []
+        fb.retranslate()
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Cargando la configuración de MapleJet...")
+        # Once the settings load (DataUpdate), the rows come with the watcher's next board
+        i18n.set_language("en")
+        services.data.run_once()
+        services.bus.pump()
+        self.assertEqual(fb.canvas.itemcget(fb.message_item, "text"), "Checking...")
+        fb.show(self.board())
+        self.assertIsNone(fb.message_item)
+        self.assertEqual(len(fb.rows), 4)
 
     def test_long_origin_shrinks_then_wraps(self):
         services = self.make()
@@ -743,6 +873,29 @@ class AlertSounderTests(UiCase):
         sounder.evaluate(board(line("ln_1", "Line 1", [view("mc_1", alerts=[
             alert("al_3", to=("user:EXAMPLE\\akim",))])])))
         self.assertFalse(sounder.playing)
+        self.assertIsNone(nav.window("alerts"))
+
+    def test_silent_after_stop_services(self):
+        # Quitting: stop_services silences first, then App.destroy() destroys the floor board,
+        # whose close re-evaluates the sound (ui.md §15.4 item 2, §10.1). Nothing may ring again.
+        services = self.make()
+        nav = services.nav
+        nav.sounder = hx_ui_monitor.AlertSounder(services)
+        services.started = True                     # as start_services leaves it
+        mine = alert("al_1", to=("user:EXAMPLE\\jsmith",))
+        services.watcher.latest = board(line("ln_1", "Line 1", [view("mc_1", colour=RED, alerts=[mine])]))
+        with mock.patch.object(hx_win, "monitors", return_value=[]):
+            nav.open_floor_board()
+        self.assertEqual(self.play.call_count, 1)
+        self.assertIsNotNone(nav.window("alerts"))
+        hx_ui.stop_services(services, timeout_s=0.2)
+        self.assertFalse(nav.sounder.playing)
+        self.assertIsNone(nav.window("alerts"))
+        nav.window("floor").destroy()
+        nav.sounder.evaluate(services.watcher.latest)
+        services.bus.post(BoardUpdate(board=services.watcher.latest))
+        services.bus.pump()
+        self.assertEqual(self.play.call_count, 1)
         self.assertIsNone(nav.window("alerts"))
 
     def test_popup_comes_back_only_for_a_new_alert(self):
@@ -992,6 +1145,62 @@ class NavigatorTests(UiCase):
             self.assertEqual(fake.record_offline.call_count, 1)        # once only
 
 
+    def offline_case(self):
+        services = self.make()
+        services.bg = DeferredBackground()
+        fake = mock.Mock()
+        fake.record_offline.return_value = ["mc_1"]
+        for patcher in (mock.patch.object(services, "pipeline", return_value=fake),
+                        mock.patch.object(services.data, "find_send",
+                                          side_effect=lambda send_id: {"type": "send", "send_id": send_id})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return services, services.nav, fake
+
+    def test_offline_answer_given_during_the_run(self):
+        services, nav, fake = self.offline_case()
+        nav.note_offline_send("sd_x")
+        services.bus.post(ShareHealth(ok=True, last_reached=time.time()))
+        services.bus.pump()
+        self.assertEqual(fake.record_offline.call_count, 1)        # the run's work is done, its done() isn't
+        fake.confirm.assert_not_called()
+        # Meanwhile the result window's confirm hit a ShareError and hands the answer over
+        nav.note_offline_answer("sd_x", ["mc_1"], False)
+        self.assertEqual(fake.record_offline.call_count, 1)        # one run at a time
+        services.bg.finish()
+        # The first run had no answer: the Send stays and runs again for its answer
+        fake.confirm.assert_called_once_with("sd_x", ["mc_1"], False)
+        self.assertEqual(fake.record_offline.call_count, 2)
+        self.assertEqual(nav.offline_sends, ["sd_x"])
+        services.bg.finish()
+        self.assertEqual((nav.offline_sends, nav.offline_answers), ([], {}))
+        self.assertEqual(fake.confirm.call_count, 1)
+
+    def test_offline_answer_after_the_run(self):
+        services, nav, fake = self.offline_case()
+        # The share came back and the run dropped the Send before the answer's ShareError arrived
+        nav.note_offline_send("sd_y")
+        services.bus.post(ShareHealth(ok=True, last_reached=time.time()))
+        services.bus.pump()
+        services.bg.finish()
+        self.assertEqual(nav.offline_sends, [])
+        nav.note_offline_answer("sd_y", ["mc_1"], True)            # the share is up: recorded now
+        services.bg.finish()
+        fake.confirm.assert_called_once_with("sd_y", ["mc_1"], True)
+        self.assertEqual((nav.offline_sends, nav.offline_answers), ([], {}))
+        # With the share down the answer waits for ShareHealth(ok=True)
+        nav.note_offline_send("sd_z")
+        with mock.patch.object(services.store, "available", False):
+            nav.note_offline_answer("sd_z", ["mc_1"], False)
+        self.assertEqual(fake.confirm.call_count, 1)
+        self.assertEqual(nav.offline_sends, ["sd_z"])
+        services.bus.post(ShareHealth(ok=True, last_reached=time.time()))
+        services.bus.pump()
+        services.bg.finish()
+        self.assertEqual(fake.confirm.call_args, mock.call("sd_z", ["mc_1"], False))
+        self.assertEqual((nav.offline_sends, nav.offline_answers), ([], {}))
+
+
 class ServiceTests(UiCase):
     def test_make_services(self):
         services = self.make()
@@ -1030,6 +1239,15 @@ class ServiceTests(UiCase):
                       and services.watcher.latest.lines)
             names = {t.name for t in threading.enumerate()}
             self.assertTrue({"hx-data", "hx-poller", "hx-watch"} <= names, names)
+            # The 100 ms bus pump runs on Tk's loop, and every BoardUpdate re-checks the monitor
+            # flag (which notices the main window hidden to the tray)
+            with mock.patch.object(services.nav, "update_monitor_flag") as flag:
+                services.bus.post(BoardUpdate(board=board()))
+                deadline = time.monotonic() + 5.0
+                while not flag.called and time.monotonic() < deadline:
+                    self.root.update()
+                    time.sleep(0.01)
+            self.assertTrue(flag.called)
             started = time.monotonic()
             hx_ui.stop_services(services, timeout_s=2.0)
             self.assertLess(time.monotonic() - started, 3.0)
