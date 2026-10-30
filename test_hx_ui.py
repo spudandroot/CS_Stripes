@@ -202,8 +202,13 @@ class PureTests(unittest.TestCase):
 
 class UiCase(unittest.TestCase):
     """ui.md §17.1: a FakeWorld, the v2 folders in temp folders, services from make_services, strict
-    threads, and tell/ask patched on hx_ui_common."""
+    threads, and tell/ask patched on hx_ui_common.
+
+    As in the app (architecture §7.1 rule 3), garbage is collected on the Tk thread only: the
+    collector is off for the whole class and runs after each test. Otherwise a worker thread that
+    happens to start a collection frees a window's leftover Tk fonts off the Tk thread, and Tk hangs."""
     root = None
+    _gc_was_enabled = True
 
     @classmethod
     def setUpClass(cls):
@@ -212,14 +217,21 @@ class UiCase(unittest.TestCase):
         except tk.TclError as e:
             raise unittest.SkipTest(f"Tk can't start: {e}")
         cls.root.withdraw()
+        cls._gc_was_enabled = gc.isenabled()
+        gc.disable()
 
     @classmethod
     def tearDownClass(cls):
         for window in hx_ui_common.open_windows():
             window.destroy()
+        gc.collect()                    # the last test's leftovers, while Tk is still there
         cls.root.destroy()
+        gc.collect()
+        if cls._gc_was_enabled:
+            gc.enable()
 
     def setUp(self):
+        self.addCleanup(gc.collect)     # registered first, so it runs last: after every other cleanup
         self.tmp = tempfile.mkdtemp(prefix="hx_ui_")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.world = FakeWorld(self.tmp, printers=[{}], timings=SCALED)
@@ -378,6 +390,8 @@ class TabTests(UiCase):
             tab.refresh_button.invoke()
         self.assertEqual(tab.banner_label.cget("text"),
                          f"You can refresh once every {int(SCALED.refresh_now_min_s)} s.")
+        # The timer's end without waiting for it; cancelled, so it doesn't fire after this class's root is gone
+        tab.after_cancel(tab._refused_timer)
         tab._end_refused()
         self.assertIn("next check in", tab.banner_label.cget("text"))
         # Back to normal: no banner
@@ -1215,17 +1229,8 @@ class RealWindowTests(UiCase):
     """The Navigator with hx_ui_send's and hx_ui_admin's own windows (ui.md §15.3). Their tests use a
     stub Navigator, so this is where the two halves of the UI meet."""
 
-    def setUp(self):
-        super().setUp()
-        # As in the app (architecture §7.1 rule 3): garbage is collected on the Tk thread only, so a
-        # Send's worker thread never frees a Tk object
-        enabled = gc.isenabled()
-        gc.disable()
-        self.addCleanup(lambda: gc.enable() if enabled else None)
-
     def tearDown(self):
         super().tearDown()
-        gc.collect()
         for fake in self.world.printers:
             self.assertLessEqual(set(fake.writes), set(ALLOWED_WRITE_TAGS))
             self.assertLessEqual(fake.max_in_flight, 1)
@@ -1515,8 +1520,11 @@ class ServiceTests(UiCase):
         identity = self.world.identity("jsmith", admin=True, sender=True)
         env = {"STRIPES_HX_USER": identity.user, "STRIPES_HX_COMPUTER": identity.computer,
                "STRIPES_HX_SIDS": ",".join(sorted(identity.sids))}
-        enabled = gc.isenabled()
-        self.addCleanup(lambda: gc.enable() if enabled else None)
+        # UiCase keeps the collector off; on here (with nothing left to collect) so start_services is
+        # seen turning it off
+        self.addCleanup(gc.disable)
+        gc.collect()
+        gc.enable()
         with mock.patch.dict(os.environ, env), mock.patch.object(hx_win, "stop_alert") as stop_alert:
             services = hx_ui.start_services(self.root, config_path=None, bg=SyncBackground(), version="test")
             self.services = services
