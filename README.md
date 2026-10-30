@@ -2,10 +2,7 @@
 
 # Stripes
 
-> **Development freeze.** Stripes is frozen while a major update is built: support for MapleJet Hx
-> inkjet printers. Please don't change `main` until that update is merged.
-
-A small Windows app for designing and printing labels on Zebra printers.
+A small Windows app for printing labels on Zebra printers and bag codes on MapleJet Hx printers.
 
 - **Text, barcodes, QR codes and pictures.** Each text line has its own size and alignment.
 - **Auto layout** stacks items to fill the label; drag items on the preview to place them by hand.
@@ -13,10 +10,17 @@ A small Windows app for designing and printing labels on Zebra printers.
 - **Label stock**: each printer has a default stock; pick another for a one-off print.
 - Prints straight to a printer's IP address (port 9100), or through a printer installed in Windows.
 - Shows whether the printer is ready, out of labels, paused or has the head open, and whether the
-  labels loaded are the size of the label stock. **Stripes never changes printer settings**: labels
-  only carry their content, so other software printing to the same printers isn't affected.
+  labels loaded are the size of the label stock. For Zebra printers, **Stripes never changes printer
+  settings**: labels only carry their content, so other software printing to the same printers isn't
+  affected.
 - **Printer monitor** shows every printer at once: problems and what to do about them first, then
   which printer it is, with everything else behind **More info**.
+- **MapleJet Hx bag coding** (the MapleJet tab): administrators set up products, films and print
+  texts; senders send them to a line's printers. Stripes reads every message back from the
+  printer, three times, before the sender confirms it from the printer's own pictures. A monitor
+  and a floor board show what every machine is printing, with alerts.
+- On MapleJet Hx printers Stripes writes only its own messages (slots 9 and 10), the printer's
+  clock, and printing on or off. It never changes printer-wide settings.
 
 Download the latest `Stripes.exe` from **[Releases](../../releases/latest)**. It's a single file;
 nothing to install. Needs Windows 10 or 11.
@@ -67,6 +71,69 @@ See [`examples/config`](examples/config) for the format.
 
 Keep your real files on the internal share, **not in this repo**.
 
+## MapleJet Hx printers (set-up for IT)
+
+**Network.** Give each printer a fixed IP address on its own network segment that only accepts
+port 80 from the floor PCs. Stripes talks to printers directly, never through a proxy, one
+request at a time. PCs ask the time server over SNTP (UDP 123). Change every printer's password
+before rollout.
+
+**Groups.** Create two AD groups: `Stripes Administrators` (set up products, films, print texts,
+lines, machines and printers; run test prints) and `Stripes MapleJet Senders` (send, stop,
+resume, set clocks). Someone who does both goes in both. Changes take effect at the person's
+next Windows sign-in.
+
+**Folders on the share.** The MapleJet version keeps everything in a `v2` folder next to
+today's `config` folder (`\\SERVER\Share\Stripes\v2`). Today's version never reads it, so old and
+new copies can run side by side during a rollout. Create it once with the folder script, as an
+account with Full Control on `\\SERVER\Share\Stripes`, first with `-WhatIf` to see what it
+will do:
+
+    powershell -NoProfile -File New-StripesV2Folders.ps1 -ConfigPath \\SERVER\Share\Stripes\config -WhatIf
+    powershell -NoProfile -File New-StripesV2Folders.ps1 -ConfigPath \\SERVER\Share\Stripes\config
+
+It creates the folders and sets their permissions, copies `printers.json` and `stock.json` into
+`v2\config` once, and writes the first company settings with the two groups. Re-running it is
+safe: it puts the permissions back and never deletes anything. Get it from `tools/` in the
+release's source, read it, and `Unblock-File` it if your execution policy asks.
+
+| Folder under `v2\` | Domain Users | Stripes MapleJet Senders | Stripes Administrators |
+|---|---|---|---|
+| `config\` (Zebra printers and stock, `hx\` settings) | Read | Read | Modify |
+| `templates\` (products, films, print texts) | Read | Read | Modify |
+| `status\machines`, `status\pollers`, `status\deployment` | Modify | Modify | Modify |
+| `status\lines`, `status\locks`, `status\alerts` | Read | Modify | Modify |
+| `logs\hx-sends` | Read | Read and add files | Read |
+| `logs\hx-events` | Read and add files | Read and add files | Read and add files |
+| `logs\hx-admin` (admin changes and test prints) | Read | Read | Read and add files |
+
+Log files can be added but never changed or deleted, except by the server's administrators.
+
+**Share settings.** Keep `v2` on one file server (not replicated with DFS-R; a namespace with one
+target is fine), turn offline caching off for the share (`Set-SmbShare -Name <share> -CachingMode
+None`), and use the UNC path in `ConfigPath`, never a mapped drive.
+
+**Zebra files.** The new version reads `printers.json` and `stock.json` from `v2\config` (and
+from `ConfigPath` until the folder script has copied them). Until every PC runs the new version,
+make each Zebra printer or stock change in both `config\` and `v2\config\`.
+
+**Printer passwords.** An administrator types each printer's password once, in
+MapleJet > Admin > Printers. Stripes stores only a token made from it, scrambled with a key that
+is built into each release (it isn't in this public repository). Every PC can read the scrambled
+tokens because every PC watches the printers; that's obscurity, chosen on purpose. If Stripes says
+a password "was made by a different Stripes build", enter it again.
+
+**If a group is replaced.** The company settings keep each group's ID. If the administrators'
+group itself is deleted and re-created, nobody can open the admin screens: edit
+`admin_group_sid` in `v2\config\hx\company.json` (Notepad is fine). Stripes picks it up within
+about 10 minutes, or when it restarts.
+
+**First rollout, in order:** create the groups and add people; put the printers on their
+segment and change their passwords; make the release (see Releasing); run the folder script;
+try the release on one PC (below); then put it on the share. An administrator then enters the
+company settings (time server, countries, inks), printers, lines, machines, products, films and
+print texts.
+
 ## Deploying to domain PCs (Group Policy)
 
 Each user runs their own copy from `%LocalAppData%\Programs\Stripes`. **Group Policy keeps it up
@@ -90,12 +157,33 @@ One GPO, linked to an OU that contains both the users and their PCs:
    its window keeps it there; right-click the tray icon > **Quit Stripes** to exit. Opening the
    shortcut again brings the running copy forward instead of starting a second one.
 
+The MapleJet version is the same single `Stripes.exe` with the same Group Policy: nothing else
+to install, and no new registry value (it finds `v2` next to `ConfigPath`). Every running copy
+that can reach the printers, including one waiting in the tray, takes a share of watching them;
+office PCs that can't reach them never do.
+
 ### Deployment log
 
-Create a `status` folder next to `config` (e.g. `\\SERVER\Share\Stripes\status`) and give Domain
-Users **Modify** on it. Each copy of Stripes then keeps one small file there (`COMPUTER_user.json`)
-with its version, when it was installed, its last update and a heartbeat every 15 minutes while open. **Manage printers > Deployment status...** shows them all in one
-table. Without the folder, nothing is written.
+Each copy of Stripes keeps one small file (`COMPUTER_user.json`) with its version, when it was
+installed, its last update and a heartbeat every 15 minutes while open. **Manage printers >
+Deployment status...** shows them all in one table. The MapleJet version writes it to
+`v2\status\deployment` (the folder script creates it, with Modify for Domain Users), and the
+window also shows the older copies that still write to `\\SERVER\Share\Stripes\status`.
+Without the folder, nothing is written.
+
+### Trying a new version on one PC first
+
+1. Download `Stripes.exe` from the new release and **Unblock** it. Keep the old one on the share.
+2. On the test PC, put it in `%LocalAppData%\Programs\Stripes-test\` (not the Group Policy
+   folder, which is replaced at every logon) and start it from there. The old copy can keep
+   running; they don't share files.
+3. Check the version in the top right corner. It must not say "(development key)".
+4. Work through the checklist in `docs/maplejet/test-pc.md`.
+5. When it passes, put that same `Stripes.exe` on the share. PCs get it at their next logon.
+   Delete the `Stripes-test` folder.
+
+To go back, put the previous `Stripes.exe` on the share. The `v2` folder stays and is ignored by
+the old version; the printers keep printing whatever they were last sent.
 
 ## Releasing a new version
 
@@ -111,15 +199,34 @@ Every build carries its version: the release also has `Stripes-v1.4.0.exe` (the 
 plain `Stripes.exe` for the share, since that's the name Group Policy copies), build artifacts are
 named `Stripes-<version>`, and the exe's **Properties > Details** shows the version.
 
+### Printer-password key (once)
+
+Releases carry a key that scrambles the printer passwords saved in Stripes. Set it up once:
+
+1. Make a key: `python -c "import secrets; print(secrets.token_hex(32))"`.
+2. On GitHub: **Settings > Secrets and variables > Actions > New repository secret**, name
+   `STRIPES_HX_KEY`, value the 64 characters.
+3. Keep a copy in IT's password safe. GitHub never shows it again. Never put it in this
+   repository or in a file on the share.
+
+A release without the secret stops at "Stamp version". Other builds use a public development
+key and say "(development key)" next to their version; passwords saved with one don't work in a
+release. **Don't change the key**: every saved printer password depends on it. If it's lost or
+leaks, set a new one, release, and once PCs have that release an administrator enters every
+printer's password again.
+
 ## Development
 
 ```
 python -m pip install -r requirements.txt
 python stripes.py          # run from source
-python -m unittest -v      # tests
+python -m unittest -v      # tests (on Linux: xvfb-run -a python -m unittest -v)
+python hx_fake.py          # fake MapleJet printers and share; prints the variables to set
 build.bat v1.2.0           # local build, dist\Stripes-v1.2.0.exe (needs Python from python.org)
 ```
 
 What goes into the exe is set in `pyinstaller.spec`, which leaves out parts of Python, Pillow and Tcl
 that Stripes doesn't use. If you add a library or a picture format, check the build's self-check
-(`Stripes.exe --self-check out.txt`) still says `ok`.
+(`Stripes.exe --self-check out.txt`) still says `ok`. `hx_fake.py` is for tests and trying the
+MapleJet tab only; it is never built into the exe. Source runs and local builds use the
+development key.

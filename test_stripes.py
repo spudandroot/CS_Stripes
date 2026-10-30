@@ -611,5 +611,685 @@ class DeploymentLogTests(unittest.TestCase):
             self.assertEqual(zl.old_status_folder(), os.path.join(self.dir, "Stripes", "status"))
 
 
+# --------------------------------------------------------------------------
+# The v2 folders (architecture §10.5)
+# --------------------------------------------------------------------------
+
+_STRIPES_VARIABLES = ("STRIPES_SETTINGS", "STRIPES_CACHE", "STRIPES_STATUS", "STRIPES_CONFIG", "STRIPES_V2",
+                      "STRIPES_V2_ROAMING", "STRIPES_V2_LOCAL", "STRIPES_V2_MACHINE")
+
+
+def isolated_profile(test, tmp):
+    """APPDATA and LOCALAPPDATA in a temp folder, and none of Stripes' own overrides, until the
+    test ends."""
+    env = {"APPDATA": os.path.join(tmp, "Roaming"), "LOCALAPPDATA": os.path.join(tmp, "Local")}
+    patcher = mock.patch.dict(os.environ, env)
+    patcher.start()
+    test.addCleanup(patcher.stop)  # puts back the whole environment, the removed overrides too
+    for name in _STRIPES_VARIABLES:
+        os.environ.pop(name, None)
+    return env
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def snapshot(folder):
+    """Every file under a folder with its bytes, to show that nothing was written there."""
+    found = {}
+    for here, _dirs, files in os.walk(folder):
+        for name in files:
+            path = os.path.join(here, name)
+            with open(path, "rb") as f:
+                found[os.path.relpath(path, folder)] = f.read()
+    return found
+
+
+class V2PathTests(unittest.TestCase):
+    """This version keeps its own files under v2 folders, which the older versions never read."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        env = isolated_profile(self, self.tmp)
+        self.roaming, self.local = env["APPDATA"], env["LOCALAPPDATA"]
+
+    def test_settings_cache_and_instance_under_v2(self):
+        self.assertEqual(zl.settings_path(), os.path.join(self.roaming, "Stripes", "v2", "settings.json"))
+        self.assertEqual(zl.old_settings_path(), os.path.join(self.roaming, "Stripes", "settings.json"))
+        self.assertEqual(zl.cache_folder(), os.path.join(self.local, "Stripes", "v2", "config-cache"))
+        self.assertEqual(zl.SingleInstance().path, os.path.join(self.local, "Stripes", "v2", "instance.txt"))
+        # The v2 overrides move them, and the older overrides still win
+        with mock.patch.dict(os.environ, {"STRIPES_V2_ROAMING": os.path.join(self.tmp, "r"),
+                                          "STRIPES_V2_LOCAL": os.path.join(self.tmp, "l")}):
+            self.assertEqual(zl.settings_path(), os.path.join(self.tmp, "r", "settings.json"))
+            self.assertEqual(zl.cache_folder(), os.path.join(self.tmp, "l", "config-cache"))
+            self.assertEqual(zl.SingleInstance().path, os.path.join(self.tmp, "l", "instance.txt"))
+            with mock.patch.dict(os.environ, {"STRIPES_SETTINGS": os.path.join(self.tmp, "s.json"),
+                                              "STRIPES_CACHE": os.path.join(self.tmp, "c", "cache")}):
+                self.assertEqual(zl.settings_path(), os.path.join(self.tmp, "s.json"))
+                self.assertEqual(zl.cache_folder(), os.path.join(self.tmp, "c", "cache"))
+                self.assertEqual(zl.SingleInstance().path, os.path.join(self.tmp, "c", "instance.txt"))
+        self.assertEqual(zl.old_settings_path(), os.path.join(self.roaming, "Stripes", "settings.json"))
+
+    def test_settings_copied_once(self):
+        old = zl.old_settings_path()
+        self.assertFalse(zl.copy_old_settings())                 # nothing to bring along
+        self.assertFalse(os.path.exists(zl.settings_path()))
+        write_json(old, {"printers": [asdict(ZD420)], "last_printer": "Packing", "language": "es"})
+        with open(old, "rb") as f:
+            old_bytes = f.read()
+        self.assertTrue(zl.copy_old_settings())
+        loaded = zl.load_settings()
+        self.assertEqual((loaded["printers"], loaded["last_printer"], loaded["language"]), ([ZD420], "Packing", "es"))
+        # Only once: changes are saved under v2, and today's file is never written
+        zl.save_settings(dict(loaded, language="en"))
+        self.assertFalse(zl.copy_old_settings())
+        self.assertEqual(zl.load_settings()["language"], "en")
+        with open(old, "rb") as f:
+            self.assertEqual(f.read(), old_bytes)
+        write_json(old, {"printers": [], "language": "es"})      # the older version, still in use, saves
+        self.assertFalse(zl.copy_old_settings())
+        self.assertEqual(zl.load_settings()["printers"], [ZD420])
+
+    def test_no_copy_with_settings_override(self):
+        write_json(zl.old_settings_path(), {"language": "es"})
+        mine = os.path.join(self.tmp, "mine.json")
+        with mock.patch.dict(os.environ, {"STRIPES_SETTINGS": mine}):
+            self.assertFalse(zl.copy_old_settings())
+            self.assertFalse(os.path.exists(mine))
+        self.assertFalse(os.path.exists(zl.settings_path()))
+
+    def test_deployment_log_folders(self):
+        share = os.path.join(self.tmp, "Share", "Stripes")
+        new, old = os.path.join(share, "v2", "status", "deployment"), os.path.join(share, "status")
+        with mock.patch.object(zl, "configured_folder", return_value=None):
+            self.assertEqual((zl.status_folder(), zl.old_status_folder()), (None, None))
+        os.environ["STRIPES_CONFIG"] = os.path.join(share, "config")
+        self.assertEqual((zl.status_folder(), zl.old_status_folder()), (new, old))
+        with mock.patch.dict(os.environ, {"STRIPES_V2": os.path.join(self.tmp, "elsewhere")}):
+            self.assertEqual(zl.status_folder(), os.path.join(self.tmp, "elsewhere", "status", "deployment"))
+        with mock.patch.dict(os.environ, {"STRIPES_STATUS": os.path.join(self.tmp, "st")}):
+            self.assertEqual(zl.status_folder(), os.path.join(self.tmp, "st"))
+        # Written only to the new folder, and only once the folder script has made it
+        os.makedirs(old)
+        self.assertFalse(zl.DeploymentLog(zl.status_folder(), "FLOOR01", "jsmith").started("v2.0.0", "x"))
+        os.makedirs(new)
+        self.assertTrue(zl.DeploymentLog(zl.status_folder(), "FLOOR01", "jsmith").started("v2.0.0", "x"))
+        self.assertEqual((os.listdir(new), os.listdir(old)), (["FLOOR01_jsmith.json"], []))
+
+    def test_deployment_window_reads_both_folders(self):
+        new, old = os.path.join(self.tmp, "new"), os.path.join(self.tmp, "old")
+
+        def record(folder, computer, user, version, seen):
+            write_json(os.path.join(folder, f"{computer}_{user}.json"),
+                       {"computer": computer, "user": user, "version": version, "last_seen": seen})
+
+        record(old, "FLOOR01", "jsmith", "v1.4.0", "2026-10-28 08:00:00")
+        record(old, "FLOOR02", "akim", "v1.4.0", "2026-10-29 09:00:00")
+        record(new, "FLOOR01", "JSmith", "v2.0.0", "2026-10-30 07:00:00")
+        found = zl.read_all_deployment([new, old, os.path.join(self.tmp, "missing")])
+        self.assertEqual([(r["computer"], r["version"]) for r in found], [("FLOOR01", "v2.0.0"), ("FLOOR02", "v1.4.0")])
+        # The older version started again after the new one: the newer record wins
+        record(old, "FLOOR01", "jsmith", "v1.4.0", "2026-10-30 08:00:00")
+        found = zl.read_all_deployment([new, old])
+        self.assertEqual([(r["computer"], r["version"]) for r in found], [("FLOOR01", "v1.4.0"), ("FLOOR02", "v1.4.0")])
+
+
+class ZebraConfigTests(unittest.TestCase):
+    r"""The Zebra printers and stock come from v2\config once the folder script has copied them,
+    and from today's folder (never written) until then."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        isolated_profile(self, self.tmp)
+        share = os.path.join(self.tmp, "Share", "Stripes")
+        self.config, self.v2_config = os.path.join(share, "config"), os.path.join(share, "v2", "config")
+        shutil.copytree(EXAMPLE_CONFIG, self.config)
+        os.environ["STRIPES_CONFIG"] = self.config
+        os.environ["STRIPES_CACHE"] = os.path.join(self.tmp, "cache")
+
+    def test_read_from_v2_config_with_fallback(self):
+        before = snapshot(self.config)
+        # Before the folder script: today's folder
+        self.assertEqual(zl.zebra_config_folder(), self.config)
+        cfg = zl.load_company_config()
+        self.assertEqual((cfg.source, cfg.problems), (self.config, []))
+        self.assertIn("Packing ZD420", [p.name for p in cfg.printers])
+        # stock.json alone isn't enough: printers.json decides
+        os.makedirs(self.v2_config)
+        shutil.copy(os.path.join(self.config, "stock.json"), self.v2_config)
+        self.assertEqual(zl.zebra_config_folder(), self.config)
+        # Copied (and changed there since): v2\config is read
+        write_json(os.path.join(self.v2_config, "printers.json"),
+                   {"printers": [{"name": "Line 1 Labels", "host": "192.0.2.30", "stock": "2x1-gap"}]})
+        self.assertEqual(zl.zebra_config_folder(), self.v2_config)
+        cfg = zl.load_company_config()
+        self.assertEqual((cfg.source, [p.name for p in cfg.printers], cfg.problems),
+                         (self.v2_config, ["Line 1 Labels"], []))
+        self.assertEqual(zl.label_dots(cfg.printers[0]), (406, 203))   # its stock from v2\config\stock.json
+        self.assertEqual([p.name for p in zl.load_cached_config(self.config).printers], ["Line 1 Labels"])
+        # STRIPES_V2 moves the v2 folder
+        with mock.patch.dict(os.environ, {"STRIPES_V2": os.path.join(self.tmp, "nowhere")}):
+            self.assertEqual(zl.zebra_config_folder(), self.config)
+        self.assertEqual(snapshot(self.config), before)
+
+
+# --------------------------------------------------------------------------
+# The tray menu (pystray faked, so it runs anywhere)
+# --------------------------------------------------------------------------
+
+class TrayTests(unittest.TestCase):
+    def tearDown(self):
+        i18n.set_language("en")
+
+    def test_menu_has_maplejet_monitor(self):
+        class MenuItem:
+            def __init__(self, text, action, **kw):
+                self.text, self.action = text, action
+
+        class Menu:
+            SEPARATOR = object()
+
+            def __init__(self, *items):
+                self.items = items
+
+        class Icon:
+            def __init__(self, name, image, title, menu):
+                image.load()            # as pystray does
+                self.menu = menu
+
+            def run_detached(self):
+                pass
+
+        pystray = types.ModuleType("pystray")
+        pystray.MenuItem, pystray.Menu, pystray.Icon = MenuItem, Menu, Icon
+        calls = []
+        app = types.SimpleNamespace(call=calls.append, show="show", show_monitor="printer monitor",
+                                    show_hx_monitor="maplejet monitor", quit_app="quit")
+        with mock.patch.dict(sys.modules, {"pystray": pystray}):
+            tray = zl.Tray(app)
+        items = tray.icon.menu.items
+
+        def labels():
+            return ["-" if item is Menu.SEPARATOR else item.text(item) for item in items]
+
+        self.assertEqual(labels(), ["Open Stripes", "Printer monitor", "MapleJet monitor", "-", "Quit Stripes"])
+        items[2].action(tray.icon, items[2])
+        self.assertEqual(calls, ["maplejet monitor"])   # handed to the window's thread
+        i18n.set_language("es")
+        self.assertEqual(labels()[1:3], ["Monitor de impresoras", "Monitor MapleJet"])
+
+
+# --------------------------------------------------------------------------
+# The window (needs a display)
+# --------------------------------------------------------------------------
+
+def tk_or_skip():
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        raise unittest.SkipTest(f"Tk can't start: {e}")
+    root.withdraw()
+    return root
+
+
+def descendants(widget):
+    for child in widget.winfo_children():
+        yield child
+        yield from descendants(child)
+
+
+def inside(widget, container):
+    return str(widget).startswith(str(container) + ".")
+
+
+def alive(widget):
+    try:
+        return bool(widget.winfo_exists())
+    except tk.TclError:
+        return False
+
+
+def cancel_timers(app):
+    """Stop the window's own timers before it goes, so none fires into the next test's Tk."""
+    for timer in app.tk.splitlist(app.tk.call("after", "info")):
+        app.tk.call("after", "cancel", timer)
+
+
+def closed_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class TkCase(unittest.TestCase):
+    """One withdrawn root per class. Garbage is collected on the Tk thread only, as in the app
+    while the MapleJet services run (architecture §7.1 rule 3)."""
+    root = None
+    _gc_was_enabled = True
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tk_or_skip()
+        cls._gc_was_enabled = gc.isenabled()
+        gc.disable()
+
+    @classmethod
+    def tearDownClass(cls):
+        for window in hx_ui_common.open_windows():
+            window.destroy()
+        gc.collect()
+        cls.root.destroy()
+        gc.collect()
+        if cls._gc_was_enabled:
+            gc.enable()
+
+    def setUp(self):
+        self.addCleanup(gc.collect)     # registered first, so it runs after every other cleanup
+
+    def tearDown(self):
+        i18n.set_language("en")
+        for window in hx_ui_common.open_windows():
+            window.destroy()
+        for child in self.root.winfo_children():
+            child.destroy()
+
+
+class ShortcutGuardTests(TkCase):
+    def test_zebra_shortcut_guard(self):
+        # ui.md §17.2: App._zebra_shortcut with a stand-in for the App holding the two top tabs
+        tabs = ttk.Notebook(self.root)
+        zebra, maplejet = ttk.Frame(tabs), ttk.Frame(tabs)
+        tabs.add(zebra, text="  Zebra  ")
+        tabs.add(maplejet, text="  MapleJet  ")
+        fake_self = types.SimpleNamespace(top_tabs=tabs, zebra_tab=zebra, hx_tab=maplejet)
+        simple_box, stock_box, send_button = tk.Text(zebra), ttk.Combobox(zebra), ttk.Button(maplejet)
+        printed = []
+
+        def press(widget):
+            printed.clear()
+            zl.App._zebra_shortcut(fake_self, types.SimpleNamespace(widget=widget), lambda: printed.append(widget))
+            return printed == [widget]
+
+        tabs.select(zebra)
+        self.assertTrue(press(simple_box))
+        self.assertTrue(press(f"{stock_box}.popdown.f.l"))     # its drop-down list, known only by its path
+        self.assertTrue(press(tk.Toplevel(self.root)))         # a Zebra window, as before
+        tabs.select(maplejet)
+        self.assertFalse(press(simple_box))
+        self.assertFalse(press(send_button))
+        # Never from a MapleJet window or its question, whichever tab is selected
+        tabs.select(zebra)
+        window = hx_ui_common.HxWindow(self.root)
+        entry, choice = ttk.Entry(window), ttk.Combobox(ttk.Frame(window))
+        dialog = hx_ui_common._AskDialog(self.root, "Quit anyway?", "Quit anyway", "Keep Stripes open")
+        for widget in (window, entry, f"{choice}.popdown.f.l", dialog, dialog.yes_button):
+            self.assertFalse(press(widget), widget)
+        dialog.destroy()
+        window.destroy()
+
+
+class RetranslateTests(TkCase):
+    def test_marked_widgets_are_skipped(self):
+        class Marked(ttk.Frame):
+            hx_no_translate = True
+
+        frame = ttk.Frame(self.root)
+        plain = ttk.Label(frame, text="Simple")
+        inner = ttk.Label(Marked(frame), text="Simple")
+        i18n.set_language("es")
+        zl.App._retranslate(self.root)
+        self.assertEqual((plain.cget("text"), inner.cget("text")), ("Sencillo", "Simple"))
+        i18n.set_language("en")
+        zl.App._retranslate(self.root)
+        self.assertEqual(plain.cget("text"), "Simple")
+
+
+# ui.md §17.1's scaled timings, with printer and share timeouts that leave room for a busy machine
+SCALED = replace(TIMINGS.scaled(0.05), http_timeout_s=0.5, web_repeat_window_s=0.5, share_timeout_s=1.0,
+                 lock_stale_s=30.0)
+
+
+def machine_view(mid, line_id, origin):
+    return MachineView(machine_id=mid, line_id=line_id, name="Line 1 Bagger 1", colour=GREEN, code="printing",
+                       headline=Msg("Printing"), origin_line=origin, printing=True, monitored=True, checked_age_s=2.0)
+
+
+def board_of(line_id, *machines):
+    return BoardView(lines=[LineView(line_id=line_id, name="Line 1", colour=GREEN, headline=Msg("Printing"),
+                                     machines=list(machines), monitored=True, checked_age_s=2.0)],
+                     share_ok=True, generated_at=time.time())
+
+
+class BagTextTests(TkCase):
+    """ui.md §17.1: a FakeWorld, the v2 folders in temp folders, services from make_services, strict
+    threads, and tell/ask patched on hx_ui_common."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp(prefix="stripes_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.world = FakeWorld(self.tmp, printers=[{}], timings=SCALED)
+        self.addCleanup(self.world.close)
+        env = {"STRIPES_V2": self.world.share_root}
+        for name, folder in (("STRIPES_V2_ROAMING", "roaming"), ("STRIPES_V2_LOCAL", "local"),
+                             ("STRIPES_V2_MACHINE", "machine")):
+            env[name] = os.path.join(self.tmp, "pc", folder)
+            os.makedirs(env[name])
+        for patcher in (mock.patch.dict(os.environ, env), mock.patch.object(hx_ui_common, "tell"),
+                        mock.patch.object(hx_ui_common, "ask", return_value=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        hx_ui_common.STRICT_THREADS = True
+        self.addCleanup(setattr, hx_ui_common, "STRICT_THREADS", False)
+        identity = self.world.identity("jsmith", admin=True, sender=True)
+        self.services = hx_ui.make_services(self.root, config_path=None, bg=hx_ui_common.SyncBackground(),
+                                            version="test", timings=SCALED, identity=identity,
+                                            fs=self.world.fs.view(), gates=GateRegistry(), key=release_key())
+        self.services.data.run_once()
+        self.services.bus.pump()
+
+    def test_bag_text_survives_spanish(self):
+        services, ids = self.services, self.world.ids
+        nav, lid, mid = services.nav, ids["line"], ids["machine1"]
+        board = board_of(lid, machine_view(mid, lid, "Product of USA"))
+        services.watcher.latest = board
+        # The main window's two tabs: a Zebra label, and the MapleJet tab with its line card
+        tabs = ttk.Notebook(self.root)
+        zebra = ttk.Frame(tabs)
+        tabs.add(zebra, text="  Zebra  ")
+        zebra_label = ttk.Label(zebra, text="Simple")
+        tab = hx_ui.MapleJetTab(tabs, services)
+        tabs.add(tab, text="  MapleJet  ")
+        services.bus.post(BoardUpdate(board=board))
+        services.bus.pump()
+        # A prefilled Send window with its trial plan, a result window of a made-up result, the floor board
+        choice = LineChoice(line_id=lid, machine_ids=[mid], product_id=ids["product"], film_id=ids["film"],
+                            print_text_id=ids["print_text"], lot="4417", countries=["USA", "Canada"])
+        nav.open_send(prefill=SendRequest(send_id=new_id("sd"), sender=services.identity.user,
+                                          computer=services.identity.computer, created_at=time.time(),
+                                          lines=[choice]))
+        send = nav.window("send")
+        self.assertIsNotNone(send.blocks[lid].trial)
+        self.assertEqual(send.send_button.cget("text"), "Send to 1 machine")
+        now = time.time()
+        result = hx_ui_send.ResultWindow(self.root, services, SendResult(
+            send_id=new_id("sd"), sender=services.identity.user, computer=services.identity.computer,
+            started_at=now, finished_at=now, time_source="server",
+            machines=[MachineResult(machine_id=mid, colour=AMBER, ok=True, step=STEP_CONFIRM_2,
+                                    origin_line="Product of USA and Canada")]))
+        with mock.patch.object(hx_win, "monitors", return_value=[]):
+            nav.open_floor_board()
+
+        def bag_texts():
+            out = []
+            for widget in (tab, send, result):
+                for bag in descendants(widget):
+                    if isinstance(bag, hx_ui_common.BagText):
+                        out += [bag.get(), bag.itemcget(bag.text_item, "text")]
+            floor = nav.window("floor")      # the floor board may rebuild itself
+            return out + [floor.canvas.itemcget(i, "text") for i in floor.origin_items.values()]
+
+        before = bag_texts()
+        self.assertGreaterEqual(before.count("Product of USA and Canada"), 4)   # the Send and result windows
+        self.assertGreaterEqual(before.count("Product of USA"), 3)              # the card and the floor board
+        i18n.set_language("es")
+        zl.App._retranslate(self.root)
+        hx_ui.language_changed(services)
+        self.assertEqual(bag_texts(), before)
+        self.assertEqual(send.send_button.cget("text"), "Enviar a 1 máquina")
+        self.assertEqual((zebra_label.cget("text"), tab.monitor_button.cget("text")), ("Sencillo", "Monitor MapleJet"))
+        self.assertEqual([tabs.tab(t, "text") for t in tabs.tabs()], ["  Zebra  ", "  MapleJet  "])
+        i18n.set_language("en")
+        zl.App._retranslate(self.root)
+        hx_ui.language_changed(services)
+        self.assertEqual(send.send_button.cget("text"), "Send to 1 machine")
+        self.assertEqual(bag_texts(), before)
+
+
+class FakeTray:
+    def __init__(self, app):
+        self.app, self.stopped = app, 0
+
+    def notify(self, text):
+        pass
+
+    def stop(self):
+        self.stopped += 1
+
+
+class AppTests(unittest.TestCase):
+    """The real window, built as it is at start-up, with the MapleJet services made but not started
+    (their threads are tested in test_hx_ui.py) and the profile in temp folders."""
+    _gc_was_enabled = True
+
+    @classmethod
+    def setUpClass(cls):
+        tk_or_skip().destroy()
+        cls._gc_was_enabled = gc.isenabled()
+        gc.disable()                    # collected on the Tk thread only, after each test
+
+    @classmethod
+    def tearDownClass(cls):
+        gc.collect()
+        if cls._gc_was_enabled:
+            gc.enable()
+
+    def setUp(self):
+        self.addCleanup(gc.collect)
+        self.tmp = tempfile.mkdtemp(prefix="stripes_app_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        isolated_profile(self, self.tmp)
+        os.environ["STRIPES_V2_MACHINE"] = os.path.join(self.tmp, "machine")
+        # The older version's settings, with one printer of the user's own: brought along at the first start
+        self.old_settings = zl.old_settings_path()
+        write_json(self.old_settings, {"printers": [asdict(zl.Printer(name="Packing", host="127.0.0.1",
+                                                                      port=closed_port()))],
+                                       "last_printer": "Packing"})
+        self.events, self.made, self.bound = [], [], {}
+        real_bind_all = tk.Misc.bind_all
+
+        def bind_all(widget, *args, **kw):
+            self.bound[args[0] if args else kw.get("sequence")] = args[1] if len(args) > 1 else kw.get("func")
+            return real_bind_all(widget, *args, **kw)
+
+        def start_services(root, *, config_path, bg, version):
+            self.events.append(("start_services", hasattr(root, "top_tabs"), bg is getattr(root, "bg", None)))
+            services = hx_ui.make_services(root, config_path=config_path, bg=bg, version=version, clock=FakeClock(),
+                                           identity=Identity(user="EXAMPLE\\jsmith", computer="FLOOR01",
+                                                             sids=frozenset(), pid=os.getpid()),
+                                           gates=GateRegistry(), key=release_key())
+            self.made.append(services)
+            return services
+
+        def startup(root, services):
+            self.events.append(("startup", hasattr(root, "tray") and hasattr(root, "deployment"), services))
+
+        for target, name, value in ((zl.App, "bind_all", bind_all), (hx_ui, "start_services", start_services),
+                                    (hx_ui, "startup", startup), (zl, "Tray", FakeTray),
+                                    (zl, "configured_folder", lambda: None), (zl, "local_folders", lambda: []),
+                                    (zl, "VERSION", "dev"), (zl, "HX_KEYED", False),
+                                    (zl.App, "_first_run", mock.Mock()), (hx_win, "stop_alert", mock.Mock())):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.app = zl.App(start_hidden=True)
+        self.addCleanup(self.close_app)
+        self.app.update_idletasks()
+
+    def close_app(self):
+        i18n.set_language("en")
+        if alive(self.app):
+            cancel_timers(self.app)
+            self.app.destroy()
+
+    def header_texts(self):
+        return [w.cget("text") for w in descendants(self.app)
+                if isinstance(w, ttk.Label) and not inside(w, self.app.top_tabs)]
+
+    def test_start_up_order(self):
+        app = self.app
+        # The services before the window is built (with its Background), the floor board last
+        self.assertEqual(self.events, [("start_services", False, True), ("startup", True, app.hx)])
+        self.assertIs(app.hx, self.made[0])
+        self.assertIsNone(app.config_folder)
+        # The older version's settings were brought along before they were read
+        self.assertEqual(app.printer_var.get(), "Packing")
+        with open(self.old_settings, "rb") as old, open(zl.settings_path(), "rb") as new:
+            self.assertEqual(new.read(), old.read())
+
+    def test_two_tabs(self):
+        app, tabs = self.app, self.app.top_tabs
+        self.assertEqual([tabs.tab(t, "text") for t in tabs.tabs()], ["  Zebra  ", "  MapleJet  "])
+        self.assertEqual(tabs.tabs(), (str(app.zebra_tab), str(app.hx_tab)))
+        self.assertEqual(str(tabs.select()), str(app.zebra_tab))       # the Zebra tab at start
+        self.assertIsInstance(app.hx_tab, hx_ui.MapleJetTab)
+        self.assertIs(app.hx.nav.tab, app.hx_tab)
+        # Everything below the header is on the Zebra tab ...
+        for widget in (app.printer_box, app.printer_status, app.stock_box, app.size_label, app.tabs, app.simple_box,
+                       app.recent_box, app.preview_frame, app.canvas, app.print_btn, app.status):
+            self.assertTrue(inside(widget, app.zebra_tab), widget)
+        self.assertFalse(inside(app.update_label, tabs))
+        # ... packed as before: Print and the status line stay visible in a short window
+        top, stock_row, status, bottom, body = app.zebra_tab.pack_slaves()
+        self.assertEqual((top, stock_row, body), (app.printer_box.master, app.stock_box.master,
+                                                  app.preview_frame.master))
+        self.assertEqual((status, bottom), (app.status, app.print_btn.master))
+        self.assertEqual((status.pack_info()["side"], bottom.pack_info()["side"]), ("bottom", "bottom"))
+        # The header
+        self.assertIn("Zebra labels and MapleJet bag printing", self.header_texts())
+        self.assertEqual(app.update_label.cget("text"), "Version dev (development key)")
+        self.assertEqual((app.title(), app.minsize()), ("Stripes dev", (900, 640)))
+
+    def test_tab_switch_shows_and_hides_the_maplejet_tab(self):
+        app, nav = self.app, self.app.hx.nav
+        app.top_tabs.select(app.hx_tab)
+        app.update()
+        self.assertTrue(nav.tab_shown)
+        app.top_tabs.select(app.zebra_tab)
+        app.update()
+        self.assertFalse(nav.tab_shown)
+
+    def test_shortcuts_print_only_on_the_zebra_tab(self):
+        app = self.app
+        self.assertTrue(app.simple_box.bind("<Control-Return>"))      # the Simple box's own binding stays
+        with mock.patch.object(app, "print_label") as print_label:
+            for sequence in ("<Control-p>", "<Control-Return>"):
+                press = self.bound[sequence]
+                print_label.reset_mock()
+                press(types.SimpleNamespace(widget=app.simple_box))
+                self.assertEqual(print_label.call_count, 1, sequence)
+                app.top_tabs.select(app.hx_tab)
+                press(types.SimpleNamespace(widget=app.hx_tab.send_button))
+                app.top_tabs.select(app.zebra_tab)
+                window = hx_ui_common.HxWindow(app, app.hx)
+                press(types.SimpleNamespace(widget=ttk.Entry(window)))
+                window.destroy()
+                self.assertEqual(print_label.call_count, 1, sequence)
+
+    def test_tray_opens_the_maplejet_monitor(self):
+        app = self.app
+        app.show_hx_monitor()
+        window = app.hx.nav.window("monitor")
+        self.assertIsInstance(window, hx_ui_monitor.MonitorWindow)
+        self.assertIs(window.master, app)              # its own window: it shows while Stripes is in the tray
+        app.show_hx_monitor()
+        self.assertEqual([w for w in hx_ui_common.open_windows() if isinstance(w, hx_ui_monitor.MonitorWindow)],
+                         [window])
+
+    def test_language_switch(self):
+        app = self.app
+        with open(self.old_settings, "rb") as f:
+            old = f.read()
+        with mock.patch.object(hx_ui, "language_changed", wraps=hx_ui.language_changed) as changed:
+            app.v_language.set("es")
+            app._language_changed()
+        changed.assert_called_once_with(app.hx)
+        self.assertIn("Etiquetas Zebra e impresión de bolsas MapleJet", self.header_texts())
+        self.assertEqual(app.update_label.cget("text"), "Versión dev (clave de desarrollo)")
+        self.assertEqual(app.print_btn.cget("text"), i18n.ES["Print"])
+        self.assertEqual(app.hx_tab.monitor_button.cget("text"), "Monitor MapleJet")
+        self.assertEqual([app.top_tabs.tab(t, "text") for t in app.top_tabs.tabs()], ["  Zebra  ", "  MapleJet  "])
+        self.assertEqual(zl.load_settings()["language"], "es")       # saved under v2 ...
+        with open(self.old_settings, "rb") as f:
+            self.assertEqual(f.read(), old)                          # ... never in the older version's file
+        app.v_language.set("en")
+        app._language_changed()
+        self.assertEqual(app.update_label.cget("text"), "Version dev (development key)")
+        self.assertEqual(app.hx_tab.monitor_button.cget("text"), "MapleJet monitor")
+
+    def test_quit_asks_once_then_stops_the_services(self):
+        app, hx = self.app, self.app.hx
+        app.tray = FakeTray(app)
+        folder = os.path.join(self.tmp, "deployment")
+        os.makedirs(folder)
+        app.deployment = zl.DeploymentLog(folder, "FLOOR01", "jsmith")
+        app.deployment.started("dev", "x")
+        stopped = []
+        with mock.patch.object(hx_ui, "can_quit", return_value=False) as can_quit, \
+                mock.patch.object(hx_ui, "stop_services",
+                                  side_effect=lambda services, timeout_s: (stopped.append((services, timeout_s,
+                                                                                           alive(app))),
+                                                                           cancel_timers(app))):
+            app.quit_app()                 # a Send is running, and the person keeps Stripes open
+            can_quit.assert_called_once_with(app, hx)
+            self.assertTrue(alive(app))
+            self.assertEqual((app.tray.stopped, stopped), (0, []))
+            can_quit.reset_mock()
+            can_quit.return_value = True
+            app.quit_app()
+        can_quit.assert_called_once_with(app, hx)          # asked once per quit
+        self.assertEqual(stopped, [(hx, 2.0, True)])       # before the window goes
+        self.assertEqual(app.tray.stopped, 1)
+        self.assertFalse(alive(app))
+        self.assertFalse(app.deployment.read()["running"])
+
+    def test_close_box_without_tray(self):
+        app, hx = self.app, self.app.hx
+        expected = "hide_to_tray" if sys.platform == "win32" else "_on_close"   # the tray is only on Windows
+        self.assertTrue(app.protocol("WM_DELETE_WINDOW").endswith(expected))
+        app.tray = None
+        with mock.patch.object(hx_ui, "can_quit", return_value=False) as can_quit, \
+                mock.patch.object(hx_ui, "stop_services", side_effect=lambda *a, **kw: cancel_timers(app)) \
+                as stop_services:
+            app._on_close()
+            self.assertTrue(alive(app))
+            stop_services.assert_not_called()
+            can_quit.return_value = True
+            app._on_close()
+        self.assertEqual(can_quit.call_count, 2)
+        stop_services.assert_called_once_with(hx, timeout_s=2.0)
+        self.assertFalse(alive(app))
+
+
+class SelfCheckOrderTests(unittest.TestCase):
+    """deploy.md §1.3 item 3: the key first, before Tk starts; the MapleJet checks last, inside the try."""
+
+    @classmethod
+    def setUpClass(cls):
+        tk_or_skip().destroy()
+
+    def test_key_first_maplejet_last(self):
+        order = []
+        with mock.patch.object(zl, "check_release_key", side_effect=lambda v, k: order.append(("key", v, k))), \
+                mock.patch.object(hx_ui, "self_check", side_effect=lambda root: order.append(("hx", root.winfo_exists()))):
+            zl._self_check()
+        self.assertEqual(order, [("key", zl.VERSION, zl.HX_KEYED), ("hx", 1)])
+        # A release without the key fails before Tk starts
+        with mock.patch.object(zl, "VERSION", "v2.0.0"), mock.patch.object(zl, "HX_KEYED", False), \
+                mock.patch.object(zl.tk, "Tk") as make_root, mock.patch.object(hx_ui, "self_check") as hx_check:
+            with self.assertRaisesRegex(RuntimeError, "STRIPES_HX_KEY"):
+                zl._self_check()
+        make_root.assert_not_called()
+        hx_check.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
