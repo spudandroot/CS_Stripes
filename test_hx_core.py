@@ -114,6 +114,78 @@ class FakeClockTests(unittest.TestCase):
         long.join(2)
         self.assertIs(long.result, True)
 
+    def test_small_steps_add_up_exactly(self):
+        clock = FakeClock()
+        for _ in range(600):
+            clock.advance(0.1)
+        self.assertEqual((clock.time(), clock.monotonic()), (1_793_275_260.0, 1060.0))
+        for _ in range(20):
+            clock.sleep(0.05)       # auto mode goes through the same sums
+        self.assertEqual((clock.time(), clock.monotonic()), (1_793_275_261.0, 1061.0))
+
+    def test_manual_sleeper_wakes_after_small_steps(self):
+        # Float sums of the steps fall a hair short (600 x 0.1 is 59.99999999997 as plain floats)
+        for seconds, steps in ((60.0, 600), (1.0, 20), (0.15, 3), (1.5, 5), (3.0, 10), (0.1 * 3, 5)):
+            clock = FakeClock(auto_advance=False)
+            sleeper = Sleeper(clock, seconds)
+            sleeper.start()
+            self.assertTrue(wait_until(lambda: clock.sleepers() == 1))
+            for _ in range(steps):
+                clock.advance(seconds / steps)
+            sleeper.join(2)
+            self.assertFalse(sleeper.is_alive(), (seconds, steps))
+            self.assertIs(sleeper.result, True)
+            self.assertGreaterEqual(clock.monotonic(), 1000.0 + seconds)
+
+    def test_manual_sleeper_short_of_its_deadline_stays_asleep(self):
+        clock = FakeClock(auto_advance=False)
+        sleeper = Sleeper(clock, 1.0)
+        sleeper.start()
+        self.assertTrue(wait_until(lambda: clock.sleepers() == 1))
+        clock.advance(0.999)
+        time.sleep(0.05)
+        self.assertTrue(sleeper.is_alive())
+        clock.advance(0.001)
+        sleeper.join(2)
+        self.assertIs(sleeper.result, True)
+
+    def test_code_deadline_loop_ends(self):
+        # Code that works out its own deadline: 1000.1 + 0.7 is 1000.8000000000001 as a float,
+        # one step above the 1000.8 the test advances to
+        def wait_for(clock, deadline):
+            while clock.monotonic() < deadline:
+                if not clock.sleep(deadline - clock.monotonic()):
+                    return False
+            return True
+
+        clock = FakeClock(auto_advance=False)
+        clock.advance(0.1)
+        deadline = clock.monotonic() + 0.7
+        self.assertGreater(deadline, round(deadline, 9))      # the case this test is about
+        result = []
+        worker = threading.Thread(target=lambda: result.append(wait_for(clock, deadline)), daemon=True)
+        worker.start()
+        self.assertTrue(wait_until(lambda: clock.sleepers() == 1))
+        for _ in range(7):
+            clock.advance(0.1)
+        worker.join(2)
+        self.assertEqual(result, [True])
+        self.assertEqual(clock.monotonic(), deadline)
+
+        # The same when the test advances first and the code sleeps what's left (float noise)
+        clock = FakeClock(auto_advance=False)
+        clock.advance(0.1)
+        deadline = clock.monotonic() + 0.7
+        clock.advance(0.7)
+        self.assertTrue(wait_for(clock, deadline))            # at once, no 10 s watchdog
+        self.assertEqual(clock.monotonic(), deadline)
+
+        clock = FakeClock()                                   # auto mode: one sleep reaches it
+        clock.advance(0.1)
+        deadline = clock.monotonic() + 0.7
+        self.assertTrue(clock.sleep(deadline - clock.monotonic()))
+        self.assertGreaterEqual(clock.monotonic(), deadline)
+
     def test_nobody_advancing_fails_instead_of_hanging(self):
         clock = FakeClock(auto_advance=False)
         with mock.patch.object(hx_core, "_NOBODY_ADVANCED_S", 0.15):
@@ -306,6 +378,59 @@ class EventBusTests(unittest.TestCase):
         bus.post(Ping(2))
         bus.pump()
         self.assertEqual(seen, [("new", 2)])     # only events delivered after it subscribed
+
+    def test_nested_pump_keeps_order(self):
+        # A callback that opens a modal dialog runs the Tk loop, and the 100 ms pump inside it
+        bus = EventBus()
+        seen = []
+        tokens = {}
+        while_open = {}
+
+        def dialog(event):
+            seen.append(("dialog", event.n))
+            if event.n == 1:
+                bus.post(Ping(3))
+                while_open["pumped"] = bus.pump()              # events 2 and 3, while open
+                while_open["board"] = [n for who, n in seen if who == "board"]
+                bus.unsubscribe(tokens["gone"])
+                bus.post(Ping(4))
+                bus.pump()
+
+        def broken(event):
+            raise RuntimeError("broken subscriber")
+
+        tokens["dialog"] = bus.subscribe(Ping, dialog)
+        tokens["broken"] = bus.subscribe(Ping, broken)
+        tokens["board"] = bus.subscribe(Ping, lambda e: seen.append(("board", e.n)))
+        tokens["gone"] = bus.subscribe(Ping, lambda e: seen.append(("gone", e.n)))
+        bus.post(Ping(1))
+        bus.post(Ping(2))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(bus.pump(), 1)
+        self.assertEqual(while_open, {"pumped": 2, "board": [1, 2, 3]})   # updates go on meanwhile
+        for name in ("dialog", "board"):
+            self.assertEqual([n for who, n in seen if who == name], [1, 2, 3, 4], name)
+        self.assertEqual([n for who, n in seen if who == "gone"], [1, 2, 3])
+        self.assertEqual(err.getvalue().count("RuntimeError: broken subscriber"), 4)   # one per event
+        self.assertEqual(bus.pump(), 0)
+
+    def test_nested_pump_leaves_the_newest_last(self):
+        bus = EventBus()
+        shown = []
+        tokens = {}
+
+        def first(event):
+            if event.n == 1:
+                bus.unsubscribe(tokens["later"])    # still owed event 1: skipped, not delivered late
+                bus.pump()
+
+        bus.subscribe(Ping, first)
+        tokens["later"] = bus.subscribe(Ping, lambda e: shown.append(("later", e.n)))
+        bus.subscribe(Ping, lambda e: shown.append(("board", e.n)))   # e.g. a window showing the board
+        for n in (1, 2, 3):
+            bus.post(Ping(n))
+        self.assertEqual(bus.pump(), 1)
+        self.assertEqual(shown, [("board", 1), ("board", 2), ("board", 3)])
 
     def test_post_from_many_threads(self):
         bus = EventBus()

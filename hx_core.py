@@ -8,6 +8,7 @@ A Msg is a piece of UI or log text kept in English; the UI translates it with tr
 
 from __future__ import annotations
 
+import collections
 import math
 import queue
 import threading
@@ -21,6 +22,11 @@ from typing import Callable
 _NOBODY_ADVANCED_S = 10.0
 # How often a manual-mode sleeper looks at its cancel token (real seconds)
 _CANCEL_POLL_S = 0.01
+# FakeClock keeps monotonic() to whole nanoseconds, so 600 x advance(0.1) is exactly 60 s
+_FAKE_DIGITS = 9
+# A FakeClock sleeper this close to its deadline (fake seconds) is due. Float sums, the test's
+# steps or the code's own "monotonic() + s", can fall a hair short of each other.
+_DUE_WITHIN_S = 1e-6
 
 
 # --------------------------------------------------------------------------
@@ -106,20 +112,28 @@ class FakeClock(Clock):
     auto_advance=True: sleep(s) moves both clocks on by s and returns at once, for
     single-threaded logic tests. auto_advance=False: sleep(s) blocks until a test calls
     advance() past its deadline, or the cancel token fires.
+
+    Float sums drift, so monotonic() is kept to whole nanoseconds and a sleeper within a
+    microsecond of its deadline counts as due: advancing a sleeper's time in small steps
+    (600 x 0.1 s) wakes it. The clock then moves onto that deadline exactly, so the
+    sleeper's own "monotonic() >= deadline" check agrees with the wake-up.
     """
 
     def __init__(self, start=1_793_275_200.0, *, auto_advance=True):
         # start = 29 Oct 2026 12:00 UTC
         self.auto_advance = auto_advance
-        self._wall = float(start)
         self._mono = 1000.0
+        # time() is _wall_base when monotonic() was _mono_base: worked out on each call, so
+        # the wall clock never drifts from monotonic() however many steps are added
+        self._wall_base = float(start)
+        self._mono_base = self._mono
         self._cond = threading.Condition()
-        self._sleeping = 0
+        self._deadlines = []        # monotonic() deadline of each thread blocked in sleep()
         self._last_advance = time.monotonic()   # real time of the last advance(), for the watchdog
 
     def time(self):
         with self._cond:
-            return self._wall
+            return self._wall_base + (self._mono - self._mono_base)
 
     def monotonic(self):
         with self._cond:
@@ -130,32 +144,37 @@ class FakeClock(Clock):
         if seconds < 0:
             raise ValueError("FakeClock can't go backwards")
         with self._cond:
-            self._wall += seconds
-            self._mono += seconds
-            self._last_advance = time.monotonic()
-            self._cond.notify_all()
+            self._move_to(round(self._mono + seconds, _FAKE_DIGITS))
 
     def set_wall(self, epoch):
         """Move time() only: a PC clock jump. Sleepers follow monotonic(), so none wakes."""
         with self._cond:
-            self._wall = float(epoch)
+            self._wall_base = float(epoch)
+            self._mono_base = self._mono
 
     def sleepers(self):
         """Threads blocked in sleep() right now (manual mode)."""
         with self._cond:
-            return self._sleeping
+            return len(self._deadlines)
 
     def sleep(self, seconds, cancel=None):
         seconds = max(0.0, seconds)
         if cancel is not None and cancel.cancelled:
             return False
-        if self.auto_advance:
-            self.advance(seconds)
-            return True
         started = time.monotonic()
         with self._cond:
             deadline = self._mono + seconds
-            self._sleeping += 1
+            if self.auto_advance:
+                # At least the exact sum, so the caller's own "monotonic() + s" has passed too
+                self._move_to(max(round(deadline, _FAKE_DIGITS), deadline))
+                return True
+            if deadline <= self._mono + _DUE_WITHIN_S:
+                # Nothing left but float noise: count it as reached instead of waiting for an
+                # advance() that the test thinks it has already made
+                if deadline > self._mono:
+                    self._move_to(deadline, advanced=False)
+                return True
+            self._deadlines.append(deadline)
             try:
                 while self._mono < deadline:
                     if cancel is not None and cancel.cancelled:
@@ -166,7 +185,17 @@ class FakeClock(Clock):
                     self._cond.wait(_CANCEL_POLL_S if cancel is not None else 0.05)
                 return True
             finally:
-                self._sleeping -= 1
+                self._deadlines.remove(deadline)
+
+    def _move_to(self, mono, advanced=True):
+        """Lock held: move both clocks on to mono (never back) and wake the sleepers due.
+        A sleeper due within _DUE_WITHIN_S takes the clock onto its deadline exactly.
+        advanced=False (a sleeper settling float noise) doesn't count for the watchdog."""
+        due = [d for d in self._deadlines if d <= mono + _DUE_WITHIN_S]
+        self._mono = max([self._mono, mono] + due)
+        if advanced:
+            self._last_advance = time.monotonic()
+        self._cond.notify_all()
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +254,8 @@ class EventBus:
         self._queue = queue.SimpleQueue()
         self._subscribers = {}      # token -> (event type, callback), in subscription order
         self._next_token = 1
+        # (event, token, callback) still to run for events already taken off the queue
+        self._deliveries = collections.deque()
 
     def post(self, event):
         """Any thread."""
@@ -243,20 +274,30 @@ class EventBus:
 
     def pump(self, max_events=1000):
         """Tk thread: deliver up to max_events queued events in order; returns how many.
-        A callback that raises is printed with its traceback and the pump carries on."""
-        delivered = 0
-        while delivered < max_events:
+        A callback that raises is printed with its traceback and the pump carries on.
+
+        A callback may run pump() again (a modal dialog runs the Tk loop, and the 100 ms pump
+        with it). That pump first finishes the event the outer one is part-way through, so
+        every subscriber still sees the events in the order they were posted."""
+        taken = 0
+        while True:
+            while self._deliveries:
+                event, token, callback = self._deliveries.popleft()
+                if token not in self._subscribers:
+                    continue    # unsubscribed since the event was taken
+                try:
+                    callback(event)
+                except Exception:
+                    traceback.print_exc()
+            if taken >= max_events:
+                break
             try:
                 event = self._queue.get_nowait()
             except queue.Empty:
                 break
-            delivered += 1
-            for token, (event_type, callback) in list(self._subscribers.items()):
-                if token not in self._subscribers:
-                    continue    # unsubscribed by an earlier callback for this event
-                if isinstance(event, event_type):
-                    try:
-                        callback(event)
-                    except Exception:
-                        traceback.print_exc()
-        return delivered
+            taken += 1
+            # The subscribers as they are now: one that subscribes later gets the next event
+            self._deliveries.extend((event, token, callback)
+                                    for token, (event_type, callback) in self._subscribers.items()
+                                    if isinstance(event, event_type))
+        return taken
