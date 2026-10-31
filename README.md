@@ -120,8 +120,8 @@ next Windows sign-in.
 **Folders on the share.** The MapleJet version keeps everything in a `v2` folder next to
 today's `config` folder (`\\SERVER\Share\Stripes\v2`). Today's version never reads it, so old and
 new copies can run side by side during a rollout. Create it once with the folder script, as an
-account with Full Control on `\\SERVER\Share\Stripes`, first with `-WhatIf` to see what it
-will do:
+account with Full Control on `\\SERVER\Share\Stripes` (on the file server itself, in a PowerShell
+run as administrator), first with `-WhatIf` to see what it will do:
 
     powershell -NoProfile -File New-StripesV2Folders.ps1 -ConfigPath \\SERVER\Share\Stripes\config -WhatIf
     powershell -NoProfile -File New-StripesV2Folders.ps1 -ConfigPath \\SERVER\Share\Stripes\config
@@ -133,9 +133,15 @@ release's source, read it, and `Unblock-File` it if your execution policy asks.
 
 - `v2` doesn't inherit the Stripes folder's rights, so rights granted there (a helpdesk group, say)
   stop at `v2`. Run the script again later as a member of the file server's Administrators group
-  (a domain admin) or as the account that ran it first.
+  (a domain admin). The account that ran it first owns only what it created, so a re-run as that
+  account can fail part-way.
+- If a run fails before it has set the rights of `v2`, it says "v2 isn't protected yet": `v2`
+  still has the Stripes folder's rights until you run the script again.
 - A re-run removes any entry added by hand on the `v2` folders, and lists each one as
   `Removed entry`.
+- A re-run with another `-AdminGroup` or `-SenderGroup` gives the folder rights to the new group
+  but keeps the groups in `company.json`, which Stripes goes by, and warns. Change the group in
+  MapleJet > Admin > Company too, or see "If a group is replaced" below.
 - The share's own (SMB) permissions must allow at least Change for Domain Users. The folder rights
   below do the real limiting.
 
@@ -165,10 +171,14 @@ is built into each release (it isn't in this public repository). Every PC can re
 tokens because every PC watches the printers; that's obscurity, chosen on purpose. If Stripes says
 a password "was made by a different Stripes build", enter it again.
 
-**If a group is replaced.** The company settings keep each group's ID. If the administrators'
-group itself is deleted and re-created, nobody can open the admin screens: edit
-`admin_group_sid` in `v2\config\hx\company.json` (Notepad is fine). Stripes picks it up within
-about 10 minutes, or when it restarts.
+**If a group is replaced.** The company settings and the folder rights keep each group's ID. If
+the administrators' group itself is deleted and re-created, nobody can open the admin screens. As
+a member of the file server's Administrators group, run the folder script again, so the folder
+rights use the new group (it warns that `company.json` still has the old one), then edit
+`admin_group_sid` in `v2\config\hx\company.json` to the new ID the script printed (Notepad is
+fine). Stripes picks it up within about 10 minutes, or when it restarts. For a re-created senders'
+group, an administrator sets it in MapleJet > Admin > Company (**Look up**, then **Save**) before
+the script is run again.
 
 **First rollout, in order:** create the groups and add people; put the printers on their
 segment and change their passwords; make the release (see Releasing); run the folder script;
@@ -228,8 +238,13 @@ The full test, with what you should see at each step: [`docs/maplejet/test-pc.md
 5. When it passes, put that same `Stripes.exe` on the share. PCs get it at their next logon.
    Delete the `Stripes-test` folder.
 
-To go back, put the previous `Stripes.exe` on the share. The `v2` folder stays and is ignored by
-the old version; the printers keep printing whatever they were last sent.
+To go back, put the previous `Stripes.exe` on the share, the previous MapleJet release if there is
+one: it keeps checking the printers. The `v2` folder stays. A version from before MapleJet ignores
+it and **checks no MapleJet printer**: no drift, printing or NOT MONITORED alarms, so a changed
+origin would print unseen. The printers keep printing whatever they were last sent. Until a
+MapleJet version is back, check the origin on the bags at each running printer by hand, or stop
+the printers at their own Print On/Off button
+([it-setup.md step 13](docs/maplejet/it-setup.md#13-rollback)).
 
 ## Releasing a new version
 

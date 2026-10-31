@@ -13,7 +13,8 @@ addresses `192.0.2.x`, printer UID 1109, the time server `time.example.local`, t
 - [ ] **Accounts.** You need:
   - an account that can create AD groups;
   - an account with Full Control on `\\SERVER\Share\Stripes`, for the folder script (for example
-    `EXAMPLE\itadmin`);
+    `EXAMPLE\itadmin`), and a member of the file server's Administrators group (a domain admin)
+    for running it again later;
   - rights to edit the Group Policy objects that deploy Stripes today;
   - access to the network firewall and the Wi-Fi controller;
   - a tester (for example `EXAMPLE\jsmith`) who goes in both Stripes groups, plus one account in
@@ -23,7 +24,7 @@ addresses `192.0.2.x`, printer UID 1109, the time server `time.example.local`, t
   - **Floor PCs**: every PC that sends, stops, resumes, sets clocks, runs test prints, runs the
     MapleJet monitor or is the floor board. They must reach every MapleJet printer (step 2).
   - **Office PCs**: everyone else. They watch the lines through the share and never talk to a
-    printer.
+    printer, not even while the share is down.
   - **One test PC**: a floor PC, for trying each release (step 11), and one office PC for its
     alarm check.
   - **One maintenance PC**: the only other PC that may open the printers' own web portal.
@@ -70,16 +71,22 @@ rule below is the real security boundary.**
   about MapleJet printers only.
 - [ ] **No proxy, NAT or HTTP inspection** between the floor PCs and the printers. Stripes never
   uses a proxy for printers ([protocol.md §0](protocol.md#0-scope-and-conventions) item 3).
-- [ ] **All or nothing: every floor PC reaches every MapleJet printer.** Stripes gives a PC printers
-  to watch once that PC has reached any printer in the last 24 hours, and from then on it may give
-  it **any** printer ([storage.md §12.3](storage.md#123-can-poll-reach-memory-and-the-reachability-probe)).
-  A PC handed a printer it can't reach reports it as not answering (grey "Printer off", or red "Not
-  answering while printing bags" with an alarm), and no other PC takes it over. So:
+- [ ] **All or nothing: every floor PC reaches every MapleJet printer.** Stripes gives a copy of
+  Stripes printers to watch once it has reached any printer in the last 24 hours, and from then on
+  it may give it **any** printer ([storage.md §12.3](storage.md#123-can-poll-reach-memory-and-the-reachability-probe)).
+  That memory belongs to each Windows user on each PC (in the user's `%LocalAppData%`), not to the
+  PC as a whole. A copy handed a printer it can't reach reports it as not answering (grey "Printer
+  off", or red "Not answering while printing bags" with an alarm), and no other PC takes it over.
+  So:
   - never split the MapleJet printers into per-line VLANs that some floor PCs can't reach;
   - office PCs that reach no printer are fine: they never watch printers, and still show the
-    monitor and the floor board through the share. Sending, Stop, Resume, Set clocks and test
-    prints talk to the printer from the PC in use, so they work only from floor PCs (the other
-    admin screens work anywhere);
+    monitor and the floor board through the share. While the share is down they check no printers
+    either, and say "Server unreachable: this PC isn't checking any printers." Sending, Stop,
+    Resume, Set clocks and test prints talk to the printer from the PC in use, so they work only
+    from floor PCs (the other admin screens work anywhere);
+  - when a printer has no PC checking it, every running Stripes tries a bare connection to it on
+    port 80 (a connection only, no request, at most once a minute), to learn whether it can take
+    it over. Expect the firewall to log the office PCs' tries as blocked: that is how they stay out;
   - don't run Stripes on a laptop that moves between the floor network and the office: it keeps
     being handed printers for up to a day after it leaves.
 - [ ] **Printer passwords.** Change every printer's password from its default before rollout, and
@@ -157,7 +164,8 @@ changes the share's settings, the registry or Group Policy. Full spec:
 - [ ] Get `tools/New-StripesV2Folders.ps1` from the source of the release you will deploy (on
   GitHub, at the release's tag), so the script and `Stripes.exe` match. Read it.
 - [ ] Run it as the account with Full Control on `\\SERVER\Share\Stripes`. The file server is the
-  best place: there it can also check offline caching.
+  best place: there it can also check offline caching. On the file server itself, run it as
+  administrator (right-click Windows PowerShell > **Run as administrator**).
 - [ ] If the execution policy blocks it, `Unblock-File .\New-StripesV2Folders.ps1`. The script isn't
   signed: if the policy is `AllSigned`, it must be signed first.
 - [ ] Run it with `-WhatIf` first, then without:
@@ -190,18 +198,27 @@ You should see:
 - A group that isn't found, or a mapped drive, stops it before any change, with "Group '<name>'
   wasn't found. Create it, or pass its name with -<Parameter>." or "... Use the UNC path, as in the
   ConfigPath policy value.", then "Nothing was changed."
+- Any other error prints "Failed while <step> (<item>): <error>" and "What is done stays done. Fix the
+  problem and run the script again to finish." If it stopped before it set the rights of `v2`, it
+  also says "v2 isn't protected yet: it still has the Stripes folder's rights, ...". Then `v2` is
+  open to everyone who may change the Stripes folder: run the script again before you go on.
 
 Good to know:
 
 - `v2` doesn't inherit the Stripes folder's rights, so rights granted on `\\SERVER\Share\Stripes`
   (a helpdesk group, say) stop at `v2`. Run the script again later as a member of the file server's
-  Administrators group (a domain admin) or as the account that ran it first.
+  Administrators group (a domain admin). Not as the account that ran it first: it owns only what it
+  created, so it can fail part-way once other people have written files in `v2`.
 - A re-run removes any entry added by hand on the 23 folders and lists each one as `Removed entry`.
   Make permission changes by changing the groups' members, not the folders.
+- A re-run with another `-AdminGroup` or `-SenderGroup` gives the folder rights to the new group,
+  but never changes `company.json`, and Stripes goes by the groups in `company.json`. It warns
+  "... has the administrators' group <old>, not <new> from -AdminGroup. Stripes still uses <old>
+  ...". Change the group in MapleJet > Admin > Company too (**Look up**, then **Save**), best before
+  the re-run, or see "If a group is replaced" in the
+  [README](../../README.md#maplejet-hx-printers-set-up-for-it).
 - "Put Stripes.exe on the share" in the closing message comes after the test PC (step 11): try the
   release there first.
-- Any other error prints "Failed while <step> (<item>): <error>" and "What is done stays done. Fix the
-  problem and run the script again to finish."
 
 Running it again is safe: it prints `Exists`, `Rights unchanged` and `Kept`, puts back any
 permission someone changed (`Removed entry: ...`), and never overwrites the files it wrote.
@@ -321,7 +338,10 @@ The floor board is the production-schedule PC's full-screen view of every machin
   volume up (alarms ring there).
 - [ ] Decide which Windows account signs in there. Its floor-board settings belong to that user
   (they roam with the profile). If the account is in neither group, the board shows no
-  **Acknowledge** button, and someone in a group acknowledges from their own PC.
+  **Acknowledge** button, and someone in a group acknowledges from their own PC. The alert shows on
+  the line's card on the MapleJet tab of every PC, a NOT MONITORED alarm too (also on a PC started
+  or restarted after it began), and a group member's card has **Acknowledge**. One acknowledgement
+  silences it on every PC.
 - [ ] Keep its screen on: no display-off timeout, screen saver or lock for that account, as far as
   your security policy allows.
 - [ ] Once it runs the new version, signed in as that account: MapleJet tab > **My settings...** >
@@ -360,12 +380,19 @@ PC's MapleJet tab, how many printers it is checking.
 
 ## 13. Rollback
 
-- [ ] Put the previous `Stripes.exe` back on the share. PCs get it at their next sign-in.
+- [ ] Put the previous `Stripes.exe` back on the share. PCs get it at their next sign-in. Go back to
+  the previous **MapleJet** release if there is one: it keeps checking the printers.
 - Leave `v2` as it is. A version from before MapleJet ignores it, and the new version uses it again
   when it comes back.
-- Going back to a version from before MapleJet: the MapleJet printers keep printing their last
-  message, and nobody can send, stop or resume from Stripes until a MapleJet version is back. Stop
-  a printer at its own **Print On/Off** button if you need to.
+- Going back to a version from before MapleJet: **nothing checks the MapleJet printers any more.**
+  No drift, printing or NOT MONITORED alarms, so a changed origin at a printer would print unseen.
+  The printers keep printing their last message, and nobody can send, stop or resume from Stripes.
+  Until a MapleJet version is back:
+  - [ ] check the origin on the bags at each running printer by hand, at least once a shift and
+    after anyone uses a printer's own panel or web portal; or
+  - [ ] stop the printers at their own **Print On/Off** button.
+- If the previous MapleJet release shows "Update Stripes to see this machine" for a machine, it
+  can't check that machine either: treat it the same way.
 
 You should see: Deployment status shows the previous version on each PC.
 

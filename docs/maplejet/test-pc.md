@@ -177,6 +177,11 @@ used."
 
 ### 12. Share down
 
+- On a later release, other floor PCs still run the previous MapleJet release, and they check the
+  test unit too. A Send from a PC that can't reach the share can't make them wait, so its requests
+  would mix with theirs. First quit Stripes on every other floor PC (tray icon > **Quit Stripes**),
+  and start it again after this step. The production machines go unchecked while the share is
+  blocked, so do it when none is printing.
 - Make the share unreachable from the test PC only, for a few minutes: for example, block TCP 445
   between the test PC and the file server on the network firewall or the file server. Don't unplug
   the test PC: it must still reach the test unit.
@@ -241,9 +246,13 @@ unit.
 2. **Rollout.** Put that same `Stripes.exe` on the share (`\\SERVER\Share\Stripes\Stripes.exe`). PCs
    get it at their next sign-in. Watch **Deployment status**. Delete
    `%LocalAppData%\Programs\Stripes-test` on the test PC (and on the other PCs used).
-3. **Rollback.** Put the previous `Stripes.exe` back on the share. The `v2` folder stays. A version
-   from before MapleJet ignores it: the MapleJet printers keep printing their last message, and
-   nobody can send, stop or resume from Stripes until a MapleJet version returns.
+3. **Rollback.** Put the previous `Stripes.exe` back on the share, the previous MapleJet release if
+   there is one: it keeps checking the printers. The `v2` folder stays. A version from before
+   MapleJet ignores it and **checks no MapleJet printer**: no drift, printing or NOT MONITORED
+   alarms, so a changed origin would print unseen. The printers keep printing their last message,
+   and nobody can send, stop or resume from Stripes. Until a MapleJet version returns, check the
+   origin on the bags at each running printer by hand, or stop the printers at their own **Print
+   On/Off** button ([it-setup.md step 13](it-setup.md#13-rollback)).
 
 ## Test record
 

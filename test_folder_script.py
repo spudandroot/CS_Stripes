@@ -419,8 +419,8 @@ def stubbed_script(folder, extra="", name="stubbed.ps1"):
 
 
 def warnings_in(output):
-    """The script's Warning lines."""
-    return [line for line in output.splitlines() if line.startswith("Warning: ")]
+    """The script's Warning lines about company.json (not the share checks', which depend on the PC)."""
+    return [line for line in output.splitlines() if line.startswith("Warning: ") and "company.json" in line]
 
 
 # --------------------------------------------------------------------------

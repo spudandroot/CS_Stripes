@@ -979,9 +979,9 @@ Delivered with more tests than the table above, in three classes:
 
 | Class | Runs | What it checks |
 |---|---|---|
-| `ScriptTextTests` | every platform (Linux too), from the script's text | the folder table is exactly `hx_share._SHARE_FOLDERS` plus `v2`, top-down, and every share folder the app code names (record folders, `LOG_KINDS`, `status\deployment`) is in it; each folder's entries match the rights tables of the root README and storage.md §14.1; the `company.json` template has `hx_model.Company`'s fields in order with their defaults, and reads back through `decode_json` and `from_json`; the group defaults are `Company`'s; the `changes.json` template has the keys `DataService` writes; the only SIDs are `S-1-5-18`, `S-1-5-32-544` and `S-1-3-4`, and every name is an example one; the script is ASCII, has its help, and uses nothing only PowerShell 6 or 7 has (`??`, `?.`, ternary, `&&`, `\|\|`, `-Parallel`, `-AsHashtable`, `Join-Path` with more than one child, ...) and no command that deletes, renames or changes the share or the registry |
-| `PowerShellTests`, `StubbedRunTests` | where `powershell` or `pwsh` is found (CI: both), skipped elsewhere | the PowerShell parser finds no error and no PowerShell 7 operator; the script's own functions, loaded without running it, give each folder its entries, map the icacls notation to the right .NET values and access masks, write times with a decimal point in any culture, and write both seed files (non-ASCII, quotes and a tab escaped; UTF-8 without a BOM; never overwritten); a copy of the script with stand-ins for the groups, the account and the rights runs `-WhatIf` (nothing created), a first run and a re-run, a missing group and a missing ConfigPath |
-| `WindowsTests` | Windows only | the table above, run for real with `powershell`, plus `test_powershell_7_gives_the_same_rights` (with `pwsh`: a re-run with either finds nothing to change) |
+| `ScriptTextTests` | every platform (Linux too), from the script's text | the folder table is exactly `hx_share._SHARE_FOLDERS` plus `v2`, top-down, and every share folder the app code names (record folders, `LOG_KINDS`, `status\deployment`) is in it; each folder's entries match the rights tables of the root README and storage.md §14.1; the `company.json` template has `hx_model.Company`'s fields in order with their defaults, and reads back through `decode_json` and `from_json`; the group defaults are `Company`'s; the `changes.json` template has the keys `DataService` writes; the only SIDs are `S-1-5-18`, `S-1-5-32-544` and `S-1-3-4`, and every name is an example one; the script is ASCII, has its help, and uses nothing only PowerShell 6 or 7 has (`??`, `?.`, ternary, `&&`, `\|\|`, `-Parallel`, `-AsHashtable`, `Join-Path` with more than one child, ...) and no command that deletes, renames or changes the share or the registry; the group check of §8.3 step 5 only reads `company.json`, compares `Company` fields, runs before the rights and points at the README paragraph that exists; the error of §8.3 item 11 has the `v2` line |
+| `PowerShellTests`, `StubbedRunTests` | where `powershell` or `pwsh` is found (CI: both), skipped elsewhere | the PowerShell parser finds no error and no PowerShell 7 operator; the script's own functions, loaded without running it, give each folder its entries, map the icacls notation to the right .NET values and access masks, write times with a decimal point in any culture, and write both seed files (non-ASCII, quotes and a tab escaped; UTF-8 without a BOM; never overwritten); a copy of the script with stand-ins for the groups, the account and the rights runs `-WhatIf` (nothing created), a first run and a re-run, a missing group and a missing ConfigPath; a re-run with other groups (also under `-WhatIf`) warns with the old and new names and SIDs and leaves `company.json` byte-identical, and a damaged `company.json` warns; a failure before the rights (a file where a folder must go, a failing account lookup) prints the `v2` line, and one with no `v2` or after the rights doesn't |
+| `WindowsTests` | Windows only | the table above, run for real with `powershell`, plus `test_powershell_7_gives_the_same_rights` (with `pwsh`: a re-run with either finds nothing to change), `test_other_groups_warn` (another `-AdminGroup`: the warning, `company.json` unchanged, the new group on `v2\config`) and `test_failure_says_whether_v2_is_protected` (a first run that fails leaves `v2` inheriting and says so; a failing re-run after a good one doesn't) |
 
 ### 8.9 As built: checks against the code, and changes to this spec
 
@@ -1019,10 +1019,20 @@ Changed from the first version of this spec, for the reasons given:
    on .NET 4.5.2 runs it.
 6. **Output**: it prints the Stripes and `v2` folders, names everything from `v2` down, and ends
    differently under `-WhatIf`; errors say "Failed while <step> (<item>): <error>".
-7. **Who runs it again** (§8.3 item 13): a member of the file server's Administrators group, or
-   the account that ran it first. README follow-up (§7 owns its text): the "Folders on the share"
-   paragraph could add "Run it again later as a member of the file server's Administrators group
-   (a domain admin), or as the same account: `v2` doesn't inherit the Stripes folder's rights."
+7. **Who runs it again** (§8.3 item 13): a member of the file server's Administrators group. The
+   account that ran it first is no longer offered as an equal choice (final review, 31 Oct): it
+   owns only what it created, so a re-run as that account may fail part-way once other people
+   have written files in `v2` (§11 item 7). The README's "Folders on the share" paragraph,
+   it-setup.md step 6 and the script's help say the same.
+8. **A re-run with other groups warns** (§8.3 step 5; final review B-1). It moves the folder rights
+   to the new groups but keeps `company.json`, which Stripes goes by; before, it only said "Kept".
+   It never rewrites the file: the groups are an administrator's setting from then on, changed in
+   MapleJet > Admin > Company.
+9. **A failure before the rights says that `v2` isn't protected yet** (§8.3 item 11; final review
+   B-2): until step 7, `v2` still inherits the Stripes folder's rights. The script notes when it has
+   set `v2`'s rights, and otherwise reads them (`AreAccessRulesProtected`), so a failing re-run of
+   a protected `v2` doesn't say it. Also, a failure while writing the seed files now names
+   `company.json` as its item (it named `stock.json`, the previous step's).
 
 ## 9. Test-PC instructions (spec; delivered after development)
 
@@ -1089,9 +1099,12 @@ After the steps:
 1. **Sign-off**: the record table is filled in and kept with the release.
 2. **Rollout**: put that same `Stripes.exe` on the share; PCs get it at their next logon; watch
    Deployment status. Delete `Stripes-test` on the test PC.
-3. **Rollback**: put the previous `Stripes.exe` back on the share. The `v2` folder stays and the old
-   version ignores it. MapleJet printers keep printing their last message, and nobody can send,
-   stop or resume from Stripes until the new version returns.
+3. **Rollback**: put the previous `Stripes.exe` back on the share, the previous MapleJet release if
+   there is one, because it keeps checking the printers. The `v2` folder stays. A version from before
+   MapleJet ignores it and checks no MapleJet printer: no drift, printing or NOT MONITORED alarms, so
+   a changed origin would print unseen. MapleJet printers keep printing their last message, and
+   nobody can send, stop or resume from Stripes. Until a MapleJet version returns, check the origin
+   on the bags at each running printer by hand, or stop the printers (it-setup.md step 13).
 
 The test-unit engineering checks in the plan's "Still to test" list (fonts, sizes, encoder, units,
 stress, soak) are separate; this document only accepts the build on a PC.
@@ -1155,6 +1168,7 @@ stress, soak) are separate; this document only accepts the build on a PC.
 | 4 | Firewall prompt | No Windows Firewall prompt for SNTP (UDP) or printer HTTP on the floor-PC image | Stripes only makes outbound connections and binds loopback only; the test PC checks (§9.2 step 9) |
 | 5 | Offline caching and DFS | The share's `CachingMode` is `None` and `v2` isn't replicated | The folder script warns; README tells IT (storage §19) |
 | 6 | Printer OPEN items (encoder calibration, bag counter, speed units, beacon) | architecture §11 | None of them affects the build or the self-check |
+| 7 | Folder script re-run by the account that ran it first | On a real file server, whether a re-run as that account (the owner of the folders, not a server administrator) fails part-way once other people have written files in `v2`: passing inherited entries down to their files needs rights it may not have. CI can't show it (the runner is an administrator) | The script's help, it-setup.md step 6, the README and §8.3 item 13 say to run it again as a member of the file server's Administrators group. If a run fails part-way, the error says so, and running it again as such a member finishes it |
 
 ## 12. Decisions made in this spec
 
