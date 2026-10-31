@@ -314,6 +314,8 @@ function Find-AccountSid([string]$Name) {
         'Stripes Administrators'   = 'S-1-5-21-1000000001-1000000002-1000000003-2101'
         'Stripes MapleJet Senders' = 'S-1-5-21-1000000001-1000000002-1000000003-2102'
         'Domain Users'             = 'S-1-5-21-1000000001-1000000002-1000000003-513'
+        'Stripes Admins 2'         = 'S-1-5-21-1000000001-1000000002-1000000003-2201'
+        'Stripes Senders 2'        = 'S-1-5-21-1000000001-1000000002-1000000003-2202'
     }
     if ($known.ContainsKey($Name)) { return $known[$Name] }
     $null
@@ -322,10 +324,18 @@ function Get-CurrentAccount { 'EXAMPLE\itadmin' }
 function Set-FolderRights {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([string]$Path, [string]$Shown, [bool]$Protect, [object[]]$Entries)
-    if ($PSCmdlet.ShouldProcess($Shown, 'Set rights')) { Write-Host "Rights left alone (test): $Shown" }
+    if ($PSCmdlet.ShouldProcess($Shown, 'Set rights')) {
+        Write-Host "Rights left alone (test): $Shown"
+        if ($Protect) { $script:V2Protected = $true }      # as the real one notes it
+    }
 }
 
 """
+# The other example groups the stand-ins know, for a re-run with other groups
+OTHER_GROUPS = {"Admins": ("Stripes Admins 2", "S-1-5-21-1000000001-1000000002-1000000003-2201"),
+                "Senders": ("Stripes Senders 2", "S-1-5-21-1000000001-1000000002-1000000003-2202")}
+NOT_PROTECTED = "v2 isn't protected yet: it still has the Stripes folder's rights"
+RUN_AGAIN = "What is done stays done. Fix the problem and run the script again to finish."
 
 # Loads the script's functions without running it, and writes what they give into <Out>\out.txt
 FUNCTIONS_HARNESS = r"""
@@ -396,16 +406,21 @@ HARNESS_ADMIN_GROUP = "EXAMPLE\\Administradores de Stripes \u00f1 \u20ac <&'>"
 HARNESS_SENDER_GROUP = 'Stripes "MapleJet" Senders\ttab'
 
 
-def stubbed_script(folder):
-    """A copy of the script with the test stand-ins, in folder."""
+def stubbed_script(folder, extra="", name="stubbed.ps1"):
+    """A copy of the script with the test stand-ins, then the extra ones (which win), in folder."""
     text = script_text()
     m = re.search(r"^# Main\n# -+\n", text, re.M)
     if not m:
         raise AssertionError("the script has no main block")
-    path = os.path.join(folder, "stubbed.ps1")
+    path = os.path.join(folder, name)
     with open(path, "w", encoding="ascii", newline="\n") as f:
-        f.write(text[:m.end()] + STAND_INS + text[m.end():])
+        f.write(text[:m.end()] + STAND_INS + extra + text[m.end():])
     return path
+
+
+def warnings_in(output):
+    """The script's Warning lines."""
+    return [line for line in output.splitlines() if line.startswith("Warning: ")]
 
 
 # --------------------------------------------------------------------------
@@ -588,6 +603,57 @@ class ScriptTextTests(unittest.TestCase):
         for name in ("Get-V2Folders", "Get-EntryParts", "Format-JsonTime", "Get-UnixTime", "Get-CompanyJson",
                      "Get-ChangesJson", "Write-NewFile"):
             self.assertIn(name, names)
+
+    def test_other_groups_only_warn(self):
+        # A company.json that is already there keeps its groups: the script reads it and warns, and
+        # never writes it (final review B-1)
+        check = function_text(self.text, "Test-CompanyGroups")
+        code = code_only(check)
+        for pattern in (r"\bWrite-NewFile\b", r"\bWrite-SeedFile\b", r"WriteAll", r"\bSet-Content\b", r"\bOut-File\b",
+                        r"::Open\(", r"::Create\(", r"\bConvertTo-Json\b", r"\bCopy\("):
+            self.assertEqual(re.findall(pattern, code), [], pattern)
+        self.assertIn("ConvertFrom-Json -InputObject $text", check)
+        # The fields it compares are Company's
+        fields = {f.name for f in dataclasses.fields(Company)}
+        setup = function_text(self.text, "Invoke-FolderSetup")
+        found = re.findall(r"Field = '(\w+)'; Parameter = '(\w+)'", setup)
+        self.assertEqual(found, [("admin_group", "AdminGroup"), ("sender_group", "SenderGroup")])
+        for field, _ in found:
+            self.assertIn(field, fields)
+            self.assertIn(field + "_sid", fields)
+        self.assertIn("($group.Field + '_sid')", check)
+        # Its advice points at what exists: the Company tab and the README paragraph
+        joined = re.sub(r"'\s*\+\s*'", "", check)          # 'a ' + 'b' as one string
+        self.assertIn("MapleJet > Admin > Company, presses Look up and saves", joined)
+        self.assertIn('as the README says under "If a group is replaced"', joined)
+        with open(os.path.join(HERE, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("**If a group is replaced.**", readme)
+        self.assertIn("`admin_group_sid`", readme)
+        # Checked right after company.json's step, before the rights
+        order = [setup.index(s) for s in ("Write-SeedFile -Path $companyPath", "Test-CompanyGroups -Path $companyPath",
+                                          "$script:SetupStep = 'setting the rights'")]
+        self.assertEqual(order, sorted(order))
+        # And reminded once more at the end, where it isn't lost above the icacls listing
+        summary = function_text(self.text, "Show-Summary")
+        self.assertLess(summary.index("$script:GroupsDiffer"), summary.index("'Done. Put Stripes.exe"))
+
+    def test_failure_says_whether_v2_is_protected(self):
+        # A failure before the rights step leaves v2 with the Stripes folder's rights: the error says
+        # so (final review B-2). Set-FolderRights notes when v2 has its own
+        error = function_text(self.text, "Write-SetupError")
+        self.assertIn("v2 isn't protected yet: it still has the Stripes folder's rights", error)
+        self.assertIn(RUN_AGAIN, error)
+        self.assertLess(error.index("Test-V2Unprotected"), error.index(RUN_AGAIN))
+        rights = function_text(self.text, "Set-FolderRights")
+        self.assertEqual(rights.count("if ($Protect) { $script:V2Protected = $true }"), 2)
+        self.assertLess(rights.index("Set-FolderAccess $Path $wanted"),
+                        rights.rindex("if ($Protect) { $script:V2Protected = $true }"))
+        check = function_text(self.text, "Test-V2Unprotected")
+        self.assertIn("(Get-RuleProtection $v2) -ne $true", check)
+        main = self.text[self.text.index("\n# Main\n"):]
+        for name in ("SetupV2", "V2Protected", "GroupsDiffer"):
+            self.assertRegex(main, rf"\n\$script:{name} = ", name)
 
     def test_code_only_strips_strings_and_comments(self):
         code = code_only("a # c ?\n<# ? #>b 'x''?' \"y`\"?\" @'\n?\n'@ c\n")

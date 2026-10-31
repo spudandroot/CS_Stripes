@@ -13,7 +13,9 @@ The script:
  3. Copies printers.json and stock.json from ConfigPath into v2\config, once. A copy that is already
     there is kept.
  4. Writes the first company settings (v2\config\hx\company.json, with the two groups and their
-    IDs) and the change counter (v2\config\hx\changes.json), if they are missing.
+    IDs) and the change counter (v2\config\hx\changes.json), if they are missing. If company.json
+    is already there with other groups than this run's, it warns: Stripes keeps using the groups
+    in company.json, and the script never changes it.
  5. Sets the permissions of every folder. v2 doesn't inherit from the Stripes folder. Each folder
     gets exactly its own entries; any other entry added by hand is removed and listed.
  6. Reminds you about offline caching and DFS, and lists the permissions with icacls.
@@ -33,9 +35,14 @@ Running it again is safe: it never deletes, renames or overwrites anything, and 
 permissions back. It never touches today's config or status folders (it only reads the two Zebra
 files), the share's own settings, the registry or Group Policy.
 
-Run it as an account with Full Control on the Stripes folder. v2 doesn't inherit that, so run it
-again later as a member of the file server's Administrators group (a domain admin), or as the
-same account. On the file server itself, run it as administrator.
+Run it as an account with Full Control on the Stripes folder. On the file server itself, run it
+as administrator (an elevated PowerShell). v2 doesn't inherit that Full Control, so run it again
+later as a member of the file server's Administrators group (a domain admin). A re-run as the
+account that ran it first can fail part-way: it owns only what it created, so it can't pass the
+rights down to files other people wrote.
+
+If a run fails before it has set the rights of v2, v2 still has the Stripes folder's rights. The
+error says so: run the script again to finish.
 
 .PARAMETER ConfigPath
 Today's Zebra config folder, exactly as in the ConfigPath policy value, for example
@@ -392,8 +399,20 @@ function Set-FolderAccess([string]$Path, $Security) {
     }
 }
 
+function Get-RuleProtection([string]$Path) {
+    # True if the folder doesn't inherit its parent's rights, False if it does, $null if that
+    # can't be read
+    try {
+        $sections = [System.Security.AccessControl.AccessControlSections]::Access
+        (New-Object System.Security.AccessControl.DirectorySecurity -ArgumentList $Path, $sections).AreAccessRulesProtected
+    } catch {
+        $null
+    }
+}
+
 function Set-FolderRights {
-    # Gives one folder exactly its explicit entries. Inherited entries are left to Windows
+    # Gives one folder exactly its explicit entries. Inherited entries are left to Windows.
+    # Notes in $script:V2Protected when v2 has its own rights (Write-SetupError reads it)
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([string]$Path, [string]$Shown, [bool]$Protect, [object[]]$Entries)
 
@@ -418,6 +437,7 @@ function Set-FolderRights {
     $after = @(Get-ExplicitRules $wanted)
     if ($current.AreAccessRulesProtected -eq $Protect -and (Join-RuleKeys $before) -eq (Join-RuleKeys $after)) {
         Write-Host "Rights unchanged: $Shown"
+        if ($Protect) { $script:V2Protected = $true }
         return
     }
     $afterKeys = @($after | ForEach-Object { $_.Key })
@@ -428,6 +448,7 @@ function Set-FolderRights {
     }
     if ($PSCmdlet.ShouldProcess($Shown, $action)) {
         Set-FolderAccess $Path $wanted
+        if ($Protect) { $script:V2Protected = $true }
         Write-Host "Rights set: $Shown"
         foreach ($old in $removed) {
             Write-Host ('Removed entry: {0} on {1}' -f (Format-Rule $old.Rule), $Shown)
@@ -522,6 +543,48 @@ function Write-SeedFile {
     }
 }
 
+function Test-CompanyGroups {
+    # A company.json that is already there keeps its groups, and Stripes goes by those, whatever
+    # this run was given. Warns for each group whose ID differs. Only reads the file
+    param([string]$Path, [string]$Shown, [object[]]$Groups)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $record = $null
+    try {
+        $text = [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding -ArgumentList $false))
+        $record = ConvertFrom-Json -InputObject $text
+    } catch {
+        $record = $null
+    }
+    if (-not ($record -is [System.Management.Automation.PSCustomObject])) {
+        Write-Warn "couldn't read $Shown to check its groups."
+        return
+    }
+    $differ = 0
+    foreach ($group in $Groups) {
+        $old = @{ Name = ''; Sid = '' }
+        foreach ($pair in @(('Name', $group.Field), ('Sid', ($group.Field + '_sid')))) {
+            $property = $record.PSObject.Properties[$pair[1]]
+            if ($null -ne $property -and $null -ne $property.Value) { $old[$pair[0]] = [string]$property.Value }
+        }
+        if ($old['Sid'] -eq $group.Sid) { continue }
+        $differ += 1
+        if ($old['Name'] -eq '') { $old['Name'] = '(no name)' }
+        if ($old['Sid'] -eq '') { $old['Sid'] = 'no ID' }
+        $format = '{0} has the {1} {2} ({3}), not {4} ({5}) from -{6}. Stripes still uses {2}, but this ' +
+                  'script gives the folder rights to {4}.'
+        Write-Warn ($format -f $Shown, $group.Label, $old['Name'], $old['Sid'], $group.Name, $group.Sid,
+                    $group.Parameter)
+    }
+    if ($differ -gt 0) {
+        $script:GroupsDiffer = $true
+        Write-Warn ('this script never changes company.json. To change a group there, an administrator types ' +
+                    'it in MapleJet > Admin > Company, presses Look up and saves. Once the rights have changed, ' +
+                    'saving a new administrators'' group takes someone in both groups. Or edit admin_group_sid ' +
+                    'or sender_group_sid in company.json, as the README says under "If a group is replaced".')
+    }
+}
+
 function Test-ShareSettings([string]$V2) {
     # Checks that only warn: offline caching and DFS-R
     $server = ''
@@ -589,6 +652,9 @@ function Show-Summary([object[]]$Folders) {
         }
     }
     Write-Host ''
+    if ($script:GroupsDiffer) {
+        Write-Warn 'Stripes still uses the groups in company.json, not the ones given to this run (see above).'
+    }
     if ($WhatIfPreference) {
         Write-Host 'Nothing was changed (-WhatIf). Run it again without -WhatIf to make these changes.'
     } else {
@@ -607,6 +673,7 @@ function Invoke-FolderSetup {
     $config = Resolve-ConfigPath $ConfigPath
     $stripes = [System.IO.Path]::GetDirectoryName($config)
     $v2 = Join-Path $stripes 'v2'
+    $script:SetupV2 = $v2
     Write-Host "Stripes folder: $stripes"
     Write-Host "v2 folder:      $v2"
 
@@ -651,7 +718,14 @@ function Invoke-FolderSetup {
     }
     $script:SetupItem = 'company.json'
     $text = Get-CompanyJson @company
-    Write-SeedFile -Path (Join-Path $hx 'company.json') -Shown 'v2\config\hx\company.json' -Text $text
+    $companyPath = Join-Path $hx 'company.json'
+    Write-SeedFile -Path $companyPath -Shown 'v2\config\hx\company.json' -Text $text
+    $groups = @(
+        [pscustomobject]@{ Label = "administrators' group"; Field = 'admin_group'; Parameter = 'AdminGroup'
+                           Name = $AdminGroup; Sid = $sids['Admins'] },
+        [pscustomobject]@{ Label = "senders' group"; Field = 'sender_group'; Parameter = 'SenderGroup'
+                           Name = $SenderGroup; Sid = $sids['Senders'] })
+    Test-CompanyGroups -Path $companyPath -Shown 'v2\config\hx\company.json' -Groups $groups
     $script:SetupItem = 'changes.json'
     $text = Get-ChangesJson $account $now
     Write-SeedFile -Path (Join-Path $hx 'changes.json') -Shown 'v2\config\hx\changes.json' -Text $text
@@ -671,6 +745,20 @@ function Invoke-FolderSetup {
     Show-Summary $folders
 }
 
+function Test-V2Unprotected {
+    # After a failure: True when v2 is there but may still inherit the Stripes folder's rights
+    # (the run stopped before it set them, and they can't be read as protected)
+    try {
+        $v2 = [string]$script:SetupV2
+        if ($v2 -eq '' -or $script:V2Protected -or -not (Test-Path -LiteralPath $v2 -PathType Container)) {
+            return $false
+        }
+        (Get-RuleProtection $v2) -ne $true
+    } catch {
+        $true
+    }
+}
+
 function Write-SetupError($ErrorRecord) {
     $e = $ErrorRecord.Exception
     if ($e.Data.Contains('StripesStop')) {
@@ -678,6 +766,10 @@ function Write-SetupError($ErrorRecord) {
         $Host.UI.WriteErrorLine('Nothing was changed.')
     } else {
         $Host.UI.WriteErrorLine(('Failed while {0} ({1}): {2}' -f $script:SetupStep, $script:SetupItem, $e.Message))
+        if (Test-V2Unprotected) {
+            $Host.UI.WriteErrorLine(("v2 isn't protected yet: it still has the Stripes folder's rights, so anyone " +
+                                     'who may change that folder may change v2.'))
+        }
         $Host.UI.WriteErrorLine('What is done stays done. Fix the problem and run the script again to finish.')
     }
 }
@@ -689,6 +781,9 @@ function Write-SetupError($ErrorRecord) {
 
 $script:SetupStep = 'starting'
 $script:SetupItem = ''
+$script:SetupV2 = ''              # the v2 folder, once ConfigPath is checked
+$script:V2Protected = $false      # v2 has its own rights (Set-FolderRights)
+$script:GroupsDiffer = $false     # company.json has other groups than this run's (Test-CompanyGroups)
 $setup = @{ ConfigPath = $ConfigPath; AdminGroup = $AdminGroup; SenderGroup = $SenderGroup; UsersGroup = $UsersGroup }
 try {
     Invoke-FolderSetup @setup
