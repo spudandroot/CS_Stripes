@@ -295,7 +295,24 @@ def inheriting_temp_folder(prefix):
             os.mkdir(path)      # the default mode: no list of its own, only what the temp folder passes down
         except FileExistsError:
             continue
-        return path
+        break
+    if sys.platform == "win32":
+        # The temp folder may pass nothing down: on the CI runner a folder made in it got the account's
+        # default list (SYSTEM, Administrators and the user, full control) as entries of its own, not (I).
+        # So give this folder inheritable entries, as a server's Stripes folder has, and check that a folder
+        # made inside really inherits them, or every (I) check below would test the runner, not the script
+        user = f"{os.environ.get('USERDOMAIN')}\\{os.environ.get('USERNAME')}" if os.environ.get("USERDOMAIN") \
+            else os.environ.get("USERNAME", "")
+        done = subprocess.run(["icacls", path, "/grant", "*S-1-5-18:(OI)(CI)(F)", "*S-1-5-32-544:(OI)(CI)(F)",
+                               f"{user}:(OI)(CI)(F)"], capture_output=True, timeout=RUN_TIMEOUT_S)
+        probe = os.path.join(path, "probe")
+        os.mkdir(probe)
+        listing = subprocess.run(["icacls", probe], capture_output=True, timeout=RUN_TIMEOUT_S)
+        os.rmdir(probe)
+        if done.returncode != 0 or b"(I)" not in listing.stdout:
+            raise AssertionError(f"The test folder doesn't pass its rights down: {done.stdout!r} {done.stderr!r}"
+                                 f" / {listing.stdout!r}")
+    return path
 
 
 def make_tree(test):

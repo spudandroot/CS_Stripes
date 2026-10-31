@@ -1479,7 +1479,9 @@ class FakePrinterTests(unittest.TestCase):
             with fake.lock:
                 first = fake.requests[0] is record
             if first:
-                until(lambda: fake.in_flight >= 2)
+                # max_in_flight, not in_flight: the second may already have had its reply by the time this
+                # first looks (a 15.6 ms timer tick on Windows), and in_flight would never read 2 again
+                until(lambda: fake.max_in_flight >= 2)
             elif after_first:
                 until(lambda: fake.requests[0]["reply"] is not None)
         fake.in_flight_hook = hold
@@ -1519,7 +1521,8 @@ class FakePrinterTests(unittest.TestCase):
         fake.multi_value_hang_s = 0.1
         started = time.monotonic()
         self.assertEqual(raw_autopilot(fake, "<CPPARM/>").body, b"6")
-        self.assertGreaterEqual(time.monotonic() - started, 0.1)
+        # time.monotonic moves in 15.6 ms steps on Windows, so a 0.1 s wait can read up to one step short
+        self.assertGreaterEqual(time.monotonic() - started, 0.1 - time.get_clock_info("monotonic").resolution)
         self.assertEqual(fake.violations, ["multi-value query CPPARM"])
 
     def test_editor_page(self):
