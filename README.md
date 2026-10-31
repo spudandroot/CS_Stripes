@@ -78,6 +78,25 @@ port 80 from the floor PCs. Stripes talks to printers directly, never through a 
 request at a time. PCs ask the time server over SNTP (UDP 123). Change every printer's password
 before rollout.
 
+**Firewall (Group Policy).** Stripes only makes outgoing connections and never listens on the
+network, so PCs need no inbound rule. Windows Firewall allows outgoing traffic by default. If
+your policy blocks it, allow these outbound in a GPO (Computer Configuration > Policies >
+Windows Settings > Security Settings > Windows Defender Firewall with Advanced Security >
+Outbound Rules):
+
+| To | Protocol and port | For |
+|---|---|---|
+| The MapleJet printers' addresses | TCP 80 | Sending, checking and test prints |
+| The time server | UDP 123 | Setting printer clocks (SNTP) |
+| The file server | TCP 445 (SMB) | The share (`ConfigPath` and `v2`) |
+| The Zebra printers' addresses | TCP 9100 | Zebra labels sent straight to an IP address |
+| `api.labelary.com`, through the PC's web proxy if it has one | TCP 443 | The Zebra ZPL preview |
+
+`Stripes.exe` runs from each user's profile (`%LocalAppData%\Programs\Stripes`), so scope the rules
+by remote address and port, not by program path. The `--self-check` uses loopback (127.0.0.1)
+only. On the printers' side, the rule above still applies: their segment accepts port 80 only
+from the floor PCs.
+
 **Groups.** Create two AD groups: `Stripes Administrators` (set up products, films, print texts,
 lines, machines and printers; run test prints) and `Stripes MapleJet Senders` (send, stop,
 resume, set clocks). Someone who does both goes in both. Changes take effect at the person's
