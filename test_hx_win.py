@@ -165,6 +165,16 @@ class ScreenAndSoundTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             mon.width = 5
 
+    def test_work_area(self):
+        # The screen less the taskbar (Windows' rcWork); without one, the whole screen (ui.md §10.2)
+        self.assertEqual(hx_win.Monitor(1, 1920, 0, 1280, 1024, False).work_area(), (1920, 0, 1280, 1024))
+        mon = hx_win.Monitor(0, 0, 0, 1920, 1080, True, (0, 0, 1920, 1040))
+        self.assertEqual((mon.work, mon.work_area()), ((0, 0, 1920, 1040), (0, 0, 1920, 1040)))
+        for m in hx_win.monitors():            # Windows: each work area lies inside its screen
+            x, y, w, h = m.work_area()
+            self.assertTrue(m.x <= x and m.y <= y and x + w <= m.x + m.width and y + h <= m.y + m.height, m)
+            self.assertTrue(0 < w <= m.width and 0 < h <= m.height, m)
+
     @unittest.skipIf(hx_win.is_windows(), NOT_WINDOWS)
     def test_monitors_off_windows(self):
         self.assertEqual(hx_win.monitors(), [])

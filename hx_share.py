@@ -1323,6 +1323,7 @@ class ShareStore:
         self._pool = _IoPool()
         self._probe_after = 0.0
         self._probing = False
+        self._probe_failed_at = None         # clock.monotonic() when the last probe failed (reach_now)
         self._cleaned = False
         self._housekeeping = False
         self._local_lock_infos = {}
@@ -1437,9 +1438,47 @@ class ShareStore:
         with self._lock:
             self._start_probe(due_only=False)
 
+    def reach_now(self):
+        """Blocking, at most share_timeout_s: while the share is marked down, one probe now instead of at
+        the next due time (§9.3 item 6). True when the share is available afterwards. A probe that failed
+        less than share_timeout_s ago isn't repeated, so in a real outage the next caller fails at once."""
+        if self.root is None:
+            return False
+        with self._lock:
+            if self.available:
+                return True
+            failed = self._probe_failed_at
+            if failed is not None and self.clock.monotonic() - failed < self.timings.share_timeout_s:
+                return False
+            self._probe_after = self.clock.monotonic() + self.timings.share_retry_s
+        ok, reason = self._list_root()
+        self._probed(ok, reason)
+        with self._lock:
+            return self.available
+
     def _probe(self):
         """On an hx-io thread: listdir(root) as one more timed operation. A listing that hangs is
         abandoned after share_timeout_s like any other, so the next probe can still start."""
+        ok, reason = self._list_root()
+        self._probed(ok, reason, background=True)
+
+    def _probed(self, ok, reason, *, background=False):
+        with self._lock:
+            if background:
+                self._probing = False
+            if ok:
+                self.available = True
+                self.down_reason = None
+                self._probe_failed_at = None
+            else:
+                self._probe_failed_at = self.clock.monotonic()
+        if ok:
+            self._reached()
+        else:
+            self._mark_down(reason)
+
+    def _list_root(self):
+        """(ok, reason) of one listdir(root) with the share timeout."""
         ok, reason = False, None
         try:
             job = self._pool.start(self.fs.listdir, self.root)
@@ -1463,15 +1502,7 @@ class ShareStore:
         except Exception:
             traceback.print_exc()
             reason = Msg(N_("Stripes can't reach the server."))
-        with self._lock:
-            self._probing = False
-            if ok:
-                self.available = True
-                self.down_reason = None
-        if ok:
-            self._reached()
-        else:
-            self._mark_down(reason)
+        return ok, reason
 
     def _reached(self):
         """After every successful operation: note the time, and do the one-off and pending clean-ups."""
@@ -2173,6 +2204,10 @@ class PrinterLock:
             self.state = "unheld"
             self._note = {}
         try:
+            # One real try even while the share is marked down: a single slow operation marks it down
+            # for share_retry_s, and a local_only lock lets other PCs poll during the Send. At most
+            # share_timeout_s, so a real outage still falls back at once (storage.md §11.2 step 4)
+            store.reach_now()
             # Waits for a pending release's read-then-remove on this printer to finish, so it never
             # removes the file made here (storage.md §11.5)
             with store._printer_mutex(self.printer_id):

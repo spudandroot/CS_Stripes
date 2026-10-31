@@ -817,8 +817,9 @@ class MonitorTests(UiCase):
 class FloorBoardTests(UiCase):
     # The screen a board opens on unless a test names its own: a fake 1920x1080 one (the floor PCs'
     # larger size), so that no test depends on the real screen of the machine running it (a 1024x768
-    # CI runner, a 1366x768 laptop). monitors=[] is Tk's real screen.
-    SCREENS = (hx_win.Monitor(0, 0, 0, 1920, 1080, True),)
+    # CI runner, a 1366x768 laptop), with a 40 px taskbar along its bottom (the work area a window keeps
+    # to, ui.md §10.2). monitors=[] is Tk's real screen.
+    SCREENS = (hx_win.Monitor(0, 0, 0, 1920, 1080, True, (0, 0, 1920, 1040)),)
 
     def board(self):
         ringing = alert("al_f", to=("floor", "user:EXAMPLE\\akim"), machine="mc_2")
@@ -943,6 +944,35 @@ class FloorBoardTests(UiCase):
             fb = self.open(services, monitors=small, size=size)
             self.assertEqual((fb.geometry_spec, fb.full_screen), (f"{spec}+0+0", False), size)
             fb.destroy()
+
+    def test_a_window_keeps_out_of_the_taskbar(self):
+        # A window size as tall as the screen put the board's bottom row under the Windows taskbar. A
+        # window now keeps to the screen's work area (GetMonitorInfo's rcWork), wherever the taskbar is;
+        # full screen still takes the whole screen (ui.md §10.2)
+        services = self.make()
+        for size, spec in (("1920x1080", "1920x1040+0+0"), ("1280x1060", "1280x1040+0+0"),
+                           ("1280x800", "1280x800+0+0"), ("full", "1920x1080+0+0")):
+            fb = self.open(services, size=size)
+            self.assertEqual((fb.geometry_spec, fb.full_screen), (spec, size == "full"), size)
+            fb.destroy()
+        for work, spec in (((60, 0, 1860, 1080), "1860x1080+60+0"),          # on the left
+                           ((0, 40, 1920, 1040), "1920x1040+0+40")):         # along the top
+            mons = [hx_win.Monitor(0, 0, 0, 1920, 1080, True, work)]
+            fb = self.open(services, monitors=mons, size="1920x1080")
+            self.assertEqual(fb.geometry_spec, spec)
+            fb.destroy()
+        mons = [hx_win.Monitor(0, 0, 0, 1920, 1080, True, (0, 0, 1920, 1040)),
+                hx_win.Monitor(1, 1920, 0, 1280, 1024, False, (1920, 0, 1280, 984))]
+        fb = self.open(services, monitors=mons, screen=1, size="1280x1024")
+        self.assertEqual(fb.geometry_spec, "1280x984+1920+0")
+        fb.destroy()
+        # The board is drawn for the window it got: every row above the taskbar
+        fb = self.open(services, self.big_board(4, 3), size="1920x1080")
+        self.root.update()
+        spans = self.check_rows(fb, "1920x1040")
+        self.assertEqual(fb.canvas.winfo_height(), 1040 - fb.layout.header_h)
+        self.assertLessEqual(spans[-1][1], fb.canvas.winfo_height())
+        fb.destroy()
 
     def test_a_board_bigger_than_its_screen_shows_every_row(self):
         # A 1280x800 board on a 1024x768 screen is cut to the screen, and Windows then keeps the window's

@@ -963,6 +963,46 @@ class SendTests(Base):
         self.assertEqual(pc.store.read_expected(mid).counter, later.counter)
         self.assertClean(fake)
 
+    def test_a_store_marked_down_by_one_slow_op_still_takes_its_locks(self):
+        # The flake fix plan's product gap: one share operation slower than share_timeout_s (say the last
+        # Send's log entry) marks the store down for share_retry_s. The next Send's lock step then took a
+        # local_only lock (amber no_lock) without trying the share, although it answered, and the other
+        # PCs' pollers, seeing no lock, kept polling during the Send. The lock step now tries once
+        self.quiet()
+        w = self.world()
+        pc, akim = self.pc(), self.pc("akim")
+        self.own_poll(pc)
+        pid, mid = w.ids["printer1"], self.mid()
+        pc.store._mark_down(Msg("The server didn't answer within {seconds} s.", {"seconds": 1}))
+        self.assertFalse(pc.store.available)
+        seen = []
+
+        def on_event(e):
+            if isinstance(e, SendEvent) and e.step == STEP_LOCK and e.machine_id == mid and e.status != "running":
+                seen.append((e.status, akim.store.read_lock(pid)))
+        result, _, _ = self.send(pc, on_event=on_event)
+        r = result.machines[0]
+        self.assertEqual((r.ok, r.colour, r.notes), (True, AMBER, []))      # as test_delay: no no_lock
+        self.assertEqual([(status, lock.user) for status, lock in seen], [("ok", pc.identity.user)])
+        self.assertTrue(pc.store.available)
+        self.assertEqual(akim.store.read_expected(mid).send_id, result.send_id)
+        self.assertEqual(self.lock_files(), [])
+        # A real outage: the one try fails within share_timeout_s, and the Send carries on with a
+        # local_only lock, amber no_lock, as before
+        pc.store.fs.down = True
+        pc.store._mark_down(Msg("Stripes can't reach the server."))
+        seen.clear()
+        first = result.send_id
+        result, _, _ = self.send(pc, on_event=on_event)
+        r = result.machines[0]
+        self.assertEqual((r.ok, r.colour, r.notes), (True, AMBER, ["no_lock"]))
+        self.assertEqual([status for status, _ in seen], ["warning"])
+        self.assertIsNone(seen[0][1])                   # no lock on the share
+        self.assertTrue(result.log_queued)
+        self.assertEqual(akim.store.read_expected(mid).send_id, first)     # nothing written meanwhile
+        pc.store.fs.down = False
+        self.assertClean()
+
     def test_record_offline_skipped_machine_raises(self):
         # Review finding: a machine skipped for now (LockHeld, or a local_only lock) returned quietly,
         # so the Navigator dropped the Send and never recorded it (ui.md §15.3 keeps a send_id only when

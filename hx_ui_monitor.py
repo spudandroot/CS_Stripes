@@ -823,8 +823,10 @@ class FloorBoard(HxWindow):
             self.overrideredirect(True)
             self.geometry_spec = f"{m.width}x{m.height}+{m.x}+{m.y}"
         else:
+            # A window keeps to the work area: the screen less the taskbar, so no row is under it
             self.full_screen = False
-            self.geometry_spec = f"{min(wanted[0], m.width)}x{min(wanted[1], m.height)}+{m.x}+{m.y}"
+            x, y, width, height = m.work_area()
+            self.geometry_spec = f"{min(wanted[0], width)}x{min(wanted[1], height)}+{x}+{y}"
         self.geometry(self.geometry_spec)
 
     def _board_size(self):

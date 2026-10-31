@@ -2077,6 +2077,114 @@ class NotMonitoredAlarmTests(unittest.TestCase):
         NameNotIdTests.assertNoIds(self, [a.msg], "not_monitored")
         self.assertIn("Line 1 Bagger 1", a.msg.english())
 
+    # Final review, 31 Oct: A-1 (the shared marker), A-2, A-3 and A-4
+
+    def test_a_pc_that_never_saw_it_judged_rings_for_the_marker_of_this_occurrence(self):
+        # A-1: a PC restarted (or started) after the last judgement has no record of it moving. It asks for
+        # the shared marker once it has shown NOT MONITORED for 120 s, and rings when the marker holds this
+        # occurrence's id (a PC that saw it judged rang for it), not for any other id
+        e = expected()
+        p = poll(judged=42, judged_at=T0)
+        aid = hs.not_monitored_alarm_id(MID, 42, T0, SID)
+        seen = None
+        for mono in range(0, 151):
+            age = None if mono < 30 else float(mono)            # "Checking...", then NOT MONITORED (§7 item 6)
+            seen, a = self.step(seen, p, age, e, float(mono))
+            self.assertIsNone(a)
+            self.assertEqual(seen.ask, aid if mono == 150 else "", mono)      # 120 s after NOT MONITORED
+        for other in (None, hs.not_monitored_alarm_id(MID, 41, T0 - 5, SID), aid.replace(SID, SID2)):
+            again, a = hs.not_monitored_alarm(seen, p, view(p, age=151.0, e=e), e, LINE, share_ok=True, mono=151.0,
+                                              now=T0 + 151, alarm_s=ALARM_S, marker=other)
+            self.assertIsNone(a, other)
+            self.assertEqual((again.ask, again.shared), (aid, ""))
+        seen, a = hs.not_monitored_alarm(seen, p, view(p, age=151.0, e=e), e, LINE, share_ok=True, mono=151.0,
+                                         now=T0 + 151, alarm_s=ALARM_S, marker=aid)
+        self.assertEqual((a.id, a.started_at, a.sound, a.recipients), (aid, T0 + 151, True,
+                                                                       ["user:" + AKIM, "user:" + JSMITH, "floor"]))
+        self.assertEqual((seen.shared, seen.ask, seen.moved), (aid, "", False))
+        # Known now: it goes on with no further read, the same id and start
+        seen, b = self.step(seen, p, 200.0, e, 200.0)
+        self.assertEqual((b.id, b.started_at, seen.ask), (aid, T0 + 151, ""))
+        # Never asked while it isn't NOT MONITORED, while the share is down or E isn't running
+        fresh = hs.JudgedSeen(value=42, at=T0, since=0.0, stale_from=0.0)
+        for v, e2, ok in ((view(p, age=5.0, e=e), e, True), (view(p, age=200.0, e=e), e, False),
+                          (view(p, age=200.0, e=expected("stopped_by_user")), expected("stopped_by_user"), True)):
+            s, a = hs.not_monitored_alarm(fresh, p, v, e2, LINE, share_ok=ok, mono=200.0, now=T0 + 200,
+                                          alarm_s=ALARM_S)
+            self.assertIsNone(a)
+            self.assertEqual(s.ask, "")
+        # A PC that rang through its own record has no marker to ask for: it rings without one
+        seen, p = self.watched(e)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 155)
+        self.assertEqual([t for t, _ in rang], [155.0])
+        self.assertEqual((seen.ask, seen.shared), ("", ""))     # the watcher writes the marker, then notes it
+
+    def test_an_e_changed_since_the_last_judgement_counts_as_printing(self):
+        # A-2: judged while stopped (printing off, E stopped); then a Resume (E running, a new counter) or a
+        # Send onto the stopped machine, and the poller dies before judging it: the printer may be printing
+        stopped = expected("stopped_by_user", stopped_by=JSMITH, stop_reason="user")
+        seen, p = self.watched(stopped, printing=False)
+        self.assertFalse(seen.printing)
+        resumed = expected(counter=6)                           # P's expected_counter is 5
+        seen, rang = self.stale(seen, p, resumed, 5.0, 6, 155)
+        self.assertEqual([(t, a.id) for t, a in rang], [(155.0, hs.not_monitored_alarm_id(MID, 42, T0, SID))])
+        # E unchanged since the judgement: P's printing off stands, nothing rings
+        seen, p = self.watched(expected(), printing=False)
+        self.assertEqual(self.stale(seen, p, expected(), 5.0, 6, 1000)[1], [])
+
+    def test_printing_unknown_at_the_last_judgement_counts_as_printing(self):
+        # A-2: PRIN unread for long (printing_unchecked): the last known value counts, and so does no
+        # known value at all (it may be printing, maybe_printing)
+        for printing in (True, None):
+            with self.subTest(printing=printing):
+                seen, p = self.watched(expected(), printing=printing, printing_unchecked=True)
+                self.assertTrue(seen.printing)
+                self.assertEqual([t for t, _ in self.stale(seen, p, expected(), 5.0, 6, 155)[1]], [155.0])
+
+    def test_a_start_write_judging_nothing_doesnt_end_it(self):
+        # A-3: a PC takes the printer over and writes its start ("Checking...", judged unchanged), then
+        # can't judge it. The alarm goes on with its id and start, and the 120 s don't start again
+        e = expected()
+        seen, p = self.watched(e)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 155)
+        first = rang[0][1]
+        start = poll("checking", judged=42, judged_at=T0, counter=101)
+        for mono in range(156, 186):                            # 30 s of "Checking...": the counter is fresh
+            v = view(start, age=float(mono - 156), e=e)
+            self.assertEqual(v.code, "checking")
+            seen, a = hs.not_monitored_alarm(seen, start, v, e, LINE, share_ok=True, mono=float(mono),
+                                             now=T0 + mono, alarm_s=ALARM_S)
+            self.assertEqual((a.id, a.started_at), (first.id, first.started_at), mono)
+            self.assertEqual(a.msg.values["minutes"], int((mono - 5) // 60))
+        self.assertEqual(seen.since, 35.0)
+        # NOT MONITORED again, the same occurrence still
+        seen, rang = self.stale(seen, start, e, 5.0, 186, 200)
+        self.assertEqual({(a.id, a.started_at) for _, a in rang}, {(first.id, first.started_at)})
+        self.assertEqual(len(rang), 15)
+        # A start write followed by a real judgement ends it, as before
+        judged = poll(judged=43, judged_at=T0 + 205)
+        seen, a = self.step(seen, judged, 0.0, e, 205.0)
+        self.assertIsNone(a)
+        self.assertIsNone(seen.since)
+        # "Checking..." without a spell going on (a poller starting after a judgement) starts nothing
+        start = dataclasses.replace(start, judged=43, judged_at=T0 + 205, counter=103)
+        seen, a = hs.not_monitored_alarm(seen, start, view(start, age=1.0, e=e), e, LINE, share_ok=True,
+                                         mono=206.0, now=T0 + 206, alarm_s=ALARM_S)
+        self.assertIsNone(seen.since)
+
+    def test_a_printer_not_set_up_drops_the_record(self):
+        # A-4: an inactive printer (or one without a token) shows "No printer set up"; like an inactive
+        # machine its record goes, so after it is set up again it rings only once this PC has seen it judged
+        e = expected()
+        seen, p = self.watched(e)
+        unset = hs.MachineView(machine_id=MID, line_id=LINE_ID, name=MACHINE.name, colour=GREY, code="not_set_up",
+                               headline=Msg(hs.STATE_TEXTS["not_set_up"]))
+        self.assertEqual(hs.not_monitored_alarm(seen, p, unset, e, LINE, share_ok=True, mono=10.0, now=T0 + 10,
+                                                alarm_s=ALARM_S), (None, None))
+        seen, rang = self.stale(None, p, e, 5.0, 3600, 4000)
+        self.assertEqual(rang, [])
+        self.assertFalse(seen.moved)
+
 
 if __name__ == "__main__":
     unittest.main()

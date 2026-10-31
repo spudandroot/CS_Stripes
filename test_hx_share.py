@@ -1769,6 +1769,62 @@ class LockTests(ShareCase):
         lk.release()
         self.assertEqual(self.lock(self.b).acquire(), "held")
 
+    def slow_op_marks_down(self, view, st):
+        """One share operation slower than the share timeout: the store counts as down for share_retry_s
+        (§9.3), although the share works again straight away."""
+        view.slow_s = st.timings.share_timeout_s * 3
+        with self.assertRaises(ShareUnavailable):
+            st.append_log("hx-sends", {"type": "send_finished", "send_id": "sd_8a7b6c5d4e"})
+        view.slow_s = 0.0
+        self.assertFalse(st.available)
+
+    def test_a_store_marked_down_by_one_slow_op_still_takes_the_lock(self):
+        # The flake fix plan's product gap: one slow share operation marked the store down, and the next
+        # Send's acquire gave a local_only lock at once without trying the share. Other PCs saw no lock
+        # and polled the printer during the Send: two requests in flight. Now acquire() tries once
+        view = self.fs.view()
+        st = self.store(identity(sender=True), view=view, timings=QUICK)
+        self.slow_op_marks_down(view, st)
+        lk = self.lock(st)
+        self.assertEqual(lk.acquire(), "held")
+        self.assertEqual(self.lock_file()["token"], lk.token)
+        self.assertTrue(st.available)                    # the try was a probe: the store is up again
+        with self.assertRaises(LockHeld):                # so the other PCs see it, and their pollers step aside
+            self.lock(self.b).acquire()
+        lk.release()
+
+    def test_a_real_outage_still_falls_back_to_local_only_at_once(self):
+        # ... and in a real outage the try is one probe, at most share_timeout_s, then the amber local_only
+        # lock (no_lock) as before. A second acquire straight after doesn't wait again
+        for fault in ("down", "hang"):
+            with self.subTest(fault=fault):
+                view = self.fs.view()
+                st = self.store(identity(sender=True), view=view, timings=QUICK)
+                self.slow_op_marks_down(view, st)
+                setattr(view, fault, True)
+                self.addCleanup(setattr, view, fault, False)
+                started = time.perf_counter()
+                lk = self.lock(st)
+                self.assertEqual(lk.acquire(), "local_only")
+                self.assertLess(time.perf_counter() - started, QUICK.share_timeout_s + 0.08)
+                self.assertEqual((lk.state, lk.token, st.local_locks), ("local_only", "", {PRINTER_ID: lk.run_id}))
+                self.assertEqual(view.calls[-1], ("listdir", self.root))      # the one try: a probe
+                calls = len(view.calls)
+                started = time.perf_counter()
+                other = self.lock(st, printer_id="pr_0a1b2c3d4e")
+                self.assertEqual(other.acquire(), "local_only")
+                self.assertLess(time.perf_counter() - started, 0.05)
+                self.assertEqual(len(view.calls), calls)
+                lk.release()
+                other.release()
+                self.assertFalse(os.path.exists(self.path(f"status/locks/{PRINTER_ID}.lock")))
+                setattr(view, fault, False)
+                # share_timeout_s later the next acquire tries again, and gets the lock
+                self.clock.advance(QUICK.share_timeout_s)
+                again = self.lock(st)
+                self.assertEqual(again.acquire(), "held")
+                again.release()
+
     def test_share_down_gives_a_local_only_lock(self):
         view = self.fs.view(down=True)
         st = self.store(identity(sender=True), view=view)

@@ -253,6 +253,13 @@ class Monitor:
     width: int
     height: int
     primary: bool
+    # The screen less the taskbar and other docked bars (Windows' rcWork) as (x, y, width, height); None:
+    # the whole screen, as off Windows
+    work: tuple[int, int, int, int] | None = None
+
+    def work_area(self) -> tuple[int, int, int, int]:
+        """(x, y, width, height) a normal window should keep inside."""
+        return self.work if self.work is not None else (self.x, self.y, self.width, self.height)
 
 
 def monitors():
@@ -280,16 +287,17 @@ def monitors():
         mi = MONITORINFO()
         mi.cbSize = ctypes.sizeof(MONITORINFO)
         if user32.GetMonitorInfoW(hmonitor, ctypes.byref(mi)):
-            r = mi.rcMonitor
+            r, wa = mi.rcMonitor, mi.rcWork
             found.append((r.left, r.top, r.right - r.left, r.bottom - r.top,
-                          bool(mi.dwFlags & _MONITORINFOF_PRIMARY)))
+                          bool(mi.dwFlags & _MONITORINFOF_PRIMARY),
+                          (wa.left, wa.top, wa.right - wa.left, wa.bottom - wa.top)))
         return True
 
     callback = callback_type(each)      # kept referenced until EnumDisplayMonitors returns
     if not user32.EnumDisplayMonitors(None, None, callback, 0):
         raise ctypes.WinError(ctypes.get_last_error())
     found.sort(key=lambda m: not m[4])  # primary first, the rest in Windows' order
-    return [Monitor(i, x, y, w, h, primary) for i, (x, y, w, h, primary) in enumerate(found)]
+    return [Monitor(i, x, y, w, h, primary, work) for i, (x, y, w, h, primary, work) in enumerate(found)]
 
 
 # --------------------------------------------------------------------------
