@@ -38,7 +38,7 @@ from hx_model import (AMBER, GREY, RED, TIMINGS, Ack, AuthFailed, BadReply, Boar
                       FormatTooNew, HxError, MachineSnapshot, NoReply, PollerUpdate, PollStatus, PrinterBusy,
                       RunningMessage, ShareError, ShareUnavailable, Timings, WebReadFailed, WrongPrinter, same_user,
                       to_json)
-from hx_share import CounterWatch, ReachMemory, assign, settle_s, takeover_after_s
+from hx_share import AlarmMarker, CounterWatch, ReachMemory, assign, settle_s, takeover_after_s
 from hx_state import Reading
 from i18n import N_, add_spanish
 
@@ -56,6 +56,8 @@ UNCHECKED_CONFIRMS = 3         # ... or this many failed confirming Loads in a r
 PRIN_UNREAD_LIMIT = 3          # cycles in a row without a good PRIN value before printing counts as unknown (§6.6)
 DECLINE_MAX_S = 900.0          # a stuck-worker decline doubles from lock_stale_s up to this (§6.2 item 3.0) ...
 DECLINE_MEMORY_S = 3600.0      # ... each time the printer is fenced again within this of the last fence
+
+_GONE = object()               # the watcher's marker read: the share went away
 
 EXTRA_LOAD_GAP_S = 30.0        # at most one MSGNAM-triggered Load per printer this often (§6.4 step 9)
 DAILY_ITEMS = ("ECOMOD", "PLDEL", "MNPL", "PRPL", "PLVO", "PLWR", "NZRO")
@@ -2027,8 +2029,10 @@ class Poller:
             self._stop_workers("share")
             if not self.store.available:
                 self._try_beat()    # a call while the share is down starts the store's probe
+            # Only a PC that can poll (it reached a printer within a day, storage.md §12.3): an office PC's
+            # checks would be blocked and show printing machines as off (§6.12 item 1)
             if self._monitor_open and self._down_since is not None \
-                    and now - self._down_since >= self.timings.lock_stale_s:
+                    and now - self._down_since >= self.timings.lock_stale_s and self.reach.can_poll():
                 self._standalone_pass(data, printers, now)
             else:
                 self._set_mode("idle")
@@ -2577,23 +2581,45 @@ class StatusWatcher:
     def _with_alarms(self, data, board, polls, expected, acks):
         """The board with each machine's NOT MONITORED alarm (§7 item 7): no poller judges such a machine, so
         every PC's watcher raises it itself, with the same id on every PC, and reads its ack from the share
-        like any other. Machines no longer on the board are forgotten. Not while the share is down or in
-        standalone mode, which have their own banner."""
+        like any other. A PC that rings through its own record writes the shared marker, so a PC started
+        later (or restarted) rings for the same occurrence too; the marker is read at most once per pass for
+        a machine shown NOT MONITORED, and never otherwise. Machines no longer on the board are forgotten.
+        Not while the share is down or in standalone mode, which have their own banner."""
         mono, now = self.clock.monotonic(), self.clock.time()
         share_ok = board.share_ok and not board.standalone
         seen, alarms = {}, {}
+        gone = False                    # the share went away part-way: no more marker reads or writes
         for line in board.lines:
             record = data.lines.get(line.line_id)
             for view in line.machines:
                 mid = view.machine_id
-                s, alarm = hx_state.not_monitored_alarm(self._judged_seen.get(mid), polls.get(mid), view,
-                                                        expected.get(mid), record, share_ok=share_ok, mono=mono,
-                                                        now=now, alarm_s=NOT_MONITORED_ALARM_S)
+                prev = self._judged_seen.get(mid)
+                args = (prev, polls.get(mid), view, expected.get(mid), record)
+                kw = {"share_ok": share_ok, "mono": mono, "now": now, "alarm_s": NOT_MONITORED_ALARM_S}
+                s, alarm = hx_state.not_monitored_alarm(*args, **kw)
+                read, found = False, None
+                if s is not None and s.ask and not gone:
+                    # Its own record can't tell: a PC that saw the machine judged may have rung already
+                    read = True
+                    try:
+                        found = self.store.read_alarm_marker(mid)
+                    except ShareUnavailable:
+                        gone = True
+                    except ShareError:
+                        found = None
+                    if found is not None:
+                        s, alarm = hx_state.not_monitored_alarm(*args, marker=found.alarm_id, **kw)
+                if (alarm is not None and s.shared != alarm.id and view.code == "not_monitored"
+                        and not gone):
+                    # Rang through its own record: make sure the marker holds this occurrence
+                    s, gone = self._mark(mid, alarm, s, found if read else self._read_marker(mid))
                 if s is not None:
                     seen[mid] = s
                 if alarm is not None:
                     alarms[mid] = alarm
         self._judged_seen = seen
+        if gone:
+            return board                # gone part-way: no sound from this pass; the next one is share down
         acks = dict(acks)
         for alarm in alarms.values():
             if alarm.id in acks:
@@ -2610,6 +2636,31 @@ class StatusWatcher:
                 self._found_acks[alarm.id] = ack
                 acks[alarm.id] = ack
         return hx_state.with_board_alerts(board, alarms, acks)
+
+    def _read_marker(self, machine_id):
+        """The shared marker, None when missing or unreadable, or _GONE when the share went away."""
+        try:
+            return self.store.read_alarm_marker(machine_id)
+        except ShareUnavailable:
+            return _GONE
+        except ShareError:
+            return None
+
+    def _mark(self, machine_id, alarm, s, found):
+        """(the record, gone): the marker written for this occurrence unless it holds it already. A
+        new occurrence overwrites the old one; it is never deleted. A failed write is tried at the next
+        NOT MONITORED pass."""
+        if found is _GONE:
+            return s, True
+        if found is None or found.alarm_id != alarm.id:
+            try:
+                self.store.write_alarm_marker(AlarmMarker(machine_id=machine_id, alarm_id=alarm.id,
+                                                          started_at=alarm.started_at))
+            except ShareUnavailable:
+                return s, True
+            except (ShareError, ValueError):
+                return s, False
+        return dataclasses.replace(s, shared=alarm.id), False
 
     def _last_good(self, machine_id):
         """While the share is down: the newest P this PC has, the watcher's last read or what this PC's
