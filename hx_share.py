@@ -109,7 +109,7 @@ ENVELOPE_KEYS = ("format_version", "file_type")
 JSON_FILE_TYPES = ("company", "changes", "line", "machine", "printer", "adjustment", "calibration",
                    "product", "film", "print_text", "poll", "expected", "line_status", "lock",
                    "heartbeat", "ack", "log", "local_copy", "user_settings", "local_state",
-                   "upload_marker")
+                   "upload_marker", "nm_alarm")
 
 # The folders the folder script makes (storage.md §1.1). Stripes never creates these on the share
 _SHARE_FOLDERS = (
@@ -151,6 +151,17 @@ _NETWORK_ERRNOS = frozenset(getattr(errno, name) for name in
 
 class ShareDenied(ShareError):
     """A PermissionError on the share. The share stays available."""
+
+
+@dataclass(kw_only=True)
+class AlarmMarker:
+    """status/machines/<machine_id>.nm-alarm.json (storage.md §5.9): a PC rang the NOT MONITORED alarm of
+    this occurrence (states.md §7 item 7.6). Overwritten for a new occurrence, never deleted."""
+    machine_id: str
+    alarm_id: str
+    started_at: float = 0.0             # the writer's alert started_at (its own wall clock)
+    by: str = ""                        # set by write_alarm_marker
+    computer: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -1788,6 +1799,32 @@ class ShareStore:
         if self.create_once(f"status/alerts/{ack.alert_id}.json", encode_json("ack", to_json(ack))):
             with self._lock:
                 self._acks[ack.alert_id] = copy.deepcopy(ack)
+
+    def read_alarm_marker(self, machine_id):
+        """The machine's NOT MONITORED alarm marker (§5.9), or None when missing or damaged. Read by name,
+        never cached: it changes with each occurrence."""
+        _check_id(machine_id, "machine id")
+        kind, d = self._read_status(f"status/machines/{machine_id}.nm-alarm.json", "nm_alarm")
+        if kind == "newer":
+            d = d[0]            # machine_id and alarm_id are stable keys (§3.4)
+        elif kind != "ok":
+            return None
+        try:
+            marker = from_json(AlarmMarker, d)
+        except ValueError:
+            return None
+        if marker.machine_id != machine_id or not _ALERT_RE.match(marker.alarm_id):
+            return None
+        return marker
+
+    def write_alarm_marker(self, marker):
+        """Written whole over any earlier one (a new occurrence), with by and computer set to this PC's."""
+        _check_id(marker.machine_id, "machine id")
+        if not isinstance(marker.alarm_id, str) or not _ALERT_RE.match(marker.alarm_id):
+            raise ValueError(f"bad alert id {marker.alarm_id!r}")
+        written = dataclasses.replace(marker, by=self.identity.user, computer=self.identity.computer)
+        self.write_json(f"status/machines/{marker.machine_id}.nm-alarm.json",
+                        {"file_type": "nm_alarm", **to_json(written)})
 
     def read_preview(self, machine_id):
         _check_id(machine_id, "machine id")

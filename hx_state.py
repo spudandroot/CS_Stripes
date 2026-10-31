@@ -1529,10 +1529,13 @@ class JudgedSeen:
     value: int                      # P.judged at the last read (P.counter for a P from an older Stripes)
     at: float = 0.0                 # P.judged_at at that read (P.written_at for an older P)
     moved: bool = False             # value seen to change: someone judged the machine while this PC watched
-    printing: bool = False          # at the last good judgement: P.printing True and E.mode "running"
+    printing: bool = False          # at the last good judgement: P maybe printing (maybe_printing) and E running
     since: float | None = None      # clock.monotonic() of the first pass showing NOT MONITORED, share up
+    stale_from: float | None = None  # clock.monotonic() of the last judgement, from the last NOT MONITORED pass
     alarm_id: str = ""              # the alarm on the board now, and its started_at (this PC's wall clock)
     alarm_at: float = 0.0
+    ask: str = ""                   # this pass: the alarm's id, when only the shared marker can make it ring
+    shared: str = ""                # the alarm id the shared marker is known to hold (read or written here)
 
 
 def not_monitored_alarm_id(machine_id: str, value: int, at: float, send_id: str) -> str:
@@ -1548,43 +1551,71 @@ def _alarm_ref(value, send_id):
 
 def not_monitored_alarm(seen: JudgedSeen | None, poll: PollStatus | None, view: MachineView,
                         expected: ExpectedState | None, line: Line | None, *, share_ok: bool, mono: float,
-                        now: float, alarm_s: float) -> tuple[JudgedSeen | None, Alert | None]:
+                        now: float, alarm_s: float,
+                        marker: str | None = None) -> tuple[JudgedSeen | None, Alert | None]:
     """The watcher's record of the machine after this pass, and its not_monitored alarm or None (§7 item 7).
 
-    It rings when the view is NOT MONITORED, this watcher saw P's judged counter move earlier in this run,
-    P said printing with E running at the last good judgement (monitored, no lock, not "Checking..."), E is
-    still running, and this PC has shown NOT MONITORED for alarm_s with the share readable. So the first
-    PC to start in the morning never rings for last night's P. Not while the share is down or in
-    standalone (share_ok False): the record is kept, the wait starts again. A real judgement, E not
-    running or a lock ends it. It never changes the code or colour: sound only."""
+    It rings when the view is NOT MONITORED, E is running, this PC has shown NOT MONITORED for alarm_s with
+    the share readable, and either this watcher's own record says so (it saw P's judged counter move earlier
+    in this run, and at the last good judgement (monitored, no lock, not "Checking...") P said maybe printing
+    with E running, or E has changed since P's judgement) or the shared marker holds this occurrence's id
+    (marker: the alarm id the watcher read from it this pass; it asks through the record's ask). So the
+    first PC to start in the morning never rings for last night's P, unless a PC rang for that same
+    occurrence and nobody acknowledged it. Not while the share is down or in standalone (share_ok False):
+    the record is kept, the wait starts again. A poller's start write ("Checking...", judged unchanged)
+    doesn't end it. A real judgement, E not running, a lock, a newer file or a printer that isn't set up
+    ends it. It never changes the code or colour: sound only."""
+    if view.code == "not_set_up":
+        return None, None               # no printer set up: the record goes, as for an inactive machine
     if seen is None and poll is None:
         return None, None
     if not share_ok or view.code == "update_stripes":
-        return (dataclasses.replace(seen, since=None, alarm_id="", alarm_at=0.0) if seen is not None else None), None
+        return (dataclasses.replace(seen, since=None, stale_from=None, alarm_id="", alarm_at=0.0, ask="")
+                if seen is not None else None), None
+    judged_now = False
     if poll is not None:
         value, at = (poll.counter, poll.written_at) if poll.judged is None else (poll.judged, poll.judged_at)
         if seen is None:
             seen = JudgedSeen(value=value, at=at)
         elif value != seen.value:
+            judged_now = True
             seen = dataclasses.replace(seen, value=value, at=at, moved=True)
             # A new judgement, seen now. A paused write (a lock) moves judged too but reads nothing: the
             # last good judgement stays the one before it
             if (view.monitored and view.code not in BLUE_CODES and view.code != "checking"
                     and not poll.paused_for_lock):
                 running = expected is not None and expected.mode == "running"
-                seen = dataclasses.replace(seen, printing=poll.printing is True and running)
+                seen = dataclasses.replace(seen, printing=maybe_printing(poll) and running)
     nm = view.code == "not_monitored"
-    seen = dataclasses.replace(seen, since=(mono if seen.since is None else seen.since) if nm else None)
-    if not (nm and seen.moved and seen.printing and expected is not None and expected.mode == "running"
-            and view.checked_age_s is not None and mono - seen.since >= alarm_s):
+    # A poller's start write shows "Checking..." (§6.3 step 1) but judges nothing: the spell goes on
+    starting = (view.code == "checking" and not judged_now and seen.since is not None and poll is not None
+                and poll.state is not None and poll.state.code == "checking")
+    spell = nm or starting
+    if nm and view.checked_age_s is not None:
+        stale_from = mono - view.checked_age_s
+    else:
+        stale_from = seen.stale_from if starting else None
+    seen = dataclasses.replace(seen, since=(mono if seen.since is None else seen.since) if spell else None,
+                               stale_from=stale_from, ask="")
+    running = expected is not None and expected.mode == "running"
+    if not (spell and running and stale_from is not None and mono - seen.since >= alarm_s):
         return dataclasses.replace(seen, alarm_id="", alarm_at=0.0), None
     aid = not_monitored_alarm_id(view.machine_id, seen.value, seen.at, expected.send_id)
+    # E changed since P's judgement (a Resume, or a Send onto a stopped machine, that no poller judged):
+    # it may be printing
+    changed = poll is not None and expected.counter != poll.expected_counter
+    if not (seen.moved and (seen.printing or changed)) and seen.shared != aid:
+        if marker != aid:
+            # Only the shared marker can tell: a PC that saw it judged rang for this occurrence. The
+            # watcher reads it on NOT MONITORED passes only
+            return dataclasses.replace(seen, alarm_id="", alarm_at=0.0, ask=aid if nm else ""), None
+        seen = dataclasses.replace(seen, shared=aid)
     started = seen.alarm_at if seen.alarm_id == aid else now
     seen = dataclasses.replace(seen, alarm_id=aid, alarm_at=started)
     kind = ALERT_KINDS["not_monitored"]
     notify = line.notify_user if line is not None else ""
     alert = Alert(id=aid, machine_id=view.machine_id, line_id=view.line_id, kind=kind.kind, sound=kind.sound,
-                  msg=Msg(kind.text, {"machine": view.name, "minutes": int(view.checked_age_s // 60)}),
+                  msg=Msg(kind.text, {"machine": view.name, "minutes": int(max(0.0, mono - stale_from) // 60)}),
                   started_at=started,
                   recipients=resolve_recipients(kind.roles, sender="", notify=notify, last_sender=expected.sender),
                   active=True, colour=kind.colour, ref=_alarm_ref(seen.value, expected.send_id))
