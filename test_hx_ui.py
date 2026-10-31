@@ -961,7 +961,11 @@ class FloorBoardTests(UiCase):
                     return ((width, height) == (1024, 720) and fb._redraw_timer is None
                             and fb.layout == floor_layout(width, height, len(fb.rows), len(fb.line_items),
                                                           fb.scrollbar.winfo_reqwidth()))
-                self.pump(drawn_for_the_window)
+                try:
+                    self.pump(drawn_for_the_window, timeout_s=5)
+                except AssertionError:
+                    self.fail(f"not drawn for its window: the window is {fb.winfo_width()}x{fb.winfo_height()}, "
+                              f"the layout {fb.layout}")
                 c, lay = fb.canvas, fb.layout
                 self.assertEqual((lay.scrolls, shown(fb.scrollbar)), (scrolls, scrolls))
                 spans = self.check_rows(fb, "1024x720")

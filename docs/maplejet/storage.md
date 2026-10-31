@@ -2259,11 +2259,17 @@ sleeps more than 0.5 s in real time.
    a loop. Every read parses as either the old or the new JSON, and every write succeeds.
 3. **open_for_read shares delete:** while one is open, another handle can rename and delete the file.
 4. **create_exclusive race:** two threads, 100 rounds. Each round, exactly one gets True.
-5. **Add-only folder:** a temp folder with `icacls <dir> /inheritance:r /grant:r "%USERNAME%:(RX,WD,AD)"
-   "%USERNAME%:(OI)(IO)(R)" "*S-1-3-4:(OI)(IO)(R)"`.
+5. **Add-only folder:** a folder made with `os.mkdir` inside a temp folder, then `icacls <dir>
+   /inheritance:r /grant:r "%USERNAME%:(RX,WD,AD)" "*S-1-3-4:(OI)(IO)(R)"` and `icacls <dir> /grant
+   "%USERNAME%:(OI)(IO)(R)"`: the §14.2 "Read and add files" entries for the account running the test,
+   without SYSTEM and Administrators. `tempfile.mkdtemp`'s own folder won't do: Python 3.12.4 and later
+   give it explicit full-control entries for SYSTEM, Administrators and OWNER RIGHTS, which
+   `/inheritance:r` and `/grant:r` keep, so on an elevated administrator (a CI runner) every file could
+   be changed.
    - `create_exclusive` with data succeeds, and the file reads back complete.
    - Opening it for writing, `os.replace` onto it, `os.remove` and `FileOps.rename` all fail with
-     `PermissionError`.
+     `PermissionError`. A failure shows `icacls` of the folder and the file, and `whoami /user /groups
+     /priv`.
    - Clean-up grants Full control first.
    - The test is skipped if `icacls` fails.
 6. **The C runtime hides network errors** (`CRuntimeErrorTests`, every platform, Windows faked):

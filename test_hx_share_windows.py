@@ -33,6 +33,21 @@ def file_ops():
     return fs
 
 
+def _printed(*command):
+    """What a command printed, with the command, for a failure message; never raises."""
+    shown = " ".join(command)
+    try:
+        done = subprocess.run(command, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"> {shown}\n{type(e).__name__}: {e}"
+    raw = done.stdout + done.stderr
+    try:
+        printed = raw.decode("oem")         # the console's code page (a Windows-only codec)
+    except (LookupError, UnicodeDecodeError):
+        printed = raw.decode("utf-8", "replace")
+    return f"> {shown}  (exit code {done.returncode})\n{printed.strip()}"
+
+
 @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
 class SwapTests(unittest.TestCase):
     def setUp(self):
@@ -161,50 +176,85 @@ class CreateExclusiveTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
 class AddOnlyFolderTests(unittest.TestCase):
-    """A folder with the log folders' rights: list, create files, read; nothing else (storage.md §14.2)."""
+    """A folder with the log folders' rights for the account running the test: list, create files,
+    read; nothing else (storage.md §14.2). The server's own SYSTEM and Administrators entries are left
+    out: they may do anything on the server, and an elevated administrator (a CI runner) would get
+    everything through them."""
 
     def setUp(self):
-        self.folder = tempfile.mkdtemp(prefix="hx-share-win-")
         domain, user = os.environ.get("USERDOMAIN"), os.environ.get("USERNAME")
         if not user:
             self.skipTest("no USERNAME")
         self.who = f"{domain}\\{user}" if domain else user
+        # A folder of its own in the temp folder: mkdtemp's folder won't do. Python 3.12.4 and later make
+        # it (os.mkdir with mode 0o700) with explicit entries giving SYSTEM, Administrators and OWNER
+        # RIGHTS full control, and icacls keeps them: /inheritance:r removes inherited entries only, and
+        # /grant:r replaces the named accounts' entries only. Every new file then inherited
+        # Administrators' full control, so on the CI runner (an administrator, UAC off, so its token
+        # has Administrators enabled) the log file could be opened to change it. A folder made by
+        # os.mkdir has inherited entries only, and /inheritance:r takes them all away
+        self.parent = tempfile.mkdtemp(prefix="hx-share-win-")
+        self.folder = os.path.join(self.parent, "hx-events")
+        os.mkdir(self.folder)
         self.addCleanup(self.clean_up)
-        try:
-            done = subprocess.run(["icacls", self.folder, "/inheritance:r", "/grant:r", f"{self.who}:(RX,WD,AD)",
-                                   f"{self.who}:(OI)(IO)(R)", "*S-1-3-4:(OI)(IO)(R)"],
-                                  capture_output=True, timeout=30)
-        except (OSError, subprocess.SubprocessError) as e:
-            self.skipTest(f"icacls failed: {e}")
-        if done.returncode != 0:
-            self.skipTest(f"icacls failed: {done.stdout!r} {done.stderr!r}")
+        # The account's two entries differ only in where they apply: the second is added (/grant), so
+        # it can't replace the first (/grant:r)
+        for args in (["/inheritance:r", "/grant:r", f"{self.who}:(RX,WD,AD)", "*S-1-3-4:(OI)(IO)(R)"],
+                     ["/grant", f"{self.who}:(OI)(IO)(R)"]):
+            try:
+                done = subprocess.run(["icacls", self.folder, *args], capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError) as e:
+                self.skipTest(f"icacls failed: {e}")
+            if done.returncode != 0:
+                self.skipTest(f"icacls failed: {done.stdout!r} {done.stderr!r}")
         self.fs = file_ops()
 
     def clean_up(self):
-        # Full control first, or the folder can't be removed
-        subprocess.run(["icacls", self.folder, "/grant", f"{self.who}:(OI)(CI)(F)", "/T", "/C"],
-                       capture_output=True, timeout=30)
-        shutil.rmtree(self.folder, True)
+        # Full control first, or the files can't be removed
+        try:
+            subprocess.run(["icacls", self.folder, "/grant", f"{self.who}:(OI)(CI)(F)", "/T", "/C"],
+                           capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        shutil.rmtree(self.parent, True)
+
+    def evidence(self, path):
+        """The folder's and the file's rights and the account's token, for a failure message: why
+        Windows allowed it, in the CI log."""
+        return "\n\n".join(_printed(*command) for command in (
+            ("icacls", self.folder), ("icacls", path), ("whoami", "/user", "/groups", "/priv")))
+
+    @contextlib.contextmanager
+    def refused(self, what, path):
+        """The block must raise PermissionError."""
+        try:
+            yield
+        except PermissionError:
+            return
+        self.fail(f"PermissionError not raised: {what} was allowed\n\n{self.evidence(path)}")
 
     def test_a_log_file_is_written_once(self):
         stored = hx_share.make_log_record("hx-events", {"type": "x"}, hx_win.current_identity(), 1_793_275_200.0)
         raw = hx_share.encode_log(stored)
         path = os.path.join(self.folder, "20261029T120000000Z.x.x.abcdef.json")
-        self.assertTrue(self.fs.create_exclusive(path, raw))
-        self.assertEqual(self.fs.read_bytes(path), raw)
+        try:
+            self.assertTrue(self.fs.create_exclusive(path, raw))
+            self.assertEqual(self.fs.read_bytes(path), raw)
+        except PermissionError as e:
+            self.fail(f"writing the log file once and reading it was refused: {e}\n\n{self.evidence(path)}")
         self.assertEqual(hx_share.decode_log(self.fs.read_bytes(path)), stored)
 
-        with self.assertRaises(PermissionError):
+        with self.refused("opening the log file to change it", path):
             open(path, "r+b").close()
-        with self.assertRaises(PermissionError):
+        with self.refused("opening the log file to add to it", path):
             open(path, "ab").close()
         other = os.path.join(self.folder, "other.json")
         self.assertTrue(self.fs.create_exclusive(other, b"other"))
-        with self.assertRaises(PermissionError):
+        with self.refused("replacing the log file", path):
             os.replace(other, path)
-        with self.assertRaises(PermissionError):
+        with self.refused("deleting the log file", path):
             os.remove(path)
-        with self.assertRaises(PermissionError):
+        with self.refused("renaming the log file", path):
             self.fs.rename(path, os.path.join(self.folder, "renamed.json"))
         self.assertEqual(self.fs.read_bytes(path), raw)
 

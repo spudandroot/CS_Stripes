@@ -206,7 +206,13 @@ class SystemClockTests(unittest.TestCase):
         self.assertTrue(SYSTEM_CLOCK.sleep(0.02))
         self.assertTrue(SYSTEM_CLOCK.sleep(0.02, CancelToken()))
         self.assertTrue(SYSTEM_CLOCK.sleep(-1))
-        self.assertGreaterEqual(time.monotonic() - start, 0.035)
+        # Both sleeps last their 0.02 s in real time: time.sleep on a high-resolution timer, and the
+        # token's Event.wait until its deadline on the performance counter. time.monotonic is read only
+        # once a tick, though: on Windows before Python 3.13 it is GetTickCount64, 15.6 ms a tick, so
+        # 40 ms can read as 31 ms there. Measured on it, the sleeps can look short by up to one tick
+        # and no more: the clock's resolution (a nanosecond on Linux)
+        tick = time.get_clock_info("monotonic").resolution
+        self.assertGreaterEqual(time.monotonic() - start, 0.04 - tick)
 
     def test_sleep_cancelled(self):
         cancel = CancelToken()
