@@ -778,7 +778,18 @@ per item (`Created`, `Exists`, `Copied`, `Kept`, `Wrote`, `Rights set`, `Rights 
    `$V2\config\<file>` doesn't, `[System.IO.File]::Copy($source, $target, $false)` it (never
    overwrites; it gets `v2\config`'s rights in step 7). An existing copy is kept (`Kept`). A
    missing source prints a warning only.
-5. If `$V2\config\hx\company.json` is missing, write it (§8.6).
+5. If `$V2\config\hx\company.json` is missing, write it (§8.6). If it is there, only read it
+   (`ConvertFrom-Json`) and compare its `admin_group_sid` and `sender_group_sid` with the SIDs of
+   step 2: a re-run with another `-AdminGroup` or `-SenderGroup` moves the folder rights to the new
+   group in step 7, but Stripes goes by `company.json`. For each SID that differs, warn: "<file> has
+   the administrators' group <old name> (<old SID>), not <new name> (<new SID>) from -AdminGroup.
+   Stripes still uses <old name>, but this script gives the folder rights to <new name>." (the
+   senders' group likewise). Then, once, how to change it: an administrator types it in MapleJet >
+   Admin > Company, presses Look up and saves (once the rights have changed, a new administrators'
+   group takes someone in both groups), or edits `admin_group_sid` or `sender_group_sid` as the
+   README says under "If a group is replaced". A `company.json` that doesn't read as a JSON object
+   warns "couldn't read <file> to check its groups.". The file is never rewritten. This also runs
+   under `-WhatIf`.
 6. If `$V2\config\hx\changes.json` is missing, write it (§8.6).
 7. Set the rights of §8.4 on each folder, top-down, `v2` first (§8.5). Each folder gets exactly its
    explicit entries: explicit entries that aren't in its set are removed and printed (`Removed entry:
@@ -796,19 +807,26 @@ per item (`Created`, `Exists`, `Copied`, `Kept`, `Wrote`, `Rights set`, `Rights 
    offline caching is off: Get-SmbShare <share> | Select CachingMode". Always print "v2 must stay
    on this one server: don't replicate it with DFS-R."
 10. Summary: `icacls "<folder>"` for each folder of §8.4 that exists (without icacls' closing
-    "Successfully processed" line; a failing icacls only warns), then the next steps: "Done. Put
-    Stripes.exe on the share. Then an administrator opens MapleJet > Admin > Company to set the
-    time server, countries and inks." Under `-WhatIf` the last line is "Nothing was changed
-    (-WhatIf). Run it again without -WhatIf to make these changes."
+    "Successfully processed" line; a failing icacls only warns), then, if step 5 warned, "Warning:
+    Stripes still uses the groups in company.json, not the ones given to this run (see above).", then
+    the next steps: "Done. Put Stripes.exe on the share. Then an administrator opens MapleJet > Admin
+    > Company to set the time server, countries and inks." Under `-WhatIf` the last line is "Nothing
+    was changed (-WhatIf). Run it again without -WhatIf to make these changes."
 11. Exit code 0 when done (also with `-WhatIf`). Any error: print the step, the item and the error
     ("Failed while <step> (<item>): <error>"), and exit 1. Steps already done stay done; running
-    again finishes the job.
+    again finishes the job. Until step 7 has set the rights of `v2`, `v2` still inherits the Stripes
+    folder's rights, so if `v2` exists, this run hasn't set them, and its rights can't be read as
+    protected, the error adds "v2 isn't protected yet: it still has the Stripes folder's rights, so
+    anyone who may change that folder may change v2." The last line is always "What is done stays
+    done. Fix the problem and run the script again to finish."
 12. Under `-WhatIf` nothing at all changes, not even `v2`: each change prints its "What if:" line
     instead (a missing folder's "Set rights" too).
-13. Who runs it: an account with Full Control on `\\SERVER\Share\Stripes`. `v2` doesn't inherit that
-    Full Control, so a later run needs a member of the file server's `Administrators` group (a
-    domain admin, over SMB), or the account that ran it first (the owner of the folders). On the
-    file server itself, it runs elevated.
+13. Who runs it: an account with Full Control on `\\SERVER\Share\Stripes`; on the file server
+    itself, in an elevated PowerShell (run as administrator). `v2` doesn't inherit that Full
+    Control, so a later run needs a member of the file server's `Administrators` group (a domain
+    admin, over SMB, or elevated on the server). The account that ran it first owns only what it
+    created: a re-run as that account can fail part-way, because passing entries down to files
+    other people wrote needs rights it may not have (not verified on Windows, §11 item 7).
 
 ### 8.4 Folders and their explicit entries
 
