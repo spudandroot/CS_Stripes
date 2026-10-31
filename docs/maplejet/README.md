@@ -79,8 +79,8 @@ share tests (`test_hx_share_windows.py`) skip elsewhere.
 
 ## Owner sign-offs
 
-The owner accepted all four on 30 Oct 2026. They are built as described, the safe way, but differ
-from the plan's wording or accept a risk:
+The owner accepted the first four on 30 Oct 2026 and the fifth on 31 Oct 2026. They are built as
+described, the safe way, but differ from the plan's wording or accept a risk:
 
 1. The font list and firmware version are read with two small web GETs (`/sfl.xml`, `/idn.xml`),
    besides the message Load the plan calls "the only web request" (architecture §6.4, §12.1).
@@ -93,10 +93,11 @@ from the plan's wording or accept a risk:
 4. Every published release contains the printer-password key, and releases on this public
    repository can be downloaded by anyone (deploy.md §3.7, OPEN 1).
 
-Waiting for the owner: the named residual risks of the printer lock (storage.md §11.8, architecture
-§7.3 rule 8 and §12.1 item 4). A PC that freezes in the instant before a request leaves can send that
-one request late, and the leases rely on PCs that never sleep, hibernate or run as VMs that can be
-paused (the root README's power settings).
+5. Accepted on 31 Oct 2026: the named residual risks of the printer lock (storage.md §11.8,
+   architecture §7.3 rule 8 and §12.1 item 4). A PC that freezes in the instant before a request
+   leaves can send that one request late (at worst a false alarm, never a false green), and the
+   leases rely on PCs that never sleep, hibernate or run as VMs that can be paused (the root README's
+   power settings).
 
 ## Owner decisions, 31 Oct 2026
 
