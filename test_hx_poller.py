@@ -25,7 +25,7 @@ import hx_share
 import hx_state
 import hx_time
 from hx_core import SYSTEM_CLOCK, EventBus, FakeClock, Msg
-from hx_model import (ALLOWED_WRITE_TAGS, AMBER, RED, TIMINGS, Ack, AuthFailed, BoardUpdate, DesignItem,
+from hx_model import (ALLOWED_WRITE_TAGS, AMBER, GREY, RED, TIMINGS, Ack, AuthFailed, BoardUpdate, DesignItem,
                       ExpectedState, FailureInfo, HeartbeatInfo, MessageDesign, PollerUpdate, PollStatus)
 
 EDT = lambda utc: -14400.0               # a fixed offset: the fake printer's clock doesn't follow the host
@@ -326,6 +326,208 @@ class ReadingTests(Base):
         self.assertTrue(p.alerts[0].sound)
         self.assertEqual(p.running.origin_line, "Product of Mexico")
         self.no_violations(sim)
+
+    def drift_with_failing_loads(self, sim, fails, attempts=None, *, origin="Product of Mexico"):
+        """Same name, other origin at the printer; fails(n) says whether the n-th Load from now (1 first)
+        fails (junk in its reply: WebReadFailed). Returns the moments of the good Loads that showed the
+        other origin; attempts, when given, gets the moment of every Load, good or not."""
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, origin)
+        n, seen = [0], []
+
+        def hook(body):
+            if b"<FCDOC>" not in body:
+                return body
+            n[0] += 1
+            if attempts is not None:
+                attempts.append(sim.clock.monotonic())
+            if fails(n[0]):
+                return body.replace(b"<FCDOC>", b"<FCDOC>junk", 1)
+            if b"Product of Mexico" in body:
+                seen.append(sim.clock.monotonic())
+            return body
+        sim.fake.web_reply_hook = hook
+        return seen
+
+    def green_after(self, sim, a, seen, seconds, until=None):
+        """Run; the latest moment the machine was green with the old origin after the first good Load that
+        showed the other one (None when never), checked on P and on the board after every step."""
+        last = [None]
+        machine = a.data.current.machines[sim.mid]
+        e = sim.sender.read_expected(sim.mid)
+
+        def check():
+            p = sim.p()
+            v = hx_state.machine_view(machine, p, 0.0, e, None, None, {})
+            if seen and (p.state.code == "running_confirmed" or v.colour == "green"
+                         or v.origin_line == ORIGIN):
+                last[0] = sim.clock.monotonic()
+            return until is not None and until()
+        sim.run(seconds, until=check)
+        return None if last[0] is None else last[0] - seen[0]
+
+    def test_a_failed_confirming_load_is_tried_again_at_the_next_cycle(self):
+        # Owner decision (31 Oct): a failed confirming Load sets need_load, so drift is red about one cycle
+        # later instead of a slow set later
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        seen = self.drift_with_failing_loads(sim, lambda n: n == 2)     # the first confirming Load
+        green = self.green_after(sim, a, seen, 90, until=lambda: sim.code() == "drift")
+        self.assertEqual(sim.code(), "drift")
+        self.assertLessEqual(green, LOGIC.poll_fast_s + 2 * LOGIC.second_reading_s + 0.5)
+        self.assertLessEqual(sim.clock.monotonic() - seen[0], LOGIC.poll_fast_s + 3 * LOGIC.second_reading_s)
+        self.assertEqual(sim.p().running.origin_line, "Product of Mexico")
+        self.no_violations(sim)
+
+    def test_every_confirming_load_failing_turns_amber(self):
+        # Every first Load reads the other origin and every confirming Load fails: never confirmed, so
+        # never red, but after UNCHECKED_CONFIRMS failed confirmations amber message_unchecked with the
+        # origin unknown, never green "Printing" with the old origin
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        seen = self.drift_with_failing_loads(sim, lambda n: n % 2 == 0)
+        green = self.green_after(sim, a, seen, 120, until=lambda: sim.code() == "message_unchecked")
+        self.assertEqual(sim.code(), "message_unchecked")
+        bound = hx_poller.UNCHECKED_CONFIRMS * (LOGIC.poll_fast_s + 2 * LOGIC.second_reading_s)
+        self.assertLessEqual(green, bound)
+        p = sim.p()
+        self.assertEqual(p.state.colour, AMBER)
+        self.assertTrue(p.running_unchecked)
+        self.assertIn("message_unreadable", [x.kind for x in p.alerts])
+        machine = a.data.current.machines[sim.mid]
+        self.assertEqual(hx_state.machine_view(machine, p, 0.0, sim.sender.read_expected(sim.mid), None, None,
+                                               {}).origin_line, "")
+        # It stays amber, and the Loads go back to the slow set's pace
+        t0 = sim.clock.monotonic()
+        self.assertIsNone(self.green_after(sim, a, [t0], 300))
+        loads = len(sim.requests(since=t0, kind="sme"))
+        self.assertLessEqual(loads, 2 * (300 / LOGIC.poll_slow_s + 1))
+        self.assertEqual(sim.code(), "message_unchecked")
+        # Loads that work again: red drift, which two agreeing Loads confirm
+        sim.fake.web_reply_hook = None
+        self.assertTrue(sim.run(130, until=lambda: sim.code() == "drift"))
+        self.assertEqual(sim.p().running.origin_line, "Product of Mexico")
+        self.no_violations(sim)
+
+    def test_random_load_failures_never_leave_a_drift_green(self):
+        # 40 % of Loads fail at random (the wave-5 probe, 10 seeds): once a good Load has shown the other
+        # origin, the machine is red or amber within a few cycles; and within about 20 s of the first Load
+        # after the change, good or not (a failed one is tried again at the next cycle), so within one
+        # slow set plus that of the change, never two slow sets
+        worst = worst_attempt = worst_change = 0.0
+        for seed in range(10):
+            sim = self.sim()
+            sim.expect()
+            a = sim.pc("akim")
+            self.steady(sim)
+            rng = random.Random(seed)
+            attempts = []
+            changed = sim.clock.monotonic()
+            seen = self.drift_with_failing_loads(sim, lambda n: rng.random() < 0.4, attempts)
+            green = self.green_after(sim, a, seen, 400,
+                                     until=lambda: sim.code() in ("drift", "message_unchecked"))
+            self.assertIn(sim.code(), ("drift", "message_unchecked"), seed)
+            worst = max(worst, green or 0.0)
+            worst_attempt = max(worst_attempt, sim.clock.monotonic() - attempts[0])
+            worst_change = max(worst_change, sim.clock.monotonic() - changed)
+        self.assertLessEqual(worst, hx_poller.UNCHECKED_CONFIRMS * (LOGIC.poll_fast_s + 2 * LOGIC.second_reading_s))
+        self.assertLessEqual(worst_attempt, 20.0 + LOGIC.second_reading_s)
+        self.assertLessEqual(worst_change, LOGIC.poll_slow_s + 15.0)
+
+    def test_a_failed_first_load_is_tried_again_at_the_next_cycle(self):
+        # Owner decision (31 Oct): the slow set's Load fails right after the message changed at the printer:
+        # the next cycle loads again, so drift is red about one cycle later, not a slow set later
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        attempts = []
+        seen = self.drift_with_failing_loads(sim, lambda n: n == 1, attempts)
+        green = self.green_after(sim, a, seen, 130, until=lambda: sim.code() == "drift")
+        self.assertEqual(sim.code(), "drift")
+        self.assertLessEqual(green or 0.0, 2 * LOGIC.second_reading_s + 0.5)     # from the first good Load
+        self.assertEqual(sim.p().running.origin_line, "Product of Mexico")
+        self.assertLessEqual(attempts[1] - attempts[0], LOGIC.poll_fast_s + 0.5)
+        self.assertLessEqual(sim.clock.monotonic() - attempts[0], LOGIC.poll_fast_s + 3 * LOGIC.second_reading_s)
+        self.no_violations(sim)
+
+    def test_a_failed_load_of_an_unchanged_message_is_tried_again_and_stays_green(self):
+        # One Load fails while nothing changed: one extra Load at the next cycle, still green, no alert,
+        # then the slow set's pace again
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        attempts = []
+        self.drift_with_failing_loads(sim, lambda n: n == 1, attempts, origin=ORIGIN)
+        codes = set()
+        sim.run(200, until=lambda: codes.add(sim.code()) or False)
+        self.assertEqual(codes, {"running_confirmed"})
+        self.assertFalse(a.entries("alert_started"))
+        self.assertLessEqual(attempts[1] - attempts[0], LOGIC.poll_fast_s + 0.5)
+        # Then the slow set's own pace again, counted from the failed Load's slow set
+        later = [x - attempts[0] for x in attempts[2:]]
+        self.assertTrue(later, attempts)
+        self.assertTrue(all(abs(x / LOGIC.poll_slow_s - round(x / LOGIC.poll_slow_s)) * LOGIC.poll_slow_s < 1.5
+                            and x >= LOGIC.poll_slow_s - 1 for x in later), later)
+
+    def test_loads_that_keep_failing_go_back_to_the_slow_set(self):
+        # Every Load fails: one retry, then amber message_unchecked, and the Loads at the slow set's pace
+        # (the budget), not one every cycle
+        sim = self.sim()
+        sim.expect()
+        sim.pc("akim")
+        self.steady(sim)
+        attempts = []
+        self.drift_with_failing_loads(sim, lambda n: True, attempts, origin=ORIGIN)
+        self.assertTrue(sim.run(130, until=lambda: sim.code() == "message_unchecked"))
+        self.assertLessEqual(sim.clock.monotonic() - attempts[0], LOGIC.poll_fast_s + 2 * LOGIC.second_reading_s)
+        t0 = sim.clock.monotonic()
+        sim.run(600)
+        self.assertEqual(sim.code(), "message_unchecked")
+        after = [x for x in attempts if x >= t0]
+        self.assertLessEqual(len(after), 600 / LOGIC.poll_slow_s + 1)
+        self.no_violations(sim)
+
+    def test_a_skipped_confirming_load_confirms_nothing(self):
+        # The second reading re-reads PRIN first; when that gets no reply, the confirming Load is never made,
+        # and the first Load's R (unconfirmed) must not be judged as if it had been read twice
+        sim = self.sim()
+        sim.expect()
+        sim.pc("akim")
+        self.steady(sim)
+        prin = []
+
+        def prin_reply():
+            # At a slow set (HXUI right before PRIN) the message changes and PRIN reads 0 once; the
+            # second reading's PRIN then gets no reply, so its Load is never made
+            with sim.fake.lock:
+                slow_set = len(sim.fake.requests) >= 2 and sim.fake.requests[-2]["tag"] == "HXUI"
+                if slow_set and not prin:
+                    sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+            if slow_set and not prin:
+                prin.append("0")
+                return "0"
+            if prin and len(prin) < 3:
+                prin.append("silent")                               # the read and the client's own retry
+                return hx_fake.FakePrinter.SILENT
+            return None
+        sim.fake.override("PRIN", prin_reply)
+        codes = []
+        self.assertTrue(sim.run(70, until=lambda: codes.append(sim.code()) or len(prin) == 3))
+        self.assertEqual(sim.requests()[-1]["tag"], "PRIN")        # the second reading's: no Load after it
+        loads = len(sim.requests(kind="sme"))
+        self.assertNotIn("printing_off", codes)                     # PRIN was read 0 only once
+        self.assertNotIn("drift", codes)                            # and Mexico only once
+        self.assertEqual(sim.p().running.origin_line, ORIGIN)
+        # The next cycle loads again (need_load), and two agreeing Loads give drift
+        self.assertTrue(sim.run(LOGIC.poll_fast_s + 3, until=lambda: sim.code() == "drift"))
+        self.assertGreaterEqual(len(sim.requests(kind="sme")), loads + 2)
+        self.assertEqual(sim.code(), "drift")
 
     def test_a_stray_prin(self):
         sim = self.sim()
@@ -1162,6 +1364,396 @@ class StandaloneTests(Base):
         self.assertEqual({r["tag"] for r in sim.requests()}, {"HXUI", "PRIN", "MSGNAM", "PMCNT"})
         sim.world.fs.down = False
 
+    def known_drift_then_down(self, sim, *, ack=False, poller=True):
+        """A same-name drift committed in share mode (red, ringing), then the share goes down with the floor
+        board open on PC a until a is standalone. poller=True: a polls the printer, and its coordinator
+        hasn't read the drift P yet (only a's worker wrote it). poller=False: another PC polls, and a's
+        coordinator read the drift P before the share went down."""
+        sim.expect()
+        pcs = [sim.pc("akim"), sim.pc("bob")]
+        r0 = next(pc for pc in pcs if pc.key == assign_order(sim, *pcs)[0])
+        a = r0 if poller else next(pc for pc in pcs if pc is not r0)
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        self.assertEqual(sim.p().poller, r0.key)
+        if poller:
+            seen = (a.poller.seen_polls().get(sim.mid) or (None, 0))[0]
+            self.assertNotEqual(seen.state.code if seen is not None else "", "drift")
+            sim.clock.advance(LOGIC.heartbeat_s + 0.1)      # the watcher reads the share, not seen_polls
+        else:
+            sim.run(LOGIC.heartbeat_s + 0.1)
+            self.assertEqual(a.poller.seen_polls()[sim.mid][0].state.code, "drift")
+        drift = next(x for x in sim.p().alerts if x.kind == "drift")
+        if ack:
+            a.watcher.run_once()
+            a.watcher.acknowledge([drift.id])
+            a.watcher.run_once()                              # writes the ack file
+            self.assertTrue(sim.run(10, until=lambda: sim.p().alerts[0].acked_by == a.identity.user))
+            if poller:
+                sim.clock.advance(LOGIC.heartbeat_s + 0.1)
+        a.watcher.run_once()
+        self.assertEqual(machine_on_board(a, sim.mid).colour, RED)
+        a.poller.set_monitor_open(True, True)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        return a, drift
+
+    def test_a_known_drift_stays_red_while_the_share_is_down(self):
+        # Owner decision (31 Oct): standalone checks can't see a same-name drift, so the drift known from
+        # the share stays red, with the same alert, and R's origin, until share mode clears it
+        sim = self.sim()
+        a, drift = self.known_drift_then_down(sim)
+        t0 = sim.clock.monotonic()
+        codes = set()
+
+        def look():
+            st = a.poller.local_statuses().get(sim.mid)
+            if st is not None:
+                codes.add(st.state.code)
+            return False
+        sim.run(3 * LOGIC.standalone_poll_s, until=look)
+        self.assertEqual(codes, {"drift"})
+        self.assertEqual([r for r in sim.requests(since=t0) if r["kind"] != "autopilot"], [])     # no Load
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertTrue(st.standalone)
+        self.assertEqual([(x.id, x.kind) for x in st.alerts if x.active], [(drift.id, "drift")])
+        self.assertFalse([e for e in a.entries("alert_ended") if e["alert_id"] == drift.id])
+        a.watcher.run_once()
+        mv = machine_on_board(a, sim.mid)
+        self.assertEqual((mv.code, mv.colour, mv.origin_line), ("drift", RED, "Product of Mexico"))
+        row = next(r for r in hx_state.floor_board_rows(a.watcher.latest) if r.machine_id == sim.mid)
+        self.assertEqual((row.colour, row.origin_line), (RED, "Product of Mexico"))
+        self.assertEqual([x.id for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)],
+                         [drift.id])
+        # The message is fixed at the printer (same name again): standalone still can't tell, so red
+        install(sim.fake)
+        sim.run(LOGIC.standalone_poll_s + 1)
+        self.assertEqual(a.poller.local_statuses()[sim.mid].state.code, "drift")
+        # Only share mode clears it: its Loads see the fixed message
+        sim.world.fs.down = False
+        self.assertTrue(sim.run(120, until=lambda: sim.code() == "running_confirmed"))
+
+    def test_a_known_drift_seen_only_by_the_coordinator(self):
+        # A PC that doesn't poll the printer seeds from the P its coordinator last read
+        sim = self.sim()
+        a, drift = self.known_drift_then_down(sim, poller=False)
+        sim.run(LOGIC.standalone_poll_s + 1)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual((st.state.code, [x.id for x in st.alerts if x.active]), ("drift", [drift.id]))
+
+    def test_an_acknowledged_known_drift_stays_quiet_and_red(self):
+        sim = self.sim()
+        a, drift = self.known_drift_then_down(sim, ack=True)
+        sim.run(2 * LOGIC.standalone_poll_s)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual(st.state.code, "drift")
+        self.assertEqual([(x.id, x.acked_by) for x in st.alerts if x.active], [(drift.id, a.identity.user)])
+        a.watcher.run_once()
+        self.assertEqual(machine_on_board(a, sim.mid).colour, RED)
+        self.assertEqual(hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True), [])
+
+    def test_a_known_drift_renamed_at_the_printer_stays_red_with_the_origin_unknown(self):
+        # Owner decision (31 Oct): another message selected at the printer while the share is down is at
+        # best amber unknown_while_down, and the drift alert stays open (so the board stays red and rings)
+        sim = self.sim()
+        a, drift = self.known_drift_then_down(sim)
+        install(sim.fake, 10, "SOMETHING-ELSE", "Product of Peru")
+        sim.run(LOGIC.standalone_poll_s + 1)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual(st.state.code, "unknown_while_down")
+        self.assertEqual([x.id for x in st.alerts if x.active], [drift.id])
+        a.watcher.run_once()
+        mv = machine_on_board(a, sim.mid)
+        self.assertEqual((mv.colour, mv.origin_line), (RED, ""))         # not Mexico any more, not E's either
+        row = next(r for r in hx_state.floor_board_rows(a.watcher.latest) if r.machine_id == sim.mid)
+        self.assertEqual((row.colour, row.origin_line), (RED, ""))
+        self.assertEqual([x.id for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)],
+                         [drift.id])
+        # E's message put back at the printer: standalone can't check its content, so still not green
+        install(sim.fake)
+        sim.run(2 * LOGIC.standalone_poll_s + 1)
+        self.assertEqual(a.poller.local_statuses()[sim.mid].state.code, "drift")
+        a.watcher.run_once()
+        self.assertEqual(machine_on_board(a, sim.mid).colour, RED)
+        # Share mode's own Loads judge it: the fixed message, two Loads agree, green
+        sim.world.fs.down = False
+        self.assertTrue(sim.run(120, until=lambda: sim.code() == "running_confirmed"))
+        self.assertFalse([x for x in sim.p().alerts if x.active and x.kind == "drift"])
+
+    def test_a_known_drift_stays_red_over_the_change_of_mode(self):
+        # Owner decision (31 Oct), the wave-5 probe end to end: from the moment the share goes down, through
+        # the change to standalone mode and the seconds before the first standalone check, over several
+        # checks, and until share mode judges again, every board sample (card, floor row, sound) is red,
+        # rings for the drift and shows what prints, never E's origin
+        for seed in range(3):
+            sim = self.sim()
+            sim.expect()
+            a = sim.pc("akim")
+            a.poller._rng.seed(seed)                # where the first standalone check falls
+            self.steady(sim)
+            with sim.fake.lock:
+                sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+            self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+            for _ in range(int(LOGIC.heartbeat_s + LOGIC.watch_s)):     # the watcher's passes see P move
+                sim.run(1)
+                a.watcher.run_once()
+            drift = next(x.id for x in sim.p().alerts if x.kind == "drift")
+            a.poller.set_monitor_open(True, True)
+            sim.world.fs.down = True
+            self.addCleanup(setattr, sim.world.fs, "down", False)
+            samples, modes = [], set()
+            for _ in range(int(LOGIC.lock_stale_s + 3 * LOGIC.standalone_poll_s)):
+                sim.run(1)
+                a.watcher.run_once()
+                modes.add(a.poller.mode)
+                mv = machine_on_board(a, sim.mid)
+                row = next(r for r in hx_state.floor_board_rows(a.watcher.latest) if r.machine_id == sim.mid)
+                ringing = [x.id for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)]
+                card = next(ln for ln in a.watcher.latest.lines if ln.line_id == mv.line_id)     # the line card
+                samples.append((a.poller.mode, mv.colour, mv.origin_line, row.colour, row.origin_line, card.colour,
+                                ringing))
+            self.assertIn("standalone", modes)
+            self.assertEqual([s for s in samples if s[1:] != (RED, "Product of Mexico", RED, "Product of Mexico", RED,
+                                                              [drift])], [], seed)
+            self.assertEqual(a.poller.local_statuses()[sim.mid].state.code, "drift")
+            # The share is back: red until share mode's own Loads judge it, never green before
+            sim.world.fs.down = False
+            a.store.probe_now()
+            deadline = time.monotonic() + 5
+            while not a.store.available and time.monotonic() < deadline:
+                time.sleep(0.01)
+            for _ in range(30):
+                sim.run(1)
+                a.watcher.run_once()
+                self.assertEqual(machine_on_board(a, sim.mid).colour, RED, seed)
+            self.assertEqual(sim.code(), "drift")
+            self.assertEqual(next(x.id for x in sim.p().alerts if x.kind == "drift"), drift)
+
+    def test_a_drift_committed_just_before_the_outage_shows_red(self):
+        # This PC's worker commits the drift and the share goes down before any watcher pass read it: the
+        # board shows the P this PC wrote, red and ringing with R's origin, not the older green it read
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        for _ in range(int(LOGIC.watch_s * 2)):
+            sim.run(1)
+            a.watcher.run_once()
+        self.assertEqual(machine_on_board(a, sim.mid).colour, "green")
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))      # no watcher pass meanwhile
+        drift = next(x.id for x in sim.p().alerts if x.kind == "drift")
+        a.poller.set_monitor_open(True, True)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        bad = []
+        for _ in range(int(LOGIC.lock_stale_s + 2 * LOGIC.standalone_poll_s)):
+            sim.run(1)
+            a.watcher.run_once()
+            mv = machine_on_board(a, sim.mid)
+            ringing = [x.id for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)]
+            if (mv.colour, mv.origin_line, ringing) != (RED, "Product of Mexico", [drift]):
+                bad.append((a.poller.mode, mv.code, mv.colour, mv.origin_line, ringing))
+        self.assertEqual(a.poller.mode, "standalone")
+        self.assertEqual(bad, [])
+
+    def test_an_ack_read_from_the_share_before_the_outage_stays_quiet(self):
+        # Another PC acknowledged the drift; this PC's watcher read the ack, the share went down before the
+        # poller wrote it into P: the carried alert still never rings again here
+        sim = self.sim()
+        sim.expect()
+        pcs = [sim.pc("akim"), sim.pc("bob")]
+        a = next(pc for pc in pcs if pc.key != assign_order(sim, *pcs)[0])       # a only watches
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        sim.run(LOGIC.heartbeat_s + 0.1)
+        drift = next(x for x in sim.p().alerts if x.kind == "drift")
+        a.watcher.run_once()
+        sim.observer.write_ack(Ack(alert_id=drift.id, by=JSMITH, computer="FLOOR01", at=sim.clock.time()))
+        a.watcher.run_once()                                    # reads the ack file
+        self.assertEqual(a.watcher._found_acks[drift.id].by, JSMITH)
+        a.poller.set_monitor_open(True, True)
+        sim.world.fs.down = True                                # before the poller saw the ack
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        sim.run(2 * LOGIC.standalone_poll_s)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual(st.state.code, "drift")
+        self.assertEqual([(x.id, x.acked_by) for x in st.alerts if x.active], [(drift.id, "")])
+        a.watcher.run_once()
+        mv = machine_on_board(a, sim.mid)
+        self.assertEqual((mv.colour, mv.unacked_sound), (RED, False))
+        self.assertEqual(hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True), [])
+
+    def test_a_pc_that_never_read_p_starts_its_checks_afresh(self):
+        # §6.12 item 3: nothing to carry on a PC whose poller never read P (Stripes started while the share
+        # was already down; here its data comes from before): its checks start from nothing, as before
+        sim = self.sim()
+        sim.expect()
+        sim.pc("bob")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        a = sim.pc("akim")
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        a.poller.set_monitor_open(True, False)
+        self.assertEqual(a.poller.seen_polls(), {})
+        self.assertTrue(sim.run(150, until=lambda: sim.mid in a.poller.local_statuses()))
+        check = a.poller._standalone.checks[sim.pid]
+        self.assertIsNone(check._seed())
+        a.watcher.run_once()
+        self.assertNotIn("drift", [x.kind for x in machine_on_board(a, sim.mid).alerts])
+
+    def board_after(self, sim, a, seconds):
+        """(mode, code, colour, origin) on PC a's board once a second."""
+        seen = []
+        for _ in range(int(seconds)):
+            sim.run(1)
+            a.watcher.run_once()
+            mv = machine_on_board(a, sim.mid)
+            seen.append((a.poller.mode, mv.code, mv.colour, mv.origin_line))
+        return seen
+
+    def share_returns_after(self, change, *, monitor=True):
+        """Standalone (or idle) for a while, change() at the printer meanwhile, then the share comes back.
+        Returns PC a and the board samples from the moment the share is back."""
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        a.watcher.run_once()
+        if monitor:
+            a.poller.set_monitor_open(True, False)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        sim.run(LOGIC.lock_stale_s + 5)
+        change(sim)
+        sim.run(2 * LOGIC.standalone_poll_s + 5)
+        a.watcher.run_once()
+        sim.world.fs.down = False
+        a.store.probe_now()                 # the store's probe runs on a real thread: wait for it
+        deadline = time.monotonic() + 5
+        while not a.store.available and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return sim, a, self.board_after(sim, a, 45)
+
+    def assert_never_green_before_judged(self, samples, final):
+        self.assertEqual([s for s in samples if s[2] == "green"], [])
+        self.assertEqual(samples[-1][1], final)
+
+    def test_share_back_after_printing_off_is_never_green_first(self):
+        # P on the share still says green "Printing" from before the outage; the worker that starts when
+        # the share is back shows this PC's standalone finding (red), not P's green, until it judges
+        def off(sim):
+            with sim.fake.lock:
+                sim.fake.printing = False
+        sim, a, samples = self.share_returns_after(off)
+        self.assert_never_green_before_judged(samples, "printing_off")
+        shared = [s for s in samples if s[0] == "share"]
+        self.assertEqual(shared[-1][2], RED)
+        self.assertLessEqual({s[2] for s in shared}, {GREY, AMBER, RED})
+
+    def test_share_back_after_a_message_change_is_never_green_first(self):
+        sim, a, samples = self.share_returns_after(
+            lambda sim: install(sim.fake, 10, "SOMETHING-ELSE", "Product of Mexico"))
+        self.assert_never_green_before_judged(samples, "drift")
+        self.assertEqual([s for s in samples if s[3] == ORIGIN], [])      # the old origin is never shown
+        self.assertEqual(samples[-1][3], "Product of Mexico")
+
+    def test_share_back_without_a_monitor_is_never_green_first(self):
+        # No standalone checks: NOT MONITORED during the outage, then "Checking..." until judged
+        sim, a, samples = self.share_returns_after(
+            lambda sim: install(sim.fake, 10, "SOMETHING-ELSE", "Product of Mexico"), monitor=False)
+        self.assert_never_green_before_judged(samples, "drift")
+        self.assertIn("checking", [s[1] for s in samples])
+        self.assertEqual([s for s in samples if s[0] == "share" and s[3] == ORIGIN], [])
+
+    def test_share_back_with_the_printer_silent(self):
+        def silent(sim):
+            sim.fake.go_silent()
+            self.addCleanup(sim.fake.go_silent, False)
+        sim, a, samples = self.share_returns_after(silent)
+        self.assertEqual([s for s in samples if s[2] == "green"], [])
+        self.assertIn(samples[-1][1], ("off", "message_unchecked"))
+
+    def test_share_back_unchanged_turns_green_after_its_checks(self):
+        sim, a, samples = self.share_returns_after(lambda sim: None)
+        self.assertEqual(samples[-1][:3], ("share", "running_confirmed", "green"))
+        first_green = next(i for i, s in enumerate(samples) if s[2] == "green")
+        self.assertTrue(all(s[3] == "" for s in samples[:first_green] if s[0] == "share" and s[1] == "checking"))
+
+    def test_first_start_after_a_long_gap_is_never_green_first(self):
+        # Every PC closed overnight; the message was changed at the panel. The first PC that starts sees
+        # last night's P, written long ago: "Checking..." until it has judged, never last night's green
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        a.poller.stop()
+        sim.pcs.remove(a)
+        install(sim.fake, 10, "SOMETHING-ELSE", "Product of Mexico")
+        sim.clock.advance(3600)
+        b = sim.pc("jsmith")
+        samples = self.board_after(sim, b, 40)
+        self.assert_never_green_before_judged(samples, "drift")
+        self.assertEqual([s for s in samples if s[3] == ORIGIN], [])
+        # Fixed at the panel overnight: last night's red stays until share mode has judged it green
+        b.poller.stop()
+        sim.pcs.remove(b)
+        install(sim.fake)
+        sim.clock.advance(3600)
+        c = sim.pc("jsmith", pid=2)
+        samples = self.board_after(sim, c, 40)
+        self.assertEqual(samples[-1][:3], ("share", "running_confirmed", "green"))
+        first_green = next(i for i, s in enumerate(samples) if s[2] == "green")
+        self.assertEqual({s[2] for s in samples[:first_green]}, {RED})
+
+    def test_a_quick_takeover_keeps_the_state(self):
+        # A handover within not_monitored_s keeps P's state: nothing turns "Checking..." on the board
+        sim = self.sim()
+        sim.expect()
+        r0, r1 = self.ranked(sim)
+        self.steady(sim)
+        r0.poller.stop()
+        sim.pcs.remove(r0)
+        codes = []
+        self.assertTrue(sim.run(30, until=lambda: codes.append(sim.code()) or sim.p().poller == r1.key))
+        sim.run(20, until=lambda: codes.append(sim.code()) or False)
+        self.assertEqual(set(codes), {"running_confirmed"})
+
+    def ranked(self, sim):
+        a, b = sim.pc("akim"), sim.pc("bob")
+        return (a, b) if assign_order(sim, a, b)[0] == a.key else (b, a)
+
+    def test_a_known_drift_from_before_a_new_send_isnt_carried(self):
+        # P's drift was judged against an older E (a Send came after it): nothing to carry
+        sim = self.sim()
+        e = sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        a.poller.set_monitor_open(True, True)
+        sim.sender.write_expected(dataclasses.replace(e, send_id=SID2, origin_line="Product of Mexico",
+                                                      fingerprint=hx_message.fingerprint(sim.read_back(9))))
+        a.store.read_expected(sim.mid)                       # the PC's cached E is the new one
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        sim.run(LOGIC.standalone_poll_s + 1)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertNotIn("drift", [x.kind for x in st.alerts])
+        self.assertEqual(st.state.code, "running_confirmed")
+
 
 # --------------------------------------------------------------------------
 # 14 to 18: waiting recipients, handover, internal errors, the watcher, the message check
@@ -1433,6 +2025,109 @@ class CoordinationTests(Base):
         self.assertEqual(sim.p().alerts[0].acked_by, a.identity.user)
         self.assertEqual(len(poller_pc.entries("alert_acknowledged")), 1)
         self.assertEqual(sim.code(), "drift")             # the problem is still there
+
+    def ringing_drift(self, sim):
+        """A same-name drift with its alert ringing on PC akim's board (the watcher not yet run)."""
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(80, until=lambda: sim.code() == "drift"))
+        sim.run(5)
+        return a
+
+    def test_an_ack_during_a_pass_stays_quiet(self):
+        # §4.5 item 2: the UI acknowledges while hx-watch builds its board from reads made before the ack.
+        # That pass's board must carry the ack too, or the sound starts again until the next pass
+        sim = self.sim()
+        a = self.ringing_drift(sim)
+        a.watcher.run_once()
+        ringing = lambda board: hx_state.sounding_alerts(board, a.identity, floor_board=True)
+        ids = [x.id for x in ringing(a.watcher.latest)]
+        self.assertTrue(ids)
+        boards = []
+        a.bus.pump()
+        a.bus.subscribe(BoardUpdate, lambda u: boards.append(u.board))
+        real = hx_state.board_view
+
+        def board_view(*args, **kw):
+            a.watcher.acknowledge(ids)
+            return real(*args, **kw)
+        with mock.patch.object(hx_state, "board_view", board_view):
+            a.watcher.run_once()
+        a.bus.pump()
+        self.assertEqual([bool(ringing(b)) for b in boards], [False, False])
+        self.assertEqual(ringing(a.watcher.latest), [])
+        self.assertEqual(machine_on_board(a, sim.mid).code, "drift")       # the problem is still shown
+
+    def test_an_ack_during_a_slow_share_read_stays_quiet(self):
+        # The same with real threads: hx-watch is in a slow lock read when the operator acknowledges
+        sim = self.sim()
+        a = self.ringing_drift(sim)
+        a.watcher.run_once()
+        ringing = lambda board: hx_state.sounding_alerts(board, a.identity, floor_board=True)
+        ids = [x.id for x in ringing(a.watcher.latest)]
+        self.assertTrue(ids)
+        boards = []
+        a.bus.pump()
+        a.bus.subscribe(BoardUpdate, lambda u: boards.append(u.board))
+        real = a.store.read_lock
+        reading = threading.Event()
+
+        def slow_read_lock(pid):
+            reading.set()
+            time.sleep(0.3)
+            return real(pid)
+        a.store.read_lock = slow_read_lock
+        t = threading.Thread(target=a.watcher.run_once)
+        t.start()
+        self.assertTrue(reading.wait(5))
+        a.watcher.acknowledge(ids)
+        t.join(10)
+        self.assertFalse(t.is_alive())
+        a.bus.pump()
+        self.assertEqual(len(boards), 2)
+        self.assertEqual([bool(ringing(b)) for b in boards], [False, False])
+        self.assertEqual(ringing(a.watcher.latest), [])
+
+    def test_a_pass_ending_inside_acknowledge_is_never_undone(self):
+        # acknowledge() applies its acks to latest and posts it. A pass that ends in the middle of that
+        # must not be overwritten by the older board (a fresh drift shown green with the old origin)
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        a.watcher.run_once()
+        code = lambda b: b.lines[0].machines[0].code
+        self.assertEqual(code(a.watcher.latest), "running_confirmed")
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(80, until=lambda: sim.code() == "drift"))
+        sim.run(5)
+        boards = []
+        a.bus.pump()
+        a.bus.subscribe(BoardUpdate, lambda u: boards.append(u.board))
+        real = hx_poller._with_acks
+        passes = []
+
+        def with_acks(board, acks):
+            if not passes:
+                # hx-watch runs a whole pass while the UI thread is inside acknowledge()
+                t = threading.Thread(target=a.watcher.run_once)
+                passes.append(t)
+                t.start()
+                t.join(0.5)
+            return real(board, acks)
+        with mock.patch.object(hx_poller, "_with_acks", with_acks):
+            a.watcher.acknowledge(["some.other.alert"])
+        passes[0].join(10)
+        self.assertFalse(passes[0].is_alive())
+        a.bus.pump()
+        self.assertEqual(code(a.watcher.latest), "drift")
+        self.assertEqual(code(boards[-1]), "drift")
+        self.assertIs(boards[-1], a.watcher.latest)
+        self.assertEqual(machine_on_board(a, sim.mid).origin_line, "Product of Mexico")
 
     def test_message_check(self):
         sim = self.sim()

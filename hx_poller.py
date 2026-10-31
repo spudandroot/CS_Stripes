@@ -34,9 +34,10 @@ import hx_protocol
 import hx_state
 import hx_time
 from hx_core import SYSTEM_CLOCK, CancelToken, Clock, Msg
-from hx_model import (GREY, RED, TIMINGS, Ack, AuthFailed, BadReply, BoardUpdate, BoardView, CommandRefused, FormatTooNew,
-                      HxError, MachineSnapshot, NoReply, PollerUpdate, PollStatus, PrinterBusy, RunningMessage,
-                      ShareError, ShareUnavailable, Timings, WebReadFailed, WrongPrinter, same_user, to_json)
+from hx_model import (AMBER, GREY, RED, TIMINGS, Ack, AuthFailed, BadReply, BoardUpdate, BoardView, CommandRefused,
+                      FormatTooNew, HxError, MachineSnapshot, NoReply, PollerUpdate, PollStatus, PrinterBusy,
+                      RunningMessage, ShareError, ShareUnavailable, Timings, WebReadFailed, WrongPrinter, same_user,
+                      to_json)
 from hx_share import CounterWatch, ReachMemory, assign, settle_s, takeover_after_s
 from hx_state import Reading
 from i18n import N_, add_spanish
@@ -50,6 +51,7 @@ DST_KEEP_S = 86_400.0          # a pending daylight-saving clock set is kept thi
 ACK_RETRY_S = 600.0            # the watcher retries a failed ack write this long
 UNCHECKED_LOADS = 2            # failed running-message Loads in a row before running_unchecked ...
 UNCHECKED_SLOW_SETS = 3        # ... or this many poll_slow_s without a successful one (§6.5)
+UNCHECKED_CONFIRMS = 3         # ... or this many failed confirming Loads in a row (owner decision, 31 Oct)
 
 EXTRA_LOAD_GAP_S = 30.0        # at most one MSGNAM-triggered Load per printer this often (§6.4 step 9)
 DAILY_ITEMS = ("ECOMOD", "PLDEL", "MNPL", "PRPL", "PLVO", "PLWR", "NZRO")
@@ -155,6 +157,7 @@ class _Cycle:
         self.stopped = False
         self.loaded = False          # a running-message Load was made
         self.load_ok = False         # ... and succeeded
+        self.load_failed = False     # ... and failed: no reply, busy, or a reply that can't be used
         self.busy_rose = False       # the last call got a busy reply from the printer
 
 
@@ -165,8 +168,9 @@ class _Cycle:
 class _Worker:
     """Polls one printer for the coordinator. tick() is one cycle; the thread runs it every poll_fast_s."""
 
-    def __init__(self, poller, printer_id, machine_id, reason):
+    def __init__(self, poller, printer_id, machine_id, reason, standalone=None):
         self.poller = poller
+        self.standalone_seen = standalone   # this PC's last standalone status, when the share just came back
         self.store = poller.store
         self.clock = poller.clock
         self.timings = poller.timings
@@ -195,6 +199,7 @@ class _Worker:
         self.last_slow = None
         self.load_ok_mono = None
         self.loads_failed = 0
+        self.confirms_failed = 0     # confirming Loads (second readings, §3.8) that failed in a row (§6.5)
         self.last_extra_load = None
         self.failures = 0
         self.backoff_i = 0
@@ -345,6 +350,7 @@ class _Worker:
         took = self.clock.monotonic() - t0
         self.p = dataclasses.replace(status, written_at=self.clock.time())
         self.p_ok = t0
+        self.poller._note_written(self.p)
         if took > self.timings.stale_s / 4:
             self._share_trouble("write")
         else:
@@ -386,6 +392,20 @@ class _Worker:
         bags = 0 if age >= t.silent_window_s else base.bags_recent
         start = dataclasses.replace(base, printer_id=self.printer_id, paused_for_lock="", yielded_to="",
                                     standalone=False, bags_recent=bags)
+        if found is not None and found.state is not None and found.state.colour not in (RED, AMBER) and (
+                age >= t.not_monitored_s or self.clock.time() - found.written_at >= t.not_monitored_s):
+            # Nobody judged this printer for long (a share outage, every PC closed overnight): the copied
+            # state, under a counter that moves again, would show as just checked. Until this worker's
+            # first judgement it is "Checking...", or the red or amber this PC's standalone checks found
+            # (only share mode clears those). A red or amber in P is kept as it is (§6.3 step 1;
+            # owner-approved divergence, 31 Oct). The facts stay, so judge still needs its evidence
+            seen = self.standalone_seen.state if self.standalone_seen is not None else None
+            if seen is not None and seen.colour in (RED, AMBER):
+                state = seen
+            else:
+                state = MachineSnapshot(code="checking", colour=GREY, headline=Msg(hx_state.STATE_TEXTS["checking"]),
+                                        since=self.clock.time())
+            start = dataclasses.replace(start, state=state)
         self.counter = max(self.counter, base.counter)
         self.dst = dict(start.dst or {})
         self.p = start
@@ -505,7 +525,7 @@ class _Worker:
 
     def _paused(self, token):
         self.lock_seen = True
-        self.loads_failed = 0
+        self.loads_failed = self.confirms_failed = 0
         self._write_status(paused_for_lock=token)
 
     # ---- one request (§6.4 step 7)
@@ -612,11 +632,13 @@ class _Worker:
             design = self._call(cyc, "web", lambda end: cyc.client.load_slot(0, deadline=end))
         except (WebReadFailed, PrinterBusy, BadReply):
             self.loads_failed += 1
+            cyc.load_failed = True
             if required:
                 r.running_reset = True
             return
         except NoReply:
             self.loads_failed += 1
+            cyc.load_failed = True
             if required:
                 r.running_reset = True
             self._no_reply(cyc)
@@ -927,7 +949,7 @@ class _Worker:
             # R may no longer describe the printer: load it, and don't judge with the old one
             self.need_load = self.r_stale = True
             self.need_hxui = self.need_hxui or self.lock_seen
-            self.loads_failed = 0
+            self.loads_failed = self.confirms_failed = 0
             self.lock_seen = False
         token = e.reread_token if e is not None else ""
         if token and token != self.reread_seen:
@@ -1103,6 +1125,7 @@ class _Worker:
         self.problem = found.problem
         self.inherited_bags = max(self.inherited_bags, found.bags_recent or 0)
         self.loads_failed = UNCHECKED_LOADS if found.running_unchecked else 0
+        self.confirms_failed = 0
         self.need_hxui = self.need_load = self.r_stale = True
 
     def _finish_reading(self, r, cyc):
@@ -1117,6 +1140,7 @@ class _Worker:
             now = self.clock.monotonic()
             r.foreign_client = self._foreign_now()
             r.running_unchecked = (self.loads_failed >= UNCHECKED_LOADS
+                                   or self.confirms_failed >= UNCHECKED_CONFIRMS
                                    or now - self.load_ok_mono >= UNCHECKED_SLOW_SETS * t.poll_slow_s)
             if r.bags_recent is None and self.samples:
                 r.bags_recent = self._recent_bags()
@@ -1137,6 +1161,7 @@ class _Worker:
         t = self.timings
         self._finish_reading(r, cyc)
         j = hx_state.judge(self.p, r, e, lock, machine, line, data, t)
+        load_failed = cyc is not None and cyc.load_failed      # a Load of this tick failed (§6.5)
 
         # 9. Load now: MSGNAM differs from the running message's name
         if (cyc is not None and j.read_running_now and not cyc.loaded
@@ -1154,6 +1179,7 @@ class _Worker:
                 self._paused(paused.token)
                 return
             cyc = extra
+            load_failed = load_failed or extra.load_failed
             self._finish_reading(r, cyc)
             j = hx_state.judge(self.p, r, e, lock, machine, line, data, t)
 
@@ -1163,6 +1189,7 @@ class _Worker:
             r = dataclasses.replace(r, second=True, pending_code=j.candidate.code, pending_alerts=j.candidate_alerts)
             j = hx_state.judge(self.p, r, e, lock, machine, line, data, t)
         elif j.recheck:
+            confirming = "load" in j.recheck
             if not self.clock.sleep(t.second_reading_s, self.poller._cancel):
                 raise _Abandon()
             r2 = dataclasses.replace(r, second=True, at=self.clock.time(), pending_code=j.candidate.code,
@@ -1173,14 +1200,39 @@ class _Worker:
             except _Paused as paused:
                 self._paused(paused.token)
                 return
+            # A confirming Load that failed (or was never made) is a failed message check that the
+            # first Load, unconfirmed, can't hide (§6.5, owner decision 31 Oct)
+            failed = confirming and not again.load_ok
+            if failed:
+                self.confirms_failed += 1
+                load_failed = True
             self._finish_reading(r2, again)
             r, cyc = r2, again
             j = hx_state.judge(self.p, r, e, lock, machine, line, data, t)
+            if failed and not j.committed and self.confirms_failed >= UNCHECKED_CONFIRMS:
+                # The UNCHECKED_CONFIRMSth in a row: R is unknown and the message check failed. Neither
+                # needs a second reading (§3.8 steps 3 and 4), so it commits amber message_unchecked
+                # now, also when the first Load's candidate can't be confirmed
+                j = hx_state.judge(self.p, dataclasses.replace(r, second=False, pending_code="",
+                                                               pending_alerts=()),
+                                   e, lock, machine, line, data, t)
+            elif confirming and not failed:
+                self.confirms_failed = 0
+        if (cyc is not None and cyc.load_ok and j.committed and r.running is not None
+                and hx_state.same_running(j.facts.running, r.running)):
+            self.confirms_failed = 0            # a Load this cycle read the R now committed
+        if load_failed and not (j.committed and r.running_unchecked):
+            # A failed Load, or a confirming Load that failed or wasn't made, is tried again at the next
+            # cycle (about 5 s), not the next slow set, until the message check counts as failed and that
+            # has committed (amber message_unchecked; then the slow set's pace again). Owner decision, 31 Oct
+            self.need_load = True
         self._write_judgement(j, r, e, cyc)
 
     def _second_reading(self, cyc, r, items, data):
         printer = data.printers.get(self.printer_id)
         done = set()
+        if "load" in items:
+            r.running = None        # never the first Load's R: a confirming Load that isn't made confirms nothing
         try:
             for item in items:
                 if item in ("reach", "PRIN"):
@@ -1205,7 +1257,6 @@ class _Worker:
                         self._no_reply(cyc)
                         raise _NoMore()
                 elif item == "load":
-                    r.running = None
                     self._load(cyc, r, required=True)
                 elif item == "INKL":
                     value = self._read(cyc, "INKL")
@@ -1307,13 +1358,35 @@ class _StandaloneCheck:
         self.poller = poller
         self.printer_id = printer_id
         self.machine_id = machine_id
-        self.status = None
+        self.status = self._seed()
         self.failures = 0
         self.problem = ""
         self.counter = 0
         self.samples = []
         self.started_mono = poller.clock.monotonic()
         self.thread = None
+
+    def _seed(self):
+        """prev for the first check (§6.12 item 3): None, or the last share P of a machine with a known
+        origin mismatch (owner decision, 31 Oct): a drift (its code or an active drift alert) whose R is
+        set and isn't E's message, judged against the E this PC holds. Standalone checks never load the
+        message and can't tell a same-name drift from E, so it stays red, with its alert, acks and R,
+        until a share-mode judgement clears it (§3.4 C11c). Only that is carried; every other machine
+        starts afresh as before. The newest P this PC has: the coordinator's last read, or what this PC's
+        own worker last wrote (the coordinator reads only every heartbeat_s)."""
+        poller = self.poller
+        found = [p for p in ((poller.seen_polls().get(self.machine_id) or (None, 0.0))[0],
+                             poller._written_polls().get(self.machine_id)) if p is not None]
+        if not found:
+            return None
+        p = max(found, key=lambda x: x.counter)
+        e = poller._cached_expected(self.machine_id)
+        if (e is None or p.running is None or p.expected_counter != e.counter or p.machine_id != self.machine_id
+                or not hx_state.known_drift(p)
+                or hx_state.matches_expected(p.running, name=e.message_name, slot=e.slot, fingerprint=e.fingerprint)):
+            return None
+        return dataclasses.replace(p, printer_id=self.printer_id, poller=poller.identity.key, counter=0,
+                                   paused_for_lock="", yielded_to="", standalone=True)
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -1523,6 +1596,7 @@ class Poller:
         self._lock = threading.Lock()
         self._workers = {}
         self._seen = {}
+        self._written = {}           # machine id -> the P this PC's worker last wrote
         self._max_counter = {}
         self._cancel = CancelToken()
         self._wake = CancelToken()
@@ -1698,6 +1772,14 @@ class Poller:
         with self._lock:
             self._local[machine_id] = status
 
+    def _note_written(self, status):
+        with self._lock:
+            self._written[status.machine_id] = status
+
+    def _written_polls(self):
+        with self._lock:
+            return dict(self._written)
+
     def _cached_expected(self, machine_id):
         # The last E this PC read or wrote (§6.12 item 3): the store keeps it for every read, the
         # coordinator's, a worker's, the watcher's or a Send's. The watcher overlays the same copy in
@@ -1847,7 +1929,10 @@ class Poller:
     def _start_worker(self, printer_id, machine_id, reason):
         if self._cancel.cancelled:
             return
-        w = _Worker(self, printer_id, machine_id, reason)
+        with self._lock:
+            # The first share pass after an outage runs before the mode leaves standalone (_coordinate)
+            seen = self._local.get(machine_id) if self.mode == "standalone" else None
+        w = _Worker(self, printer_id, machine_id, reason, standalone=seen)
         with self._lock:
             self._workers[printer_id] = w
         if self._threaded:
@@ -2044,6 +2129,7 @@ class StatusWatcher:
         self._polls, self._expected, self._locks, self._lines = {}, {}, {}, {}
         self._too_new = set()
         self._found_acks = {}
+        self._counters = {}          # machine id -> [P counter first seen, seen moving since]
         self._watch = CounterWatch(clock)
         self._cancel = CancelToken()
         self._wake = CancelToken()
@@ -2074,13 +2160,26 @@ class StatusWatcher:
                 self._own_acks[aid] = ack
                 if not standalone:
                     self._ack_queue.append((ack, self.clock.monotonic() + ACK_RETRY_S))
-            acks = dict(self._own_acks)
-        board = self.latest
-        if board is not None:
-            board = _with_acks(board, acks)
-            self.latest = board
-            self.bus.post(BoardUpdate(board=board))
+            # latest and its BoardUpdate change together under the lock (_publish), so a pass that
+            # ends meanwhile can neither be overwritten by the older board read here nor post its own
+            # board without these acks. The lock is never held across share I/O: _with_acks is pure
+            # and post only queues
+            board = self.latest
+            if board is not None:
+                self._publish(_with_acks(board, self._own_acks))
         self._wake.cancel()
+
+    def _publish(self, board):
+        """With self._lock held: the board becomes latest and is posted."""
+        self.latest = board
+        self.bus.post(BoardUpdate(board=board))
+
+    def _publish_pass(self, board, own):
+        """A pass's board, with every own ack made since the pass copied them (own) applied to it."""
+        with self._lock:
+            if self._own_acks.keys() - own.keys():
+                board = _with_acks(board, self._own_acks)
+            self._publish(board)
 
     def run_once(self) -> None:
         """Tests: one pass on the calling thread."""
@@ -2103,8 +2202,8 @@ class StatusWatcher:
         data = self.data.current
         if data is None:
             board = BoardView(lines=[], share_ok=store.available, generated_at=self.clock.time())
-            self.latest = board
-            self.bus.post(BoardUpdate(board=board))
+            with self._lock:
+                self._publish(board)
             return
         machines = []
         for line in data.lines.values():
@@ -2123,6 +2222,15 @@ class StatusWatcher:
                 if status is not None:
                     polls[m.id] = status
                     poll_ages[m.id] = self._watch.see("poll:" + m.id, status.counter)
+                elif self._last_good(m.id) is not None:
+                    # Until this PC's first standalone check of the machine: the last good P, its age
+                    # still growing, as while the share is down and the poller idle (item 4). So a red
+                    # machine keeps its colour, alerts, sound and origin over the change of mode instead
+                    # of showing "Checking..." (owner decision, 31 Oct)
+                    polls[m.id] = self._last_good(m.id)
+                    age = store.poll_age(m.id)
+                    if age is not None:
+                        poll_ages[m.id] = age
                 else:
                     self._watch.missing("poll:" + m.id)
                     poll_ages[m.id] = self._watch.age("poll:" + m.id)
@@ -2139,15 +2247,19 @@ class StatusWatcher:
                 if e is not None:
                     expected[m.id] = e
             lines = dict(self._lines)
-            acks = own
+            # Acks read from the share before the outage still count: a carried alert (§6.12 item 3)
+            # never rings again for an occurrence someone already acknowledged
+            acks = {**self._found_acks, **own}
         else:
             if share_ok:
                 share_ok = self._read_share(data, machines)
             for m in machines:
-                p = self._polls.get(m.id)
+                p = self._polls.get(m.id) if share_ok else self._last_good(m.id)
                 if p is not None:
                     polls[m.id] = p
                 age = store.poll_age(m.id)
+                if age is not None and p is not None and self._unproven(m.id, p, age):
+                    age = None
                 if age is not None:
                     poll_ages[m.id] = age
                 lk = self._locks.get(m.printer_id)
@@ -2162,9 +2274,33 @@ class StatusWatcher:
         board = hx_state.board_view(data, polls, poll_ages, expected, locks, lock_ages, lines, acks,
                                     share_ok=share_ok, standalone=standalone, now=self.clock.time(), timings=t)
         board.next_check_s = self.poller.last_update().next_check_s
-        self.latest = board
-        self.bus.post(BoardUpdate(board=board))
+        # An acknowledge() during this pass (most of which is share reads) already posted its board:
+        # this one carries its acks too, so the sound doesn't start again (§4.5 item 2)
+        self._publish_pass(board, own)
         self._write_acks()
+
+    def _last_good(self, machine_id):
+        """While the share is down: the newest P this PC has, the watcher's last read or what this PC's
+        own worker last wrote (a drift it committed just before the outage that no pass read yet), so
+        the board shows what the standalone checks carry (§6.12 item 3, §7 items 3 and 4)."""
+        p = self._polls.get(machine_id)
+        own = self.poller._written_polls().get(machine_id)
+        if own is not None and own.machine_id == machine_id and (p is None or own.counter > p.counter):
+            return own
+        return p
+
+    def _unproven(self, machine_id, p, age):
+        """A P this watcher hasn't seen move yet, written long ago by its writer's clock: the share's counter
+        rule counts a counter seen for the first time as fresh (storage.md §10 rule 1), so a P left
+        overnight would show as just checked for not_monitored_s after Stripes starts. Its age is
+        unknown instead ("Checking...") until it moves or that rule makes it NOT MONITORED. Only before
+        the first move, so a PC whose clock is off never loses a P that is being written."""
+        seen = self._counters.get(machine_id)
+        if seen is None or (seen[0] != p.counter and not seen[1]):
+            seen = self._counters[machine_id] = [p.counter, seen is not None]
+        if seen[1]:
+            return False
+        return age < self.timings.not_monitored_s and self.clock.time() - p.written_at >= self.timings.not_monitored_s
 
     def _read_share(self, data, machines):
         """Fresh reads into the last-good caches; False when the share went away part-way."""

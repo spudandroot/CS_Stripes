@@ -241,6 +241,47 @@ class TimeSourceTests(unittest.TestCase):
         source = TimeSource(["a", "b"], clock=clock, query=Stub({"a": RuntimeError("boom"), "b": OSError("no")}))
         self.assertEqual(source.now().source, "pc")
 
+    def test_now_never_raises_on_an_odd_port(self):
+        # "²".isdigit() is True but int("²") raises: only ASCII digits are a port, so the whole entry
+        # is the host name, which no server answers (§9.2 items 1, 3 and 7; ² is a key on AZERTY)
+        for host in ("time.example.local:²", "x:²", "127.0.0.1:①", "127.0.0.1:12³", "127.0.0.1:４１２３"):
+            self.assertEqual(parse_host(host), (host, 123))
+        clock = FakeClock()
+        stub = Stub({"time.example.local:²": failure(), "x:²": failure(),
+                     "time.example.local": clock.time() + 5.0, "192.0.2.123": clock.time() + 12.5})
+        # The probe: an odd port alone gives the PC's time
+        source = TimeSource(["time.example.local:²"], clock=clock, query=stub)
+        self.assertEqual(source.now().source, "pc")
+        self.assertEqual(stub.calls, [("time.example.local:²", {"port": 123, "timeout_s": 2.0})])
+        # A good fallback after it is still asked
+        source.set_hosts(["time.example.local:²", "192.0.2.123"])
+        reading = source.now(fresh=True)
+        self.assertEqual((reading.source, reading.server), ("server", "192.0.2.123"))
+        self.assertAlmostEqual(reading.offset_s, 12.5)
+        # A good primary that later fails, with an odd fallback: the PC's time
+        source.set_hosts(["time.example.local", "x:²"])
+        self.assertEqual(source.now(fresh=True).server, "time.example.local")
+        stub.answers["time.example.local"] = failure()
+        self.assertEqual(source.now(fresh=True).source, "pc")
+        self.assertEqual([host for host, _ in stub.calls[-2:]], ["time.example.local", "x:²"])
+
+    def test_now_never_raises_on_a_host_it_cannot_read(self):
+        # Backstop for §9.2 item 7: whatever parse_host raises on an entry, the next host is asked
+        clock = FakeClock()
+        stub = Stub({"192.0.2.123": clock.time() + 1.0})
+        real = hx_time.parse_host
+
+        def parse(host):
+            if host == "bad":
+                raise ValueError("bad entry")
+            return real(host)
+        source = TimeSource(["bad", "192.0.2.123"], clock=clock, query=stub)
+        with mock.patch.object(hx_time, "parse_host", side_effect=parse):
+            self.assertEqual(source.now().server, "192.0.2.123")
+            source.set_hosts(["bad"])
+            self.assertEqual(source.now(fresh=True).source, "pc")
+        self.assertEqual([host for host, _ in stub.calls], ["192.0.2.123"])
+
     def test_failure_memory_and_cached(self):
         clock = FakeClock()
         stub = Stub({"time.example.local": failure()})

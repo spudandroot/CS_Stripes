@@ -280,6 +280,13 @@ class EnvelopeTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=raw):
                 decode_json(raw, file_type="line", rel="x")
 
+    def test_nesting_too_deep_for_json_is_damage(self):
+        # json.loads raises RecursionError, not ValueError, past a few thousand levels
+        raw = b'{"format_version": 1, "file_type": "line", "a": ' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+        with self.assertRaises(ValueError):
+            decode_json(raw, file_type="line", rel="x")
+        self.assertIsNone(hx_share._lenient_json(raw))
+
     def test_newer_format(self):
         raw = json.dumps({"format_version": 2, "file_type": "line", "id": LINE_ID}).encode()
         with self.assertRaises(FormatTooNew) as cm:
@@ -849,6 +856,7 @@ class LocalCopyTests(ShareCase):
         self.data.run_once()
         path = os.path.join(self.local.hx_dir, "local-copy.json")
         d = self.stored_copy()
+        good = json.loads(json.dumps(d))
         with open(path, "w", encoding="utf-8") as f:
             json.dump(dict(d, format_version=2), f)
         self.assertIsNone(self.local.read_local_copy())
@@ -856,6 +864,13 @@ class LocalCopyTests(ShareCase):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(d, f)
         self.assertIsNone(self.local.read_local_copy())
+        for bad in (int("9" * 400), float("nan")):              # float() of the int raised OverflowError
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dict(good, reached_at=bad), f)
+            self.assertIsNone(self.local.read_local_copy())
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(dict(good, reached_at=10 ** 9), f)
+        self.assertEqual(self.local.read_local_copy().reached_at, 1e9)     # the good copy still reads
 
     def test_the_24_hour_rule(self):
         self.data.run_once()
@@ -1098,6 +1113,45 @@ class TimeoutTests(ShareCase):
             self.assertTrue(wait_until(lambda: not st._probing))
         self.assertEqual(st.down_reason, Msg("Stripes can't reach the server."))
 
+    def test_windows_network_errors_that_python_maps_to_einval(self):
+        # 55 ERROR_DEV_NOT_EXIST, 1203 ERROR_NO_NET_OR_BAD_PATH and 1225 ERROR_CONNECTION_REFUSED: CPython
+        # gives them errno EINVAL, so they read as a folder error (ShareError) and the share was never
+        # marked down: no probe, no standalone checks, no banner, and a Send went red at the lock step
+        class DroppedShare(FileOps):
+            def __init__(self, code):
+                self.code, self.calls = code, 0
+
+            def _fail(self, path, *args):
+                self.calls += 1
+                e = OSError(errno.EINVAL, "The specified network resource or device is no longer available", path)
+                e.winerror = self.code          # as CPython builds it on Windows
+                raise e
+            read_bytes = create_exclusive = write_whole = listdir = replace = remove = _fail
+
+        for code in (55, 1203, 1225):
+            with self.subTest(winerror=code):
+                fs = DroppedShare(code)
+                st = self.store(view=fs, timings=FAST)
+                with self.assertRaises(ShareUnavailable):
+                    st.read_lock(PRINTER_ID)
+                self.assertFalse(st.available)
+                self.assertEqual(st.down_reason, Msg("Stripes can't reach the server."))
+                calls = fs.calls
+                with self.assertRaises(ShareUnavailable):
+                    st.read_lock(PRINTER_ID)                    # at once, without touching the server
+                self.assertEqual(fs.calls, calls)
+                lk = st.lock(PRINTER_ID, purpose="send", run_id="sd_8a7b6c5d4e", line_id=LINE_ID,
+                             machine_id=MACHINE_ID)
+                self.assertEqual(lk.acquire(), "local_only")    # the Send carries on (amber no_lock)
+                lk.release()
+                st.probe_now()
+                self.assertTrue(wait_until(lambda: not st._probing))
+                self.assertGreater(fs.calls, calls)             # the probe tried, got the same error ...
+                self.assertFalse(st.available)                  # ... and the share stays down
+        e = OSError(errno.EINVAL, "The parameter is incorrect", "x")
+        e.winerror = 87                                         # ERROR_INVALID_PARAMETER: still a folder error
+        self.assertFalse(hx_share._network_error(e))
+
     def test_never_more_than_pool_max_threads(self):
         self.fs.hang = True
         timings = TIMINGS.scaled(0.06)
@@ -1176,6 +1230,8 @@ class LogTests(ShareCase):
         with self.assertRaises(FormatTooNew):
             decode_log(encode_log(newer))
         self.assertIsNone(decode_log(encode_log(dict(stored, file_type="other"))))
+        line1 = b"[" * 10_000 + b"]" * 10_000            # json.loads raises RecursionError on it
+        self.assertIsNone(decode_log(line1 + b'\n{"end":"' + hashlib.sha256(line1).hexdigest().encode() + b'"}\n'))
 
     def test_the_example_file(self):
         stored = decode_log(EXAMPLE_LOG)
@@ -2016,6 +2072,10 @@ class ReachMemoryTests(ShareCase):
         with open(os.path.join(local.hx_dir, "reach.json"), "wb") as f:
             f.write(b'{"format_version": 1, "file_type": "local_state", "last_printer_reach": true}')
         self.assertIsNone(ReachMemory(local, clock=self.clock).last_printer_reach)
+        for bad in (b"9" * 400, b"NaN", b"1e400"):              # 9...9 made math.isfinite raise OverflowError
+            with open(os.path.join(local.hx_dir, "reach.json"), "wb") as f:
+                f.write(b'{"format_version": 1, "file_type": "local_state", "last_printer_reach": ' + bad + b"}")
+            self.assertIsNone(ReachMemory(local, clock=self.clock).last_printer_reach, bad[:5])
 
 
 # --------------------------------------------------------------------------
@@ -2098,6 +2158,35 @@ class StatusFileTests(ShareCase):
         self.write(f"status/machines/{MACHINE_ID}.poll.json", other)        # another machine's content
         self.assertIsNone(self.sender.read_poll(MACHINE_ID))
 
+    def test_hand_edited_numbers_and_nesting_are_damage_too(self):
+        # Domain Users can edit status\machines. json.loads takes a 400-digit int, NaN, 1e400 and a
+        # 10 000-deep nest, which raised OverflowError or RecursionError past every reader that catches
+        # ValueError: the watcher's pass then stopped for the whole floor, keeping the last board
+        poll_rel, expected_rel = (f"status/machines/{MACHINE_ID}.poll.json",
+                                  f"status/machines/{MACHINE_ID}.expected.json")
+        deep = "[" * 10_000 + "]" * 10_000
+        for i, (name, value) in enumerate((("huge int", "9" * 400), ("NaN", "NaN"), ("1e400", "1e400"),
+                                           ("nesting", deep))):
+            with self.subTest(name=name):
+                field = "daily" if name == "nesting" else "written_at"
+                value = '{"a": ' + value + "}" if name == "nesting" else value
+                for rel, file_type in ((poll_rel, "poll"), (expected_rel, "expected")):
+                    self.write(rel, ('{"format_version": 1, "file_type": "%s", "machine_id": "%s", "printer_id": '
+                                     '"%s", "poller": "FLOOR09_x_1", "counter": 7, "%s": %s}'
+                                     % (file_type, MACHINE_ID, PRINTER_ID, field, value)).encode())
+                self.assertIsNone(self.sender.read_poll(MACHINE_ID))
+                self.assertEqual(self.sender.check_poller_paused(MACHINE_ID, "t"), "polling")
+                self.assertIsNone(self.sender.read_expected(MACHINE_ID))
+                self.assertIsNone(self.sender.cached_expected(MACHINE_ID))
+                ack = '{"format_version": 1, "file_type": "ack", "alert_id": "drift-x-%d", "by": "b", ' \
+                      '"computer": "c", "at": %s}' % (i, value)
+                self.write(f"status/alerts/drift-x-{i}.json", ack.encode())
+                self.assertIsNone(self.sender.read_ack(f"drift-x-{i}"))
+        self.clock.advance(TIMINGS.stale_s)
+        self.assertEqual(self.sender.check_poller_paused(MACHINE_ID, "t"), "missing")
+        self.poller.write_poll(self.poll(1))                     # a taker overwrites it from counter 1
+        self.assertEqual(self.sender.read_poll(MACHINE_ID).counter, 1)
+
     def test_line_status(self):
         status = LineStatus(line_id=LINE_ID, send_id="sd_8a7b6c5d4e", countries=["USA", "Canada"],
                             machines={MACHINE_ID: "amber"})
@@ -2123,6 +2212,10 @@ class StatusFileTests(ShareCase):
             reader.read_ack("../x")
         self.write("status/alerts/newer-1.json", {"format_version": 2, "file_type": "ack", "alert_id": "newer-1"})
         self.assertEqual(reader.read_ack("newer-1").alert_id, "newer-1")
+        for i, bad in enumerate((b"9" * 400, b"NaN", b"1e400")):  # 9...9 made float() raise OverflowError
+            self.write(f"status/alerts/newer-{i + 2}.json",
+                       b'{"format_version": 2, "file_type": "ack", "alert_id": "newer-%d", "at": %s}' % (i + 2, bad))
+            self.assertEqual(reader.read_ack(f"newer-{i + 2}").at, 0.0)     # still acknowledged
 
     def test_preview(self):
         bmp = b"BM" + bytes(20540)

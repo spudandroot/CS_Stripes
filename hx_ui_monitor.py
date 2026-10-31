@@ -345,10 +345,10 @@ class MachineRow(tk.Frame):
         self.headline_label.configure(text=text(view.headline), foreground=DIM_FG if dim else colour)
         self.origin.set(view.origin_line)
         self.origin.set_colours(foreground=DIM_FG if dim else TEXT_FG)
-        if view.origin_line:
-            self.unknown_label.pack_forget()
-        else:
-            self.unknown_label.pack(anchor="w", after=self.origin)
+        # The origin, or "(origin unknown)" in its place: an empty BagText still measures a line
+        # high, so it goes rather than leave a gap. Details and the rest are packed after these below
+        _show_widgets([self.origin, self.unknown_label], {self.origin if view.origin_line else self.unknown_label},
+                      anchor="w")
         alert_texts = [text(a.msg) for a in view.alerts]
         details = [text(d) for d in view.details]
         details = [d for d in details if d and d not in alert_texts]

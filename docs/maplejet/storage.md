@@ -197,6 +197,8 @@ dataclass.
 `decode_json(raw, *, file_type, rel) -> dict`:
 
 1. Decode with `utf-8-sig` and run `json.loads`. If it isn't a dict, raise `ValueError` ("damaged").
+   `json.loads` raises `RecursionError` for a file nested thousands of levels deep (a hand edit):
+   that is turned into `ValueError` too, so every reader treats it as damaged.
 2. `format_version` must be an int (not a bool) of at least 1. Otherwise raise `ValueError`.
 3. If `format_version > FORMAT`, raise `FormatTooNew(Msg(N_("Update Stripes: {file} was saved by a
    newer version."), {"file": rel}), path=rel, found=format_version)`.
@@ -207,7 +209,9 @@ dataclass.
 
 Typed readers then call `from_json(cls, d)`, with architecture.md §5.3's type rules (an int is a
 valid float, lists come back as tuples where the hint says so, a bool is never a number). A
-`ValueError` there also means "damaged". What
+`ValueError` there also means "damaged", and `from_json` raises nothing else for bad values: a
+number no float can hold (a 400-digit int, which `json.loads` accepts) or NaN or infinity, which
+Stripes never writes, raises `ValueError` too. What
 happens with a damaged file depends on what it is: see §5 for status files, §6.6 for logs and §13.2
 for records.
 
@@ -1163,13 +1167,22 @@ The remaining file rules:
 | Raised by the operation | The store raises | Share marked down? |
 |---|---|---|
 | timeout (§9.1) | `ShareUnavailable` | yes |
-| `OSError` whose `winerror` is in `NETWORK_WINERRORS` = {51, 53, 54, 59, 64, 67, 121, 1222, 1231, 1232, 1236, 2250}, or whose `errno` is in {`ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`, `ETIMEDOUT`, `ECONNRESET`, `ENOTCONN`, `ESTALE`} | `ShareUnavailable(Msg(N_("Stripes can't reach the server.")))` | yes |
+| `OSError` whose `winerror` is in `NETWORK_WINERRORS` = {51, 53, 54, 55, 59, 64, 67, 121, 1203, 1222, 1225, 1231, 1232, 1236, 2250}, or whose `errno` is in {`ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`, `ETIMEDOUT`, `ECONNRESET`, `ENOTCONN`, `ESTALE`} | `ShareUnavailable(Msg(N_("Stripes can't reach the server.")))` | yes |
 | `FileNotFoundError` on a read | the read returns None | no |
 | `FileNotFoundError` on a write (folder missing) | `ShareError(Msg(N_("Stripes can't find {folder} on the server."), {"folder": <rel folder>}))` | no |
 | `PermissionError` | `ShareDenied(Msg(N_("Stripes isn't allowed to change {folder} on the server."), ...))` | no |
 | any other `OSError` | `ShareError(Msg(N_("Stripes couldn't use {folder} on the server: {error}"), ...))` | no |
 
 `ShareDenied` is a new subclass of `ShareError` in `hx_share` (§15).
+
+55 (`ERROR_DEV_NOT_EXIST`, "the network resource is no longer available", the usual error once
+the client knows the session is gone), 1203 (`ERROR_NO_NET_OR_BAD_PATH`) and 1225
+(`ERROR_CONNECTION_REFUSED`) were added after the first version of this list: CPython maps them to
+`EINVAL`, so only the `winerror` check can tell them from a folder error, and without them a lost
+server read as "couldn't use the folder" with no probe, no standalone checks and no down banner.
+All three come only from a network path, and a wrong "down" costs one probe cycle. 58
+(`ERROR_BAD_NET_RESP`) stays out: some NAS boxes give it for an operation they don't support, on a
+share that works.
 
 ### 9.3 Down, probe and recovery
 
@@ -1863,7 +1876,7 @@ READ_RETRY_S = (0.05, 0.1, 0.2)
 REPLACE_RETRY_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
 POOL_IDLE, POOL_MAX = 4, 16
 CLOCK_BACK_TOLERANCE_S = 300.0
-NETWORK_WINERRORS = frozenset({51, 53, 54, 59, 64, 67, 121, 1222, 1231, 1232, 1236, 2250})
+NETWORK_WINERRORS = frozenset({51, 53, 54, 55, 59, 64, 67, 121, 1203, 1222, 1225, 1231, 1232, 1236, 2250})   # §9.2
 
 class ShareDenied(ShareError): ...          # PermissionError on the share; the share stays available
 

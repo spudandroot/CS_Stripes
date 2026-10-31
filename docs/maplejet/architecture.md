@@ -383,7 +383,9 @@ def same_user(a: str, b: str) -> bool: ...    # Windows names compare case-insen
 `from_json` type rules (every module's files and tests rely on them, so they are fixed here):
 
 1. An int is accepted for a `float` field and converted to float (JSON writes `610` for `610.0`, and
-   records written by hand or by `FakeWorld` hold ints).
+   records written by hand or by `FakeWorld` hold ints). An int too big for a float (`json.loads`
+   takes a 400-digit int, where `float()` raises `OverflowError`), NaN and infinity are refused
+   under rule 8: `encode_json` never writes them, so they mean a damaged or hand-edited file.
 2. A bool is rejected for `int` and `float` fields (`True` isn't 1 here); an `int` field accepts only
    an int (not a float, not a string).
 3. A `str` field accepts only a str.

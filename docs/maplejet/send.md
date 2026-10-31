@@ -998,9 +998,11 @@ relates the answer to its injected clock.
 
 ### 9.2 TimeSource
 
-1. `parse_host(h)`: when `h` has exactly one `:` and the part after it is digits, `(before, int(after))`;
-   otherwise `(h, SNTP_PORT)`. So `hx_fake.py` can point the app at a fake time server with
-   `127.0.0.1:<port>` (protocol.md §16.3).
+1. `parse_host(h)`: when `h` has exactly one `:` and the part after it is ASCII digits `0`-`9`,
+   `(before, int(after))`; otherwise `(h, SNTP_PORT)`. So `hx_fake.py` can point the app at a fake time
+   server with `127.0.0.1:<port>` (protocol.md §16.3). Other characters Python calls digits (`²`, `①`,
+   full-width or Arabic-Indic digits) are not a port, so `time.example.local:²` is asked as that whole
+   name, which fails name resolution like any unknown host.
 2. `set_hosts(hosts)` keeps the non-empty ones, in order. Every user of a `TimeSource` calls
    `time.set_hosts([company.time_server, company.time_server_fallback])` from its current `HxData`
    before asking (the Send pipeline at the start of every run, the poller each cycle, `PrinterActions`
@@ -1019,7 +1021,9 @@ relates the answer to its injected clock.
    and its `local`. No request. A Send asks the server once and uses `now_from` for every machine's
    clock set and date check, so each TD carries the time of its own moment.
 6. Thread-safe: one lock around the cache. Queries run outside it.
-7. `now()` never raises. The caller warns, and marks results amber, when `source == "pc"`.
+7. `now()` never raises. Anything raised for one host, by `parse_host` or by the query, counts as that
+   host failing and the next host is asked. The caller warns, and marks results amber, when
+   `source == "pc"`.
 8. `cached()`: never queries and never blocks on the network (only the cache lock). It returns the
    cached server reading (`utc = clock.time() + offset_s`, its `local`, `source "server"`) when an answer
    was cached within the last `2 × cache_s`, else the PC's reading. The poller uses only `cached()`; its
@@ -2327,6 +2331,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | SntpTests | fake server | `FakeSntp(offset_s=3600)`: `sntp_query("127.0.0.1", port=..., timeout_s=0.5)` is within 0.5 s of `time.time() + 3600` |
 | | silent and bad | a silent `FakeSntp` raises `TimeServerError` after about 0.2 s with `timeout_s=0.2`; a small UDP server in the test answering with mode 3, a wrong originate timestamp, stratum 0 or leap indicator 3 raises it each time |
 | TimeSourceTests | hosts | a `query` stub where the first host raises and the second answers: `source "server"`, `server` the second host, `offset_s` the answer minus `clock.time()`; the stub receives `port` and `timeout_s` keywords; `parse_host` of `time.example.local`, `192.0.2.123` and `127.0.0.1:4123` |
+| | odd port | `parse_host` of `time.example.local:²`, `127.0.0.1:①`, `127.0.0.1:12³` and a full-width port is `(h, 123)`; `now()` with only `time.example.local:²` (the stub fails that name) gives `source "pc"` and doesn't raise; with `192.0.2.123` after it, the fallback answers; a good primary that later fails, with fallback `x:²`, gives `source "pc"`; a `parse_host` patched to raise for one host: the next host is still asked |
 | | cache | `FakeClock`: a second `now()` within `cache_s` makes no query; after `advance(600)` it queries; `fresh=True` always queries; no hosts or every host failing gives `source "pc"`, `offset_s 0.0`, and clears the cache; `now_from` keeps the offset and moves with the clock |
 | | local | `to_local(1793275200.0, offset_fn=lambda u: -14400.0)` is 29 Oct 2026 08:00 |
 | DstTests | constant | a constant offset function: `recent_dst_change` is None at any time |

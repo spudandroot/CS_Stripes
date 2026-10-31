@@ -1150,6 +1150,25 @@ class WebTests(unittest.TestCase):
         self.assertEqual((a.nonsense, b.nonsense), (0, 0))
         self.assertEqual(fake.violations, [])
 
+    def test_broken_login_reply_is_auth_failed(self):
+        # §2.4 and §10.1 rule 3: a Login reply that is neither 200 with the cookies nor 401 is AuthFailed.
+        # A 200 with a broken header line raised BadReply, which the poller's second reading didn't
+        # catch: it dropped every cycle unjudged and the machine stayed green on an unchecked origin
+        for reply in (b"HTTP/1.1 200 OK\r\nbroken header\r\n\r\n", b"HTTP/2 200 OK\r\n\r\n",
+                      b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"):
+            for call in ("login", "load_slot"):
+                with self.subTest(reply=reply[:24], call=call):
+                    port = one_shot_server(self, reply)
+                    c = PrinterClient("127.0.0.1", 1109, TOKEN, port=port, clock=self.clock, gates=GateRegistry())
+                    c.label = "Printer 1"
+                    if call == "login":
+                        c._cookies = {"Access_token_1109": "old", "Auth_token_1109": "old"}
+                    with self.assertRaises(AuthFailed) as e:
+                        c.login() if call == "login" else c.load_slot(9)
+                    self.assertIn("refused the password", str(e.exception))
+                    self.assertEqual(c._cookies, {})                    # forgotten
+                    self.assertEqual((c.nonsense, c.relogins), (1, 0))  # still counted as nonsense (§13)
+
     def test_second_login_page(self):
         # A session that is refused again right after logging in: AuthFailed, once per call
         self.c.login()

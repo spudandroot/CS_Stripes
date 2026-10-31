@@ -644,6 +644,61 @@ class PlantTests(unittest.TestCase):
         plant.check_one_request_at_a_time()
         plant.check_one_writer()
 
+    def test_confirm_at_once_never_shows_the_old_origin_green(self):
+        """The sender confirms the moment the Send ends, before the poller has judged it: until the poller's
+        Loads of the new message commit, the board shows the origin unknown in amber, never the previous
+        message's origin, and never green with an origin the printer isn't printing (states.md §5.1 steps
+        2.5 and 2.7, §5.3 rule 0c)."""
+        old_origin = "Product of USA"
+        plant = Plant(self, printers=1, printer_kw={"mixup": False})
+        fake = plant.fakes[0]
+        with fake.lock:
+            fake.slots[9] = design(9, "EXCO1-PKO07-OLD0-M9", origin=old_origin)
+            fake.current_slot = 9
+        plant.expect(0)
+        poller = plant.pc("bob")
+        poller.start()
+        sender = plant.sender_pc("jsmith")
+        self.assertTrue(wait(lambda: plant.code(0) == "running_confirmed" and plant.p(0).running is not None
+                             and plant.p(0).running.origin_line == old_origin, 10))
+        machine = sender.data.current.machines[plant.mids[0]]
+        samples, stop = [], threading.Event()
+
+        def sample():
+            while not stop.is_set():
+                t = time.monotonic()
+                try:
+                    p = plant.observer.read_poll(plant.mids[0])
+                    e = plant.observer.read_expected(plant.mids[0])
+                    lk = plant.observer.read_lock(plant.pids[0])
+                except Exception:
+                    continue
+                v = hx_state.machine_view(machine, p, 0.0, e, lk, 0.0 if lk is not None else None, {},
+                                          plant.timings)
+                with fake.lock:
+                    held = hx_message.origin_from_design(fake.slots[fake.current_slot])
+                samples.append((t, v.code, v.colour, v.origin_line, held))
+                time.sleep(0.005)
+        th = threading.Thread(target=sample, daemon=True)
+        th.start()
+        result = sender.send((0,))
+        (m,) = result.machines
+        self.assertTrue(m.ok, m)
+        t_sent = time.monotonic()
+        sender.pipeline.confirm(result.send_id, [plant.mids[0]], True)
+        self.assertTrue(wait(lambda: plant.code(0) == "running_confirmed"
+                             and plant.p(0).running.origin_line == ORIGIN, 6))
+        time.sleep(0.2)
+        stop.set()
+        th.join(2)
+        after = [s[1:] for s in samples if s[0] >= t_sent]     # read after the Send ended
+        self.assertTrue(after)
+        self.assertEqual([s for s in after if s[2] == old_origin], [])
+        self.assertEqual([s for s in after if s[1] == "green" and s[2] != s[3]], [])
+        self.assertEqual(after[-1][:3], ("running_confirmed", "green", ORIGIN))
+        poller.stop()
+        plant.check_one_request_at_a_time()
+
     def test_slow_everything(self):
         """A slow printer, a slow share and a silent time server; a rank-0 and a rank-1 poller, and a
         sender on a third store sending twice (states.md §12.3 case 1)."""

@@ -474,6 +474,14 @@ def matches_expected(running: RunningMessage | None, *, name: str, slot: int | N
     return True
 
 
+def known_drift(prev: PollStatus | None) -> bool:
+    """P says the printer runs something other than E: the code drift, or an active drift alert (§3.4 C11c)."""
+    if prev is None:
+        return False
+    return ((prev.state is not None and prev.state.code == "drift")
+            or any(a.active and a.kind == "drift" for a in prev.alerts))
+
+
 def was_printing(prev: PollStatus | None, company: Company) -> bool:
     """The printer was printing bags just before it stopped answering (§3.7)."""
     if prev is None or prev.printing is not True:
@@ -536,6 +544,11 @@ def _rm_key(r):
     if r is None:
         return None
     return r.slot, norm_name(r.name), r.fingerprint, r.origin_line
+
+
+def same_running(a: RunningMessage | None, b: RunningMessage | None) -> bool:
+    """Two Loads read the same running message (slot, name, content and origin; not read_at)."""
+    return _rm_key(a) == _rm_key(b)
 
 
 def _sender(e):
@@ -852,6 +865,19 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
                 need("drift")
         else:
             carry("drift")
+
+    # C11c (owner decision, 31 Oct): a drift known from the share stays in standalone mode. Standalone
+    # checks never load the message, so they can't see a drift end, and its name alone (C12) can't tell a
+    # same-name drift from E: only a share-mode judgement clears it. Same alert, same acks, R's origin.
+    # A MSGNAM that no longer names R's message means something else was selected at the printer: still
+    # never green, at best amber unknown_while_down, with the drift alert open
+    if (standalone and known_drift(prev) and prev.expected_counter == e.counter and mode == "running"
+            and not e.rejected and not after_switch and names_message):
+        if trusted:
+            renamed = (running is not None and F.message_name is not None
+                       and norm_name(F.message_name) != norm_name(running.name))
+            codes.add("unknown_while_down" if renamed else "drift")
+        need("drift")
 
     # C11b: the running message can't be read
     if not standalone:
@@ -1228,6 +1254,11 @@ def machine_view(machine: Machine, poll: PollStatus | None, poll_age_s: float | 
         from_poll = True
     else:
         code = "checking"
+    if code in STATE_CODES and STATE_CODES[code] == GREEN and _r_predates(poll, expected):
+        # The poller hasn't judged E yet and R isn't E's message (a Send just made, confirmed before the
+        # poller's first Load commits): green needs a Load since E changed (§15 decision 36), so amber
+        code = "confirmed_with_notes" if expected.confirmed else "unconfirmed"
+        headline, from_poll = None, False
     if code not in STATE_CODES:
         code = "update_stripes"         # a code from a newer Stripes
         headline, from_poll = None, False
@@ -1291,14 +1322,26 @@ def machine_view(machine: Machine, poll: PollStatus | None, poll_age_s: float | 
         message_name = norm_name(running.name)
     else:
         message_name = norm_name(poll.message_name) if poll is not None else ""
+    # "Checking...": nothing judged yet since a long gap (§6.3 step 1), or a status of unknown age. What
+    # P last said prints isn't shown as printing (owner-approved divergence, 31 Oct)
+    checking = code == "checking"
     return MachineView(machine_id=machine.id, line_id=machine.line_id, name=machine.name, colour=colour, code=code,
-                       headline=headline, details=details, origin_line=effective_origin(poll, expected),
+                       headline=headline, details=details,
+                       origin_line="" if checking else effective_origin(poll, expected),
                        message_name=message_name, checked_age_s=poll_age_s, monitored=monitored,
-                       printing=poll.printing if monitored else None, alerts=alerts,
+                       printing=poll.printing if monitored and not checking else None, alerts=alerts,
                        unacked_sound=any(a.sound and not a.acked_by for a in alerts),
                        can_stop=can_stop, can_resume=can_resume, needs_send=needs_send,
                        confirm_pending_by=confirm_by, confirm_send_id=confirm_id, test=test,
                        has_preview=running is not None and bool(running.preview_sha256))
+
+
+def _r_predates(poll: PollStatus | None, expected: ExpectedState | None) -> bool:
+    """E changed since the poller's last judgement (E.counter != P.expected_counter) and P's running
+    message isn't E's: R was read before E was written, so it may not be what prints now (§5.1 step 2.5)."""
+    return (poll is not None and expected is not None and expected.counter != poll.expected_counter
+            and not matches_expected(poll.running, name=expected.message_name, slot=expected.slot,
+                                     fingerprint=expected.fingerprint))
 
 
 def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) -> str:
@@ -1306,9 +1349,16 @@ def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) ->
     if poll is not None and (poll.running_unchecked
                              or (poll.state is not None and poll.state.code == "message_unchecked")):
         return ""
+    if poll is not None and not poll.standalone and poll.state is not None and poll.state.code == "unknown_while_down":
+        return ""                              # a standalone check's finding carried into share mode (§6.3 step 1)
     if (poll is None or poll.running is None) and expected is not None and expected.mode == "switch_pending":
         return ""
     r = poll.running if poll is not None else None
+    if r is not None and _r_predates(poll, expected):
+        return ""                              # R predates an E the poller hasn't judged yet
+    if r is not None and poll.standalone and (poll.message_name is None
+                                              or norm_name(poll.message_name) != norm_name(r.name)):
+        return ""                              # a drift's R carried into standalone (C11c), and MSGNAM isn't R's
     if (r is not None and expected is not None and expected.fingerprint != "" and r.origin_line == ""
             and matches_expected(r, name=expected.message_name, slot=expected.slot,
                                  fingerprint=expected.fingerprint)):

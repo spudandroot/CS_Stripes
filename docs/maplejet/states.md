@@ -84,7 +84,7 @@ alerts (§4.5), never on the code.
 | `switch_pending` | BLUE | Switching to the new message: {user} on {computer} | a fresh `send` lock and E.mode `switch_pending` | as above | none |
 | `test_running` | BLUE | TEST by {user}, step {step} of {of} (or TEST by {user} before the first step) | a fresh lock with purpose `test` or `calibration` | released (normally then `test_finished`), or stale (§3.6) | none |
 | `action_in_progress` | BLUE | Stopping printing: {user} · Resuming printing: {user} · Setting the clock: {user} (by purpose `stop`, `resume`, `clock`) · Printer in use: {user} on {computer} (any other purpose, such as a damaged lock's `unknown` or a newer version's purpose) | a fresh lock with one of those purposes, or any purpose not listed in this table | released or stale | none |
-| `checking` | GREY | Checking... | no P has been read yet, and it hasn't been missing for `not_monitored_s` | P is read, or 30 s pass (then `not_monitored`) | none |
+| `checking` | GREY | Checking... | no P has been read yet, and it hasn't been missing for `not_monitored_s`; or P's age isn't known (§7, a P first seen long after it was written); or P holds it (also a poller code: a worker starting after a long gap writes it until its first judgement, §6.3 step 1). The origin shows as unknown and `printing` is None | P is read, or 30 s pass (then `not_monitored`); the worker's first judgement | none |
 | `not_monitored` | GREY, or the last known RED or AMBER (§5.2) | NOT MONITORED | P's counter unchanged, or P missing, for `not_monitored_s` (30 s) on this PC's clock. Standalone: §6.12 | P's counter moves | Confirm |
 | `update_stripes` | GREY | Update Stripes to see this machine | P or E is from a newer format | this PC runs the newer Stripes | none |
 | `not_set_up` | GREY | No printer set up | (board_view) the machine's printer record is missing, inactive, or has no password (`token == ""`) | an administrator fixes it | none |
@@ -227,6 +227,7 @@ trusted and `F.printing is False`, "carried" = §3.7.
 | C10 | `off_read` and E.mode `running` and not E.rejected and not (`E.failure` and `E.failure.after_switch`), and (prev's `printing_off` alert is active, or (`prev.reachable` and `prev.printing is True` and `prev.problem == ""`)). Carried while not trusted | `printing_off` | `printing_off` |
 | C10b | `off_read` and E.mode `running` and not E.rejected and no E.failure, and not C10 | `not_printing` | none |
 | C11 | not standalone, trusted, R is not None, E.mode `running`, not E.rejected, not (`E.failure` and `after_switch`), E names a message (`E.message_name` or `E.fingerprint` not empty), and R doesn't match E. Carried while not trusted | `drift` | `drift` |
+| C11c | standalone, prev knows a drift (`prev.state.code == "drift"` or an active `drift` alert in prev), `E.counter == prev.expected_counter`, E.mode `running`, not E.rejected, not (`E.failure` and `after_switch`), and E names a message (owner decision, 31 Oct). Not cleared in standalone, also while not trusted or acknowledged | when trusted: `drift`, or `unknown_while_down` when MSGNAM was read and names another message than R | `drift` (prev's, the same id and acks) |
 | C11b | not standalone, trusted, E.mode `running` or `switch_pending`, not E.rejected, and (R is None, or `F.running_unchecked`). Carried while not trusted | `message_unchecked` | `message_unreadable` only while `F.running_unchecked` |
 | C12 | standalone, E names a message, `reading.message_name` was read this cycle and `norm_name` differs from `E.message_name`; or standalone, trusted, E names a message and MSGNAM gave no name this check (`F.message_name` is None, §3.2); or standalone, trusted, E.mode `running`, no E.failure, not E.rejected and `F.printing` is None (PRIN not read since the outage began); or standalone and E.mode in (`switch_pending`, `test_running`) | `unknown_while_down` | none |
 | C13 | `on` and `F.ink_level == 4`. Carried while not trusted | `ink_out` | `ink_out` |
@@ -254,7 +255,13 @@ Notes:
 4. A code always results: with E.mode `running`, an untrusted printer gives C18 or C9; a trusted one
    gives C10, C10b, C11b or C19 (C19 needs R in share mode; without R, C11b applies).
 5. In standalone mode C3, C4, C11 and C11b are skipped and C12 applies (§6.12); C19 then doesn't need
-   R, because standalone checks never load the message.
+   R, because standalone checks never load the message. A drift already known from the share is the
+   exception (C11c, owner decision, 31 Oct): standalone checks can't see it end, and a same-name drift
+   looks like E to C12, so it stays red with its alert, its acks and R (`effective_origin` shows R's
+   origin while MSGNAM reads R's name) until a share-mode judgement clears it. When MSGNAM names
+   another message (something else selected at the printer, E's own name included when R's differs),
+   the best it gets is amber `unknown_while_down` with the origin unknown, and the drift alert stays
+   open, so the view stays red (§5.2 item 2). Standalone never raises a drift of its own.
 6. C11b exists because a running-message Load that keeps failing (a firmware update that changed the
    web page, or replies that never match) is a failed check (plan: "A failed or unrecognised read
    counts as a failed check"): without it a machine would stay green on its last good reading while
@@ -376,6 +383,13 @@ prev_key = (prev.state.code, frozenset(active alert keys in prev))      # ("", {
 6. otherwise                                      -> keep prev; no recheck (the next cycle starts afresh)
 ```
 
+Step 6 after a confirming Load that failed, or wasn't made (owner decision, 31 Oct): prev is kept, but
+the clock isn't reset. The next cycle, about 5 s later, loads again (`need_load`), and that Load is
+judged by these same steps. The worker counts the failed confirmations in a row, and the third commits
+amber `message_unchecked` ("can't check the message") until a Load and its second reading settle it
+(§6.5, failed confirmations). No single reading gives `drift` or its alert: amber only says the check
+failed.
+
 "Commit" means: `Judgement.state` is the new snapshot (`since` = prev's when the code is unchanged,
 else `reading.at`), `Judgement.alerts` is §4.2's list, `Judgement.facts` = F_new. "Keep prev" means:
 state and alerts unchanged, and `Judgement.facts` = the judged facts from prev with the display facts
@@ -403,8 +417,11 @@ list is empty (shouldn't happen), the change commits at once.
 Examples: a single stray PRIN `0` from a mixed-up reply makes a candidate `printing_off`; the second
 read gives `1`, so nothing changes. A confirm (E.confirmed becomes True) changes `unconfirmed` to
 `running_confirmed` without a second reading, because the same printer facts give the same outcome
-(step 2). After a Send, the poller's first Load shows the new message: if the outcome is
-`unconfirmed` either way it commits at once; if R doesn't match (drift), a second Load must agree.
+(step 2). After a Send, the poller's first Load shows the new message. With P's R (the previous
+message) the new E gives `drift`, which differs from the outcome of the new R, so step 4 applies: a
+second Load a second later must agree before `unconfirmed` commits. Meanwhile the view shows E's code
+in amber with the origin unknown (§5.1 step 2.7, §5.3 rule 0c). If R doesn't match E (drift), the
+second Load must agree too.
 
 ### 3.9 Headlines and details
 
@@ -599,9 +616,15 @@ clock (`ShareStore.poll_age`, `lock_age`, or the watcher's own `CounterWatch` in
    4. **Stale status**: `poll_age_s >= not_monitored_s`: `not_monitored`.
    5. **E not judged yet**: `expected` is not None, `expected.counter != poll.expected_counter`, and
       `expected_code(expected)` isn't None: that code. This covers the few seconds between a sender's
-      write and the poller's next cycle, so a card never shows the old origin as green right after a
-      Send.
+      write and the poller's commit of its first Loads of the new message.
    6. Otherwise `poll.state.code` (`checking` if `poll.state` is None).
+   7. **Never green on an R older than E** (an owner-approved divergence, 31 Oct): when the code from
+      steps 5 or 6 is GREEN, E isn't judged yet (`expected.counter != poll.expected_counter`) and R
+      doesn't match E (or there is no R), the code is `confirmed_with_notes` when E is confirmed, else
+      `unconfirmed` (both AMBER), with that code's headline. A sender who presses "Everything is right"
+      before the poller has read the new message back therefore sees amber "Printing, not fully
+      checked" with the origin unknown (§5.3 rule 0c) until the poller commits, never green with the
+      previous message's origin. Green needs a Load since E changed (§15 decision 36).
 3. Colour and headline: §5.2.
 
 ```python
@@ -620,7 +643,10 @@ def expected_code(e: ExpectedState) -> str | None:
 1. `code_colour = STATE_CODES[code]`, except `not_monitored`: RED or AMBER when the last known colour
    (P.state's colour, or `expected_code`'s colour when that is worse) was RED or AMBER, else GREY.
    NOT MONITORED never makes a machine look better than it last was; it only replaces green, blue and
-   grey.
+   grey. Standalone mode keeps the same rule for an origin mismatch (owner decision, 31 Oct): a machine
+   last known to print something other than E stays red with its drift alert and R's origin, and at
+   best turns amber `unknown_while_down`, until share mode judges it (§3.4 C11c, §6.12 item 3). Other
+   states start afresh in standalone, as before.
 2. Alerts colour the machine: an active alert with colour RED makes the machine RED whatever the code;
    an active alert with colour AMBER turns a GREEN or GREY code AMBER (never a BLUE, AMBER or RED one).
    Alerts without a colour change nothing. Acknowledged alerts still count.
@@ -656,10 +682,22 @@ def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) ->
     # 0. If poll and (poll.running_unchecked or (poll.state and poll.state.code == "message_unchecked")):
     #    ""  (unknown: the message can't be read, so neither the last reading nor E is shown as what
     #    prints, also when a higher code such as ink_out or rejected hides message_unchecked)
+    #    Also "" when poll isn't standalone and its code is unknown_while_down (a standalone finding
+    #    carried into share mode by a worker's start, §6.3 step 1). machine_view shows "" whenever its
+    #    code is `checking` (§2.1), and `printing` None then
     # 0b. If (poll is None or poll.running is None) and expected and expected.mode == "switch_pending":
     #    ""  (unknown: the new message was never read back running by the poller (a failure after the
     #    switch, Leave it, an interrupted Send, standalone), so E's origin is not shown as what prints,
     #    whatever code won)
+    # 0c. If R = poll.running is set, expected is set, expected.counter != poll.expected_counter (E not
+    #    judged yet) and R doesn't match expected: ""  (unknown: R was read before E was written, so
+    #    right after a Send it is the previous message; E changes that keep the message, such as a Stop,
+    #    a clock set or a Send that failed before the switch, still match and keep R's origin. Owner-
+    #    approved divergence, 31 Oct)
+    # 0d. If R and poll.standalone and (poll.message_name is None or norm_name(poll.message_name) !=
+    #    norm_name(R.name)): ""  (an origin mismatch's R carried into standalone, §3.4 C11c, §6.12 item
+    #    3: while MSGNAM names R's message, rule 2 shows R's origin, what prints, never E's; once MSGNAM
+    #    names another message, or wasn't read, the origin is unknown. Owner decision, 31 Oct)
     # 1. R = poll.running. If R and expected and expected.fingerprint != "" and R.origin_line == ""
     #    and R matches expected: expected.origin_line (the pre-printed case: "USA (pre-printed)" has
     #    no origin item on the printer, and the fingerprint proves the content is the one sent)
@@ -822,6 +860,16 @@ Every `heartbeat_s` (5 s), waiting with `clock.sleep(heartbeat_s, cancel)`:
    `silent_window_s` or more (the old poller stopped long ago), `bags_recent` is written as 0, because
    those bags are long past and must not make a printer that is now off look as if it went silent while
    printing. Log `polling_started` with the reason (`assigned`, `takeover`, `handover`, `restart`).
+   Second exception (owner-approved divergence, 31 Oct): after a long gap, when `poll_age` is
+   `not_monitored_s` or more, or P's `written_at` is that old by this PC's clock (every PC closed
+   overnight, where this PC has never seen the counter), nobody has judged the printer for that long,
+   and the copied state under a counter that moves again would show as just checked: a green
+   "Printing" with the origin from before an outage while the printer prints another one. So unless
+   P's state is RED or AMBER (kept as it is), the start writes the state `checking` (GREY, "Checking...",
+   origin unknown, §5.3), or, when this PC's last standalone check of the machine (§6.12 item 7) was RED
+   or AMBER, that check's state snapshot (only share mode clears those). Alerts and facts are copied as
+   usual, so judge still needs its evidence: unchanged facts commit at the first cycle (§3.8 step 2), a
+   change needs its second reading.
 2. Settle (storage.md §11.6): keep writing P every `poll_fast_s` (counter + 1, nothing else changed),
    and make the first request only after a lock read taken at least `hx_share.settle_s()` (6 s) after
    step 1's write still shows no lock. Then, right before the first request, the **rank check**: the
@@ -921,8 +969,17 @@ tick:
 R is reset as §3.3 says: when the cycle follows a paused tick (`lock_seen`), sees an E counter
 different from `P.expected_counter`, is the first cycle after a worker start (§6.3), or is the first
 cycle after the printer was unreachable, it must load the running message; if that Load fails, the
-reading has `running_reset = True` (and the next slow set, or `read_running_now`, brings the next
-try).
+reading has `running_reset = True`.
+
+A failed Load is tried again at the next cycle (owner decision, 31 Oct). Any Load that fails (a slow
+set's, a required one, a `read_running_now` one), and a confirming Load (a second reading's `"load"`,
+§3.8) that fails or isn't made because an earlier item of the second reading ended its requests, sets
+`need_load`: the next cycle, about 5 s later, makes a required Load instead of waiting for the next
+slow set. That Load is judged by the usual two-reading rule. A confirming Load that wasn't made
+confirms nothing: the second reading never keeps the first Load's R. The retries stop once the
+message check counts as failed and that judgement has committed (amber `message_unchecked`, §6.5);
+Loads then follow the slow set again, so the budget holds. One request at a time still applies: the
+retry is the next cycle's own Load.
 
 An exception that isn't an `HxError` (a bug) is caught at the top of the tick, printed with its
 traceback, logged as `internal_error`, and P is written with state code `internal_error` (RED), alerts
@@ -936,7 +993,7 @@ unchanged. The worker carries on at the next tick (architecture §8.1). `Cancell
 | PRIN, MSGNAM | `read` | every cycle |
 | bag counter | `read(Company.bag_counter)` | every cycle, unless `bag_counter == "none"` |
 | slow set: INKL, INKT, PHTP, DATE, TIME | `read` each | every `poll_slow_s` (60 s) |
-| running message | `load_slot(0, deadline=...)` | with each slow set; and in the first cycle after a paused tick, after E's counter changed, after the printer became reachable, after `E.reread_token` changed (set `P.reread_seen` to it), and when MSGNAM differs from R's name (`read_running_now`) |
+| running message | `load_slot(0, deadline=...)` | with each slow set; and in the first cycle after a paused tick, after E's counter changed, after the printer became reachable, after `E.reread_token` changed (set `P.reread_seen` to it), and when MSGNAM differs from R's name (`read_running_now`); and in the next cycle after a Load failed or a confirming Load failed or wasn't made, until the message check has committed as failed (§6.4, owner decision 31 Oct) |
 | daily item | one `read`, or `fonts(deadline=...)`/`firmware(deadline=...)` | one per cycle while a daily check is due (§6.10) |
 | clock set | DATE, TIME, then at most one TD and DATE, TIME again (§6.11) | in a cycle of its own, once per daylight-saving change |
 | second readings | 1 to 3 | only when the outcome would change (§3.8) |
@@ -957,17 +1014,40 @@ its previous value.
 successful running-message Load, or the worker's start, §6.3) and `loads_failed` (running-message
 Loads that failed in a row since the last success, the last paused tick or the last change of E's
 counter; any of those resets it to 0, and a worker start carries it from P, §6.3). A Load fails when
-it raises `WebReadFailed`, `NoReply` or `PrinterBusy`. `reading.running_unchecked = loads_failed >=
+it raises `WebReadFailed`, `NoReply`, `PrinterBusy` or `BadReply`. `reading.running_unchecked = loads_failed >=
 UNCHECKED_LOADS or now − load_ok_mono >= UNCHECKED_SLOW_SETS × poll_slow_s`; it is computed only in
-share mode (None in standalone, carrying the previous value). With Loads failing every slow set, the
-machine turns amber `message_unchecked` and the `message_unreadable` warning starts within 2 slow
-sets (about 2 minutes) and at the latest after 3 minutes. A successful Load sets `load_ok_mono =
+share mode (None in standalone, carrying the previous value). A failed Load is tried again at the
+next cycle (§6.4). When the retry fails too (`loads_failed` 2, and a failed required Load leaves R
+unknown), the machine turns amber `message_unchecked` and the `message_unreadable` warning starts,
+about 5 s after the first failure, and in any case within 3 minutes. A single failed Load followed by
+a good one changes nothing. A successful Load sets `load_ok_mono =
 now`, `loads_failed = 0` and `P.running_ok_at` to its wall time.
+
+Failed confirmations (owner decision, 31 Oct). A first Load that succeeds but reads a different R
+needs a second Load to agree (§3.8). Its success above (`loads_failed = 0`) must not hide a
+confirmation that keeps failing (a web client sharing the printer's one reply buffer can make every
+second Load fail), or the machine would stay green on the old R while every first Load reads another
+origin. So the worker also keeps `confirms_failed`: confirming Loads that failed (or weren't made) in
+a row, while a candidate waits for them. It is reset to 0 by a successful confirming Load (after that
+second reading is judged, so the second reading agrees with the first about `running_unchecked`), by a
+committed judgement whose R a successful Load of that cycle read, by a paused tick and by a change of
+E's counter; a worker start or takeover starts it at 0. A first Load that reads a mismatch never
+resets it. `reading.running_unchecked` is also True while `confirms_failed >= UNCHECKED_CONFIRMS`
+(3). After a failed confirmation the next cycle loads again (§6.4), so a single failure delays a red
+`drift` by one cycle (about 5 s), not a slow set. At the third failed confirmation in a row, when the
+second reading commits nothing, the worker judges that reading again as a first reading: R is unknown
+(the confirming Load failed) and `running_unchecked` is True, neither of which needs a second reading
+(§3.8 steps 3 and 4, `evidence`), so amber `message_unchecked` with `message_unreadable` commits at
+once, with the origin shown as unknown. Further Loads then follow the slow set again (the budget), and
+two agreeing Loads still decide `drift`. With 3, 40 % of Loads failing at random gives red or amber
+within about 20 s of the first Load after the change (§12.2 item 4).
 
 Budget per printer at the default timings, steady state: 3 requests every 5 s (36 a minute), plus 1
 HXUI, 5 slow reads and one Load (one Load request plus about one repeat) a minute: about 44 requests a
-minute, 0.73 a second, under the plan's 1 a second. No cycle sends more than 15 requests. Multi-value
-queries are never used (protocol.md refuses them).
+minute, 0.73 a second, under the plan's 1 a second. A failed Load adds one retry Load at the next cycle,
+and at most `UNCHECKED_CONFIRMS` retries follow failed confirmations before the slow set's pace
+returns, so a printer whose Loads always fail makes at most 2 Loads a minute. No cycle sends more
+than 15 requests. Multi-value queries are never used (protocol.md refuses them).
 
 ### 6.6 Requests that fail, and backoff
 
@@ -1150,9 +1230,19 @@ The share is down. Polling carries on only on PCs with the MapleJet monitor or t
    PC's own Sends still pause it). No slow set, no Load, no daily item, no clock set. HXUI is read at
    every standalone check because the cached data can't be refreshed meanwhile.
 3. Judging uses the same `judge` with `reading.standalone = True`, the last E read from the share (the
-   watcher's and the coordinator's cache), L = None, and prev = this PC's previous local status (None at
-   the first check). C3, C4, C11 and C11b are skipped and C12 gives `unknown_while_down` (§3.4). Second
-   readings apply as usual (1 s later).
+   watcher's and the coordinator's cache), L = None, and prev = this PC's previous local status. At the
+   first check prev is None, except for a known origin mismatch (owner decision, 31 Oct): when the
+   newest P this PC read from the share (the coordinator's last read, `seen_polls()`, or what this PC's
+   own worker last wrote, whichever has the higher counter) has the code `drift` or an active `drift`
+   alert, R set and not matching the cached E, and `expected_counter` equal to that E's counter, prev
+   is that P (its committed state, R, and open alerts with their acks) with `standalone` True and this
+   PC as `poller`. Only that is carried, so no other state becomes sticky. C3, C4, C11 and C11b are
+   skipped, C11c keeps a known drift (red, its alert open and sounding unless acknowledged, R's origin;
+   at best amber `unknown_while_down` once MSGNAM names another message), and C12 gives
+   `unknown_while_down` (§3.4). Standalone can't clear a carried drift; only share mode's own Loads
+   and second reading can. A PC that never read P for the machine (it started while the share was
+   already down) has nothing to carry: prev is None, as before. There are still no Loads, and one
+   request at a time per printer. Second readings apply as usual (1 s later).
 4. Results stay in memory: `local_statuses()` returns a `PollStatus` per machine, with `poller` = this
    PC's key, `counter` + 1 per check, and `standalone` True. Nothing is written to the share; log entries
    go through `DataService.append_log`, which queues them on this PC, with `"standalone": true`.
@@ -1160,7 +1250,12 @@ The share is down. Polling carries on only on PCs with the MapleJet monitor or t
    (10 s) ago on this PC, or when not in standalone mode.
 6. `next_check_s` (in `PollerUpdate`) is the time left to the next check.
 7. When the share is back, the coordinator leaves standalone mode, drops the local statuses, and starts
-   share mode from §6.2 (every start follows §6.3, settle included).
+   share mode from §6.2 (every start follows §6.3, settle included). A worker started by the first share
+   pass (still in standalone mode) gets this PC's local status of its machine, so its start write shows
+   a RED or AMBER standalone finding instead of `checking` (§6.3 step 1). A share P that holds a
+   standalone `unknown_while_down` shows the origin as unknown (§5.3 rule 0). A carried drift ends only
+   there: the share P still holds the drift with the same alert id, and the worker's first Load and its
+   second reading decide (owner decision, 31 Oct).
 
 ### 6.13 Share failures
 
@@ -1281,11 +1376,27 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
 3. **Standalone** (`poller.mode == "standalone"`): P = `poller.local_statuses()`, ages from the watcher's
    own `CounterWatch` over their counters, E and line statuses = the last good ones, L =
    `store.local_lock_info(printer_id)` for printers in `store.local_locks`, with `lock_ages[printer_id]
-   = 0.0`, and None otherwise, acks = this PC's own.
+   = 0.0`, and None otherwise, acks = the acks this watcher read from the share before the outage plus
+   this PC's own (a carried alert never rings again for an acknowledged occurrence). A machine with no
+   local status yet (before this PC's first standalone check of it) shows the last good P from the
+   share, its age still growing, as in item 4, so a red machine keeps its colour, alerts, sound and
+   origin over the change of mode instead of showing "Checking..." (owner decision, 31 Oct). A machine
+   whose P this watcher never read shows "Checking..." and then NOT MONITORED, as before.
 4. **Share down, poller idle**: the last good P, E and line statuses, with ages still growing (so every
-   machine becomes `not_monitored` after 30 s), `share_ok=False`.
+   machine becomes `not_monitored` after 30 s), `share_ok=False`. The last good P is the newer (by
+   counter) of the watcher's last read and what this PC's own worker last wrote, so a drift this PC
+   committed just before the outage shows red before any pass read it (owner decision, 31 Oct).
 5. `board = board_view(...)`; set `board.next_check_s` from the last `PollerUpdate`; set `latest`; post
-   `BoardUpdate(board)`.
+   `BoardUpdate(board)`. `latest` and its `BoardUpdate` change together under the watcher's lock, with
+   every own ack made during the pass applied first, so an `acknowledge()` while a pass reads the share
+   is never undone by that pass's board, and a pass that ends during `acknowledge()` is never replaced
+   by the older board (§4.5 item 2). The lock is never held across share I/O.
+6. Share mode, a P this watcher has not yet seen move whose `written_at` is `not_monitored_s` or more
+   old by this PC's clock while `poll_age` is still below `not_monitored_s` (storage.md §10 rule 1
+   counts a counter seen for the first time as fresh): its age is given as None, so it shows
+   `checking`, not last night's state as just checked, until it moves or becomes `not_monitored`
+   (owner-approved divergence, 31 Oct). Once seen moving, `written_at` is never used again, so a PC
+   whose clock is off never loses a P that is being written.
 
 `acknowledge(alert_ids: list[str]) -> None` (§11.3): records `Ack`s in memory at once, wakes the loop
 (the next board applies them), and queues the share writes, which the watcher thread makes after
@@ -1300,24 +1411,28 @@ The production-schedule PC runs Stripes with the MapleJet monitor in floor-board
 ui.md). Content and order come from `floor_board_rows(board)` and `board_banner(board)`; ui.md draws
 them.
 
-Layout (top to bottom):
+Layout (top to bottom; ui.md §10.3 has the drawing rules, sizes and examples, and is the one to
+follow where this summary is shorter):
 
 1. A header line: "MapleJet floor board", the time, and `board_banner(board)` when it isn't None
    (with Refresh now in standalone mode, enabled per `refresh_now_min_s`).
-2. One big row per machine, in `floor_board_rows` order, all rows the same height, filling the screen
-   (at most 12 rows at full size; beyond that the rows shrink to fit, never scroll). Each row, left to
-   right:
+2. The machines in `floor_board_rows` order, grouped under a band per line with the line's name (half
+   a row tall). Every row has the same height, filling the screen (at most a quarter of it each, never
+   under 44 px); rows that can't all fit scroll, with a scrollbar shown only then. Each row, left to
+   right, in fixed columns:
 
    | Part | Content | Share of the row width |
    |---|---|---|
-   | colour bar | `FloorRow.colour` (`COLOUR_HEX`), full height; flashes (1 s on, 1 s off) while the machine has `unacked_sound` | 3 % |
-   | names | `line_name` above `machine_name` | 17 % |
-   | origin | `origin_line` in a `BagText` in the largest type of the board, or "(origin unknown)" | 45 % |
-   | status | `text(status)` in large type, in the row's colour | 25 % |
-   | age | `checked_text(checked_age_s)`; "NOT MONITORED" rows are drawn desaturated (grey text) | 10 % |
+   | colour bar | `FloorRow.colour` (`COLOUR_HEX`), full height; flashes (on and off every `FLOOR_FLASH_MS`) while the machine has `unacked_sound` | 2.5 % |
+   | name | the machine's name without its line's name in front (`short_name`, ui.md §10.3) | 14 % |
+   | origin | `origin_line` in the bag font, every origin on the board at one size (the largest at which the longest fits), never shortened; or "(origin unknown)" | 44 % |
+   | status | `text(status)` in the row's colour | 27 % |
+   | age | `checked_text(checked_age_s)`; "NOT MONITORED" rows are drawn desaturated (grey text) | 12.5 % |
 
-3. Rows of one line sit together under a thin divider. When a line's origins differ, each of its rows
-   still shows its own origin, so every origin is listed.
+   Nothing wraps: a name, status or age too long for its column is drawn smaller, then ends in "…".
+3. Rows of one line sit together under their band, with a thin divider between rows; a heavier rule
+   divides the lines. When a line's origins differ, each of its rows still shows its own origin, so
+   every origin is listed.
 4. The floor-board PC rings for alerts with the `"floor"` recipient (`sounding_alerts(...,
    floor_board=True)`). Its Acknowledge button appears only when the signed-in user may acknowledge
    (§4.5).
@@ -1625,7 +1740,7 @@ storage.md §5.2's field list.
 
 ```python
 FOREIGN_MIN, FOREIGN_WINDOW_S, FOREIGN_CLEAR_S, MAX_BAGS_PER_S, DAILY_S, DST_KEEP_S, ACK_RETRY_S  # §6.1
-UNCHECKED_LOADS, UNCHECKED_SLOW_SETS                                                     # §6.1
+UNCHECKED_LOADS, UNCHECKED_SLOW_SETS, UNCHECKED_CONFIRMS                                 # §6.5
 def dst_change_id(at: float, new_offset_s: float, *, offset_fn) -> str                   # §6.11
 
 class Poller:                         # additions to architecture §6.8
@@ -1697,7 +1812,12 @@ message, and stale `LockInfo`s for every purpose.
    (counter mismatch shows `unconfirmed` while P says `running_confirmed`); RED alert colours a GREY
    code and takes the headline; AMBER warning turns GREEN amber but not BLUE; every button flag of
    §5.3, including Resume refused for rejected, resume-blocked, unconfirmed and failed; `effective_origin`
-   for a pre-printed film, a drifted message and a name mismatch in standalone.
+   for a pre-printed film, a drifted message and a name mismatch in standalone. An unjudged E (counter
+   6 or 7, `P.expected_counter` 5, P.running the old message): unconfirmed gives AMBER with origin
+   `""`; confirmed gives AMBER `confirmed_with_notes` with origin `""` (never GREEN, never the old
+   origin), also on the floor row; P already holding the new message stays GREEN with its origin; a
+   failure before the switch and a Stop keep R's origin; a judged drift keeps R's origin. The first
+   Load of the new message after a Send asks for a second Load (§3.8).
 9. **Lines and board**: `worst` order and empty list; line colour = worst machine; `origins_differ` with
    two printing origins (and not when one machine is stopped); its AMBER and headline; "NOT MONITORED"
    line headline; `natural_key` ordering ("Line 2" before "Line 10"); `not_set_up` for a missing,
@@ -1732,6 +1852,14 @@ message, and stale `LockInfo`s for every purpose.
     BLUE `action_in_progress` with the headline key `action_in_progress:other`.
 18. **Not from Stripes**: no E and printing on gives `not_from_stripes` with the no-sound warning
     `not_from_stripes` to the notify user only; printing off ends it.
+19. **A known drift in standalone** (C11c, owner decision 31 Oct): prev with the code `drift`, its alert
+    and a wrong R, and the same E counter: a standalone reading keeps `drift` and the same alert id,
+    acknowledged or not, also when the printer doesn't answer (the code is then the printer's); MSGNAM
+    naming another message (or E's name when R's differs) gives `unknown_while_down` with the alert
+    open, the view RED, sounding, origin `""`; MSGNAM naming R's message again gives `drift`.
+    `effective_origin` is R's origin while MSGNAM names R's message, else `""`. Not carried for a newer
+    E, a stopped or rejected machine, or a failure after the switch; standalone never raises a drift of
+    its own; share mode decides from R as before.
 
 ### 12.2 test_hx_poller.py (FakeWorld, FakePrinter, scaled timings or FakeClock)
 
@@ -1747,7 +1875,19 @@ of real time.
    fake sees no request until release; after release the first cycle has HXUI and a Load.
 4. **Drift needs two Loads**: change the fake's slot 9 content behind Stripes' back (same name):
    `drift` is committed only after two Loads disagree; a single `web_reply_hook` that corrupts one Load
-   commits nothing.
+   commits nothing. Owner decision, 31 Oct: a confirming Load that fails once gives `drift` about one
+   cycle later (`need_load`), not a slow set later; so does a failed first Load (the slow set's Load
+   fails right after the change). A single failed Load of an unchanged message: one retry, still green,
+   no alert, then the slow set's pace. Every Load failing: amber `message_unchecked` about one cycle
+   after the first failure, then one Load a slow set. Every confirming Load failing (every second Load
+   junk): amber `message_unchecked` with `message_unreadable` and origin `""` within
+   `UNCHECKED_CONFIRMS` cycles of the first good Load that read the other origin, never green after it,
+   and the Loads back at the slow set's pace; working Loads then give `drift` (never `drift` from
+   single Loads: two must agree). 40 % of Loads failing at random (10 seeds): never green longer than
+   `UNCHECKED_CONFIRMS` cycles after the first good Load that read the other origin, red or amber
+   within about 20 s of the first Load after the change, and within a slow set plus 15 s of the change.
+   A second reading whose PRIN gets no reply (so its Load is never made) commits neither the first
+   reading's PRIN nor its R.
 5. **A stray PRIN**: `override("PRIN", "0")` for one reply: no state change; for two in a row:
    `printing_off` with its alert.
 6. **Unreachable**: `go_silent()` after `print_bags(10)`: `unreachable_printing` and `went_silent` after
@@ -1787,7 +1927,16 @@ of real time.
     `lock_stale_s`, mode `standalone`, checks every `standalone_poll_s` with quick items only (no Load
     in the fake's `requests`),
     `local_statuses()` filled, no drift alert; `refresh_now()` twice within 10 s returns True then
-    False; without the monitor open the mode is `idle` and no request is made.
+    False; without the monitor open the mode is `idle` and no request is made. Owner decision, 31 Oct:
+    a same-name drift known in share mode (from this PC's own worker, and on a PC that only watches,
+    from its coordinator's last read) stays red `drift` for the whole outage with the same alert id,
+    its ack (this PC's own, or one its watcher read from the share before the outage), R's origin and
+    its sound, on every board sample from the share going down, over the change of mode and the
+    seconds before the first standalone check, until share mode judges it (card, floor row, line card,
+    `sounding_alerts`), also when the message is put back at the printer; another message selected at
+    the printer gives amber `unknown_while_down` with the alert open (the view stays red, origin
+    unknown); share mode then clears it with two Loads; a drift judged against an older E isn't
+    carried, and a PC that never read P starts its checks afresh. No Load in standalone.
 14. **Waiting recipients**: an alert to a notify user with no heartbeat logs `alert_waiting` once; a
     heartbeat for that user (another store) logs `alert_reached`.
 15. **Handover and stop**: `stop()` writes `yielded_to` and removes the heartbeat; a returning rank-0 PC
@@ -1829,6 +1978,17 @@ of real time.
     start a worker, the rank-1 one yields at its rank check before any request (`polling_stopped`
     reason `rank`, P with `yielded_to` naming rank 0), exactly one worker sends requests, and the
     fake's `max_in_flight == 1` with no "two requests in flight" violation.
+25. **After a long gap** (§6.3 step 1, §7 item 6): the share comes back after standalone checks found
+    printing off, a message changed at the panel, or the printer silent, and again with no monitor
+    open: no board sample is GREEN, and none shows the old origin, until a share-mode judgement; an
+    unchanged printer is GREEN again after its checks. The first PC started an hour after every PC
+    closed, with the message changed overnight: `checking`, then `drift`, never last night's green; the
+    message fixed overnight: last night's red until share mode judges it green. A quick takeover keeps
+    P's state.
+26. **Acks racing a pass** (§7 item 5): an `acknowledge()` while the watcher's pass builds its board
+    (from `board_view`, and with real threads during a slow lock read) leaves every later board quiet;
+    a pass that ends inside `acknowledge()` leaves `latest` and the last `BoardUpdate` as the newer
+    board, with the ack applied.
 
 ### 12.3 test_hx_sim.py (shared with storage.md and protocol.md)
 
@@ -1838,7 +1998,8 @@ it needs `hx_send` (WP5) for the Sends from two PCs.
 States-related assertions: with every poller gone, every machine is `not_monitored` on a remaining
 watcher after 30 s (scaled); a takeover keeps alert ids (no second `alert_started` for the same
 occurrence); an acknowledgement on one simulated PC silences `sounding_alerts` on every other within
-one `watch_s` (scaled).
+one `watch_s` (scaled); a sender confirming the moment a Send ends never sees the previous origin, nor
+GREEN with an origin the fake isn't printing, in the views sampled until the poller commits.
 
 Two cases from the review:
 
@@ -1932,7 +2093,9 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
 9. **NOT MONITORED never makes a machine look better**: it keeps a last known red or amber and greys
    only green, blue and grey.
 10. **An E the poller hasn't judged yet is shown at once** (`expected_counter` in P), so a card never
-    shows the old message as green right after a Send.
+    shows the old message as green right after a Send. Until the poller has judged it, an R that
+    doesn't match E shows the origin as unknown and caps the colour at amber, also after a quick
+    confirm (owner-approved divergence, 31 Oct).
 11. **Alert ids** are `<machine>.<kind>.<send or run id>` for alerts tied to a Send or test, and
     `<machine>.<kind>.<start ms>` otherwise; recipients are fixed when the alert starts; alerts continue
     across a poller takeover.
@@ -1973,7 +2136,11 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
 25. **Standalone mode** judges with the cached E and no locks, skips crash recovery and drift, shows
     `unknown_while_down` when the message name differs from the last Send on record or can't be read
     (and while printing hasn't been read), logs with
-    `"standalone": true`, and keeps acks local.
+    `"standalone": true`, and keeps acks local. Owner decision, 31 Oct: a known origin mismatch is
+    seeded from the last P this PC read and stays red, with its alert, acks and the read-back origin,
+    at best amber `unknown_while_down` once another message is selected, until share mode clears it
+    (standalone has no Loads, so it can neither see a drift nor see one end). Only that is carried;
+    other states start afresh. The board keeps the last P until the first standalone check.
 26. **Acknowledging** is per alert; the card buttons acknowledge every active alert of the machine or
     line. The acknowledging PC goes quiet at once; the others within one `watch_s`.
 27. **The alert sound** is `alert.wav` looped every 3 s; no snooze; the floor board rings only for
@@ -2001,7 +2168,11 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
     (drift, red). Standalone checks read HXUI every time.
 36. **A running message that can't be read is a failed check**: amber `message_unchecked` with a
     no-sound warning, green needs a successful Load since E last changed, and the origin shows as
-    unknown meanwhile.
+    unknown meanwhile. A failed Load, and a confirming Load that fails, are failed checks too (owner
+    decision, 31 Oct): the next cycle loads again instead of waiting a slow set, and three failed
+    confirmations in a row give amber `message_unchecked`, so a good Load that read another origin
+    never leaves the machine green. The two-reading rule is unchanged: amber says only that the check
+    failed.
 37. **P stays fresh while the poller works**: P is rewritten before any request when 5 s have
     passed, no request may outlive `stale_s / 2 + http_timeout_s` after the start of the last good P
     write (the lock is read before that check, and every request carries the time as its deadline,
@@ -2011,3 +2182,9 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
 38. **Standalone checks start after `lock_stale_s` of continuous outage**, so a short outage on one PC
     never overlaps the other PCs' polling; a longer partial outage is the residual risk named in
     architecture §7.3 rule 7.
+39. **Nothing old is shown as just checked** (owner-approved divergences, 31 Oct): a worker starting
+    after a long gap (a share outage, every PC closed overnight) writes `checking`, or this PC's red or
+    amber standalone finding, until its first judgement, and keeps a red or amber P as it is; a watcher
+    shows a P it has never seen move, written long ago, as `checking`; and `checking` shows no origin.
+    So the old origin is never green "Printing" after a gap, and a red or amber never turns green before
+    a share-mode reading.

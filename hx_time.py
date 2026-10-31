@@ -159,10 +159,11 @@ def recent_dst_change(utc, *, within_s=86_400.0, offset_fn=local_utc_offset):
 
 
 def parse_host(host):
-    """"time.example.local" -> ("time.example.local", 123); "127.0.0.1:4123" -> ("127.0.0.1", 4123)."""
+    """"time.example.local" -> ("time.example.local", 123); "127.0.0.1:4123" -> ("127.0.0.1", 4123).
+    Only ASCII digits count as a port: "²".isdigit() is True but int("²") raises."""
     if host.count(":") == 1:
         name, port = host.split(":")
-        if port.isdigit():
+        if port.isascii() and port.isdigit():
             return name, int(port)
     return host, SNTP_PORT
 
@@ -219,12 +220,12 @@ class TimeSource:
             hosts = list(self._hosts)
         # The queries run outside the lock
         for host in hosts:
-            name, port = parse_host(host)
             try:
+                name, port = parse_host(host)
                 utc = self.query(name, port=port, timeout_s=self.timeout_s)
                 offset = float(utc) - self.clock.time()
             except Exception:
-                continue         # TimeServerError, or anything else a query may raise: next host
+                continue         # TimeServerError, or anything else a host or query may raise: next host
             answer = _Answer(host=host, offset_s=offset, at=self.clock.monotonic())
             with self._lock:
                 self._answer = answer

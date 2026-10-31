@@ -100,7 +100,10 @@ READ_RETRY_S = (0.05, 0.1, 0.2)
 REPLACE_RETRY_S = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
 POOL_IDLE, POOL_MAX = 4, 16
 CLOCK_BACK_TOLERANCE_S = 300.0
-NETWORK_WINERRORS = frozenset({51, 53, 54, 59, 64, 67, 121, 1222, 1231, 1232, 1236, 2250})
+# 55, 1203 and 1225 aren't in storage.md's first list: CPython maps them to EINVAL, so only this set
+# can tell them from a folder error (storage.md §9.2). 58 stays out: some NAS boxes give it for an
+# operation they don't support, on a share that works
+NETWORK_WINERRORS = frozenset({51, 53, 54, 55, 59, 64, 67, 121, 1203, 1222, 1225, 1231, 1232, 1236, 2250})
 
 ENVELOPE_KEYS = ("format_version", "file_type")
 JSON_FILE_TYPES = ("company", "changes", "line", "machine", "printer", "adjustment", "calibration",
@@ -256,7 +259,10 @@ def _too_new(rel, found):
 def decode_json(raw, *, file_type, rel):
     """The dict of a v2 JSON file, envelope included. ValueError when damaged, FormatTooNew when
     a newer Stripes wrote it. A BOM is accepted. Older formats are upgraded in memory."""
-    d = json.loads(bytes(raw).decode("utf-8-sig"))
+    try:
+        d = json.loads(bytes(raw).decode("utf-8-sig"))
+    except RecursionError:      # a hand-edited file nested thousands deep is damage too (§3.2)
+        raise ValueError(f"{rel}: damaged (nested too deeply)") from None
     if not isinstance(d, dict):
         raise ValueError(f"{rel}: damaged (not an object)")
     version = d.get("format_version")
@@ -279,11 +285,23 @@ def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _finite(value):
+    """value as a finite float, or None: not a number, NaN, infinity, or an int too big for a float
+    (json.loads takes a 400-digit int, and float() of it raises OverflowError)."""
+    if not _is_number(value):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _lenient_json(raw):
     """The object in raw, without any checks, or None (for the stable keys of a newer file)."""
     try:
         d = json.loads(bytes(raw).decode("utf-8-sig"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return d if isinstance(d, dict) else None
 
@@ -428,7 +446,7 @@ def decode_log(raw):
     try:
         marker = json.loads(line2.decode("utf-8"))
         stored = json.loads(line1.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not (isinstance(marker, dict) and len(marker) == 1 and isinstance(marker.get("end"), str)):
         return None
@@ -1656,10 +1674,10 @@ class ShareStore:
             # An ack from a newer Stripes still means acknowledged (alert_id is a stable key)
             stable = d[0]
             if stable.get("alert_id") == alert_id:
-                at = stable.get("at")
+                at = _finite(stable.get("at"))
                 ack = Ack(alert_id=alert_id, by=stable.get("by") if isinstance(stable.get("by"), str) else "",
                           computer=stable.get("computer") if isinstance(stable.get("computer"), str) else "",
-                          at=float(at) if _is_number(at) else 0.0)
+                          at=at if at is not None else 0.0)
         if ack is None or ack.alert_id != alert_id:
             return None
         with self._lock:
@@ -2258,7 +2276,7 @@ class ReachMemory:
         if local is not None:
             try:
                 value = local.read_local_json("reach.json").get("last_printer_reach")
-                stored = float(value) if _is_number(value) and math.isfinite(value) else None
+                stored = _finite(value)
             except OSError:
                 stored = None
         self.last_printer_reach = stored
@@ -2394,12 +2412,14 @@ class LocalStore:
                 parts[name] = records
             company = from_json(Company, d["company"])
             reached = d.get("reached_at")
-            if reached is not None and not _is_number(reached):
-                raise ValueError("reached_at")
+            if reached is not None:
+                reached = _finite(reached)
+                if reached is None:
+                    raise ValueError("reached_at")
         except (KeyError, ValueError, TypeError):
             return None
         return HxData(company=company, **parts, source="local", loaded_at=self.clock.time(),
-                      reached_at=float(reached) if reached is not None else None)
+                      reached_at=reached)
 
     def write_local_copy(self, data, *, changes_counter=None):
         """One consistent set, written whole then swapped in: every record, but only active films

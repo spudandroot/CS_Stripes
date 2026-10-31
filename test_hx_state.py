@@ -1328,6 +1328,183 @@ class MessageCheckTests(unittest.TestCase):
         self.assertEqual(hs.effective_origin(poll("ink_out"), expected()), ORIGIN)
 
 
+class UnjudgedOriginTests(unittest.TestCase):
+    """§5.1 step 2.5 and §5.3 rule 0c: right after a Send, P still holds the message from before it (OLD,
+    judged against E counter 5) while E (counter 6) names the new one. Until the poller judges E, the
+    old origin is never shown as printing, and the machine is never green."""
+
+    def test_unconfirmed_send_shows_the_origin_unknown(self):
+        p = poll("running_confirmed", running=OLD, message_name=OLD.name, expected_counter=5)
+        e = expected("running", counter=6, confirmed=False, confirmed_by="")
+        v = hs.machine_view(MACHINE, p, 1.0, e, None, None, {})
+        self.assertEqual((v.code, v.colour), ("unconfirmed", AMBER))
+        self.assertEqual(v.origin_line, "")
+        self.assertNotEqual(v.origin_line, OLD.origin_line)
+
+    def test_confirmed_before_the_poller_judged_is_amber_not_green(self):
+        p = poll("running_confirmed", running=OLD, message_name=OLD.name, expected_counter=5)
+        for notes in ([], ["pc_time"]):
+            e = expected("running", counter=7, notes=notes)          # the sender pressed "Everything is right"
+            v = hs.machine_view(MACHINE, p, 1.0, e, None, None, {})
+            self.assertEqual((v.code, v.colour), ("confirmed_with_notes", AMBER), notes)
+            self.assertEqual(v.headline, Msg(hs.STATE_TEXTS["confirmed_with_notes"]))
+            self.assertEqual(v.origin_line, "")
+            self.assertEqual(v.confirm_pending_by, "")
+            board = hs.board_view(DATA, {MID: p}, {MID: 1.0}, {MID: e}, {}, {}, {}, {}, share_ok=True,
+                                  standalone=False, now=T0)
+            row = next(r for r in hs.floor_board_rows(board) if r.machine_id == MID)
+            self.assertEqual((row.colour, row.origin_line), (AMBER, ""))
+        # The same from P's own green state (E's code unknown to the view: an orphan switch_pending)
+        v = hs.machine_view(MACHINE, p, 1.0, expected("switch_pending", counter=6), None, None, {})
+        self.assertEqual((v.colour, v.origin_line), (AMBER, ""))
+        # A fresh lock is still blue
+        v = hs.machine_view(MACHINE, p, 1.0, expected(counter=7), lock("send"), 5.0, {})
+        self.assertEqual(v.colour, BLUE)
+
+    def test_the_new_message_already_read_stays_green(self):
+        # P already holds the new message (the poller judged the Send) and the confirm is newer
+        p = poll("unconfirmed", running=NEW, expected_counter=6)
+        v = hs.machine_view(MACHINE, p, 1.0, expected(counter=7), None, None, {})
+        self.assertEqual((v.code, v.colour, v.origin_line), ("running_confirmed", GREEN, ORIGIN))
+
+    def test_e_changes_that_keep_the_message_keep_its_origin(self):
+        # A Send that failed before the switch keeps the previous message in E: R matches E
+        before = expected("running", counter=6, failure=failure(), message_name=OLD.name, slot=OLD.slot,
+                          fingerprint=OLD.fingerprint, origin_line=OLD.origin_line)
+        p = poll("running_confirmed", running=OLD, message_name=OLD.name, expected_counter=5)
+        v = hs.machine_view(MACHINE, p, 1.0, before, None, None, {})
+        self.assertEqual((v.code, v.colour, v.origin_line), ("failed_before_switch", RED, OLD.origin_line))
+        # A Stop, a clock set: same message
+        stop = expected("stopped_by_user", counter=6, stopped_by=AKIM, stop_reason="user")
+        self.assertEqual(hs.machine_view(MACHINE, poll(), 1.0, stop, None, None, {}).origin_line, ORIGIN)
+        self.assertEqual(hs.machine_view(MACHINE, poll(), 1.0, expected(counter=6), None, None, {}).colour, GREEN)
+
+    def test_once_judged_r_shows_what_prints(self):
+        # Counters equal: a drift keeps showing what the printer read back
+        p = poll("drift", running=OLD, expected_counter=5)
+        v = hs.machine_view(MACHINE, p, 1.0, expected(counter=5), None, None, {})
+        self.assertEqual((v.colour, v.origin_line), (RED, OLD.origin_line))
+
+    def test_first_load_after_a_send_needs_a_second_load(self):
+        # §3.8: with the old R the new E is drift, so the first Load of the new message is confirmed by a
+        # second one (a second later, in the same cycle) before "unconfirmed" commits
+        p = poll("running_confirmed", running=OLD, message_name=OLD.name, expected_counter=5)
+        e = expected("running", counter=6, confirmed=False, confirmed_by="")
+        first = judge(p, reading(running=NEW), e)
+        self.assertFalse(first.committed)
+        self.assertEqual(first.recheck, ["load"])
+        self.assertEqual(commit_second(p, reading(running=NEW), e).state.code, "unconfirmed")
+
+
+class StandaloneKnownDriftTests(unittest.TestCase):
+    """§3.4 C11c (owner decision, 31 Oct): a drift known from the share stays in standalone mode."""
+    WRONG = dataclasses.replace(NEW, origin_line="Product of Mexico", fingerprint="c" * 64)
+
+    def drifted(self, **kw):
+        return poll("drift", **{"running": self.WRONG, "alerts": [alert("drift")], "expected_counter": 5, **kw})
+
+    def test_carried_with_its_alert_and_ack(self):
+        prev = self.drifted()
+        r = reading(running=None, standalone=True)
+        out = classify(hs.facts_from(prev, r), expected(), prev=prev, standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("drift", ["drift"]))
+        j = judge(prev, r, expected())
+        self.assertTrue(j.committed)
+        self.assertEqual(j.state.code, "drift")
+        self.assertEqual([a.id for a in j.alerts], [prev.alerts[0].id])
+        acked = self.drifted(alerts=[alert("drift", acked_by=AKIM, acked_at=T0)])
+        j = judge(acked, r, expected())
+        self.assertEqual((j.state.code, j.alerts[0].acked_by), ("drift", AKIM))
+        # Not answering: the alert stays (red), even acknowledged; the code is the printer's
+        silent = dataclasses.replace(r, reachable=False, failures=1, printing=None, message_name=None)
+        idle = dataclasses.replace(acked, bags_recent=0)          # no bags: off, not went_silent
+        out = classify(hs.facts_from(idle, silent), expected(), prev=idle, standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("off", ["drift"]))
+        # MSGNAM another name: at best amber unknown_while_down, the drift alert still open (only share mode
+        # clears it), so the view stays red, with the origin unknown
+        other = dataclasses.replace(r, message_name="SOMETHING-ELSE")
+        out = classify(hs.facts_from(prev, other), expected(), prev=prev, standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("unknown_while_down", ["drift"]))
+        j = commit_second(prev, other, expected())
+        self.assertEqual((j.state.code, [a.id for a in j.alerts]), ("unknown_while_down", [prev.alerts[0].id]))
+        st = poll(state=j.state, alerts=j.alerts, running=self.WRONG, message_name="SOMETHING-ELSE",
+                  standalone=True)
+        v = hs.machine_view(MACHINE, st, 1.0, expected(), None, None, {})
+        self.assertEqual((v.colour, v.origin_line, v.unacked_sound), (RED, "", True))
+        # A drift to another name, and E's name selected again at the printer: the content can't be
+        # checked, so never green either
+        named = self.drifted(running=dataclasses.replace(self.WRONG, name="SOMETHING-ELSE"),
+                             message_name="SOMETHING-ELSE")
+        out = classify(hs.facts_from(named, r), expected(), prev=named, standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("unknown_while_down", ["drift"]))
+        still = dataclasses.replace(r, message_name="SOMETHING-ELSE")
+        out = classify(hs.facts_from(named, still), expected(), prev=named, standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("drift", ["drift"]))
+
+    def test_not_carried(self):
+        prev = self.drifted()
+        r = reading(running=None, standalone=True)
+        # A newer E than the one P's drift was judged against
+        out = classify(hs.facts_from(prev, r), expected(counter=6), prev=prev, standalone=True)
+        self.assertNotIn("drift", kinds(out))
+        # A stopped or rejected machine, a Send that failed after the switch
+        for e in (expected("stopped_by_user", stopped_by=AKIM, stop_reason="user"), expected(rejected=True),
+                  expected("switch_pending", failure=failure(True))):
+            self.assertNotEqual(classify(hs.facts_from(prev, r), e, prev=prev, standalone=True).code, "drift", e)
+        # Standalone never raises a drift of its own
+        fresh = poll(running=None, standalone=True)
+        out = classify(hs.facts_from(fresh, r), expected(), prev=fresh, standalone=True)
+        self.assertEqual((out.code, kinds(out)), ("running_confirmed", []))
+        # Share mode is unchanged: C11 decides from R
+        self.assertEqual(classify(facts(running=NEW), expected(), prev=prev).code, "running_confirmed")
+
+    def test_origin(self):
+        st = self.drifted(standalone=True)
+        self.assertEqual(hs.effective_origin(st, expected()), "Product of Mexico")
+        # MSGNAM isn't R's name any more (renamed at the printer), or wasn't read: unknown
+        self.assertEqual(hs.effective_origin(dataclasses.replace(st, message_name="SOMETHING-ELSE"), expected()), "")
+        self.assertEqual(hs.effective_origin(dataclasses.replace(st, message_name=None), expected()), "")
+        v = hs.machine_view(MACHINE, st, 1.0, expected(), None, None, {})
+        self.assertEqual((v.code, v.colour, v.origin_line), ("drift", RED, "Product of Mexico"))
+
+
+class CheckingAfterAGapTests(unittest.TestCase):
+    """§6.3 step 1 (owner-approved divergence, 31 Oct): a worker starting after a long gap writes P with the
+    code checking until its first judgement; the view shows no origin and no printing for it."""
+
+    def test_checking_shows_nothing_as_printing(self):
+        p = poll(state=MachineSnapshot(code="checking", colour=GREY, headline=Msg(hs.STATE_TEXTS["checking"]),
+                                       since=T0))
+        v = hs.machine_view(MACHINE, p, 1.0, expected(), None, None, {})
+        self.assertEqual((v.code, v.colour, v.origin_line, v.printing, v.monitored), ("checking", GREY, "", None, True))
+        # A carried red alert still colours it
+        v = hs.machine_view(MACHINE, dataclasses.replace(p, alerts=[alert("drift")]), 1.0, expected(), None, None, {})
+        self.assertEqual((v.colour, v.origin_line), (RED, ""))
+        # A status of unknown age is "Checking..." too
+        v = hs.machine_view(MACHINE, poll(), None, expected(), None, None, {})
+        self.assertEqual((v.code, v.origin_line, v.printing), ("checking", "", None))
+        board = hs.board_view(DATA, {MID: p}, {MID: 1.0}, {MID: expected()}, {}, {}, {}, {}, share_ok=True,
+                              standalone=False, now=T0)
+        self.assertFalse(board.lines[0].origins_differ)
+
+    def test_a_standalone_finding_carried_into_share_mode(self):
+        # The start P holds this PC's standalone unknown_while_down: the message is unknown, so is the origin
+        p = poll("unknown_while_down")
+        self.assertEqual(hs.effective_origin(p, expected()), "")
+        self.assertEqual(hs.effective_origin(dataclasses.replace(p, standalone=True), expected()), ORIGIN)
+
+    def test_judged_from_checking_like_any_change(self):
+        # The first cycle after the start: unchanged facts commit at once, a change needs its second reading
+        p = poll(state=MachineSnapshot(code="checking", colour=GREY, headline=Msg(hs.STATE_TEXTS["checking"]),
+                                       since=T0))
+        j = judge(p, reading(), expected())
+        self.assertEqual((j.committed, j.state.code), (True, "running_confirmed"))
+        j = judge(p, reading(printing=False), expected())
+        self.assertFalse(j.committed)
+        self.assertEqual(j.recheck, ["PRIN"])
+        self.assertEqual(j.state.code, "checking")
+
+
 class OriginAfterFailureTests(unittest.TestCase):
     def test_failed_content_check(self):
         e = expected("switch_pending", failure=failure(True))

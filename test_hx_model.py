@@ -433,6 +433,24 @@ class TypeRuleTests(unittest.TestCase):
                                     "placement": "delay", "encoder_ppr": 5000.5})
         self.assertIn("Machine.encoder_ppr", str(caught.exception))
 
+    def test_rule_8_a_number_no_float_can_hold_is_a_value_error(self):
+        # storage.md §3.2: ValueError means "damaged". json.loads takes a 400-digit int (under its
+        # 4300-digit limit), 1e400 (inf) and NaN, and a hand-edited poll.json can hold them; float()
+        # of the int raised OverflowError, which got past every reader that catches ValueError
+        raw = '{"machine_id": "mc", "printer_id": "pr", "poller": "k", "clock_offset_s": ' + "9" * 400 + "}"
+        self.assertRefused(m.PollStatus, json.loads(raw), "PollStatus.clock_offset_s")
+        for bad in ("1e400", "-1e400", "Infinity", "-Infinity", "NaN"):
+            with self.subTest(bad=bad):
+                self.assertRefused(m.PollStatus, json.loads('{"machine_id": "mc", "printer_id": "pr", '
+                                                            '"poller": "k", "written_at": ' + bad + "}"),
+                                   "PollStatus.written_at")
+        self.assertRefused(m.ExpectedState, {"machine_id": "mc", "confirmed_at": int("9" * 400)},
+                           "ExpectedState.confirmed_at")      # an optional float field, too
+        self.assertRefused(m.RunningMessage, {"slot": 9, "name": "N", "fingerprint": "f", "origin_line": "o",
+                                              "read_at": float("nan")}, "RunningMessage.read_at")
+        self.assertEqual(m.from_json(m.PollStatus, {"machine_id": "mc", "printer_id": "pr", "poller": "k",
+                                                    "clock_offset_s": 10 ** 300}).clock_offset_s, 1e300)
+
     def test_identity_from_json(self):
         ident = m.from_json(m.Identity, {"user": "EXAMPLE\\jsmith", "computer": "FLOOR01",
                                          "sids": ["S-1-1-0", "S-1-1-0"], "pid": 7})

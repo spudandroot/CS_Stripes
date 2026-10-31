@@ -522,13 +522,15 @@ class LineBoardTests(UiCase):
         self.assertEqual(list(card.rows), ["mc_1", "mc_2", "mc_3"])
         self.assertEqual(card.name_label.cget("text"), "Line 1")
         rows = card.rows
-        # Origins are bag text; "" shows "(origin unknown)" next to an empty BagText
+        # Origins are bag text; "" shows "(origin unknown)" in place of the emptied BagText
         self.assertIsInstance(rows["mc_1"].origin, hx_ui_common.BagText)
         self.assertEqual(rows["mc_1"].origin.get(), "Product of USA and Canada")
         self.assertEqual(rows["mc_1"].origin.itemcget(rows["mc_1"].origin.text_item, "text"),
                          "Product of USA and Canada")
+        self.assertTrue(shown(rows["mc_1"].origin))
         self.assertFalse(shown(rows["mc_1"].unknown_label))
         self.assertEqual(rows["mc_2"].origin.get(), "")
+        self.assertFalse(shown(rows["mc_2"].origin))
         self.assertTrue(shown(rows["mc_2"].unknown_label))
         self.assertEqual(rows["mc_2"].unknown_label.cget("text"), "(origin unknown)")
         # Buttons follow the flags and the roles; the confirm button only for the sender
@@ -654,6 +656,40 @@ class LineBoardTests(UiCase):
         lb.show(board(line("ln_1", "Line 1", [view("mc_1", colour=RED, alerts=failed[:1], needs_send=True)])))
         self.assertEqual([w for w in body.pack_slaves() if w in (row.details_label, row.alerts_frame, row.buttons)],
                          [row.alerts_frame, row.buttons])
+        lb.destroy()
+
+    def test_row_without_an_origin_has_no_gap(self):
+        # An empty BagText still measures one line high: a machine with no origin shows
+        # "(origin unknown)" in its place, not under an empty line
+        services = self.make()
+        lb = LineBoard(self.root, services)
+        lb.show(board(line("ln_1", "Line 1", [view("mc_1", origin=""), view("mc_2")])))
+        self.root.update_idletasks()
+        none, some = lb.cards["ln_1"].rows["mc_1"], lb.cards["ln_1"].rows["mc_2"]
+        self.assertFalse(shown(none.origin))
+        self.assertTrue(shown(none.unknown_label))
+        self.assertEqual(none.winfo_reqheight(),
+                         some.winfo_reqheight() - some.origin.winfo_reqheight() + none.unknown_label.winfo_reqheight())
+        body = none.unknown_label.master
+        parts = (none.origin, none.unknown_label, none.details_label, none.alerts_frame, none.buttons)
+        # In place both ways, the origin (or the label) staying above details, alerts and buttons
+        failed = [alert("al_1", machine="mc_1")]
+        busy = view("mc_1", colour=RED, alerts=failed, needs_send=True, details=[Msg("Confirmed by {user}.",
+                                                                                     {"user": "x"})])
+        lb.show(board(line("ln_1", "Line 1", [busy, view("mc_2")])))
+        self.root.update_idletasks()
+        self.assertIs(lb.cards["ln_1"].rows["mc_1"], none)                 # updated in place
+        self.assertEqual(none.origin.get(), "Product of USA")
+        self.assertEqual([w for w in body.pack_slaves() if w in parts],
+                         [none.origin, none.details_label, none.alerts_frame, none.buttons])
+        lb.show(board(line("ln_1", "Line 1", [dataclasses.replace(busy, origin_line=""), view("mc_2")])))
+        self.root.update_idletasks()
+        self.assertEqual([w for w in body.pack_slaves() if w in parts],
+                         [none.unknown_label, none.details_label, none.alerts_frame, none.buttons])
+        lb.show(board(line("ln_1", "Line 1", [view("mc_1", origin=""), view("mc_2")])))
+        self.root.update_idletasks()
+        self.assertEqual(none.winfo_reqheight(),
+                         some.winfo_reqheight() - some.origin.winfo_reqheight() + none.unknown_label.winfo_reqheight())
         lb.destroy()
 
     def test_not_monitored_and_empty(self):

@@ -1289,10 +1289,13 @@ class PrinterClient:
                     self._hold_after_no_reply(deadline)
                     raise
                 self._pause(deadline, no_reply=True)
-            except BadReply as e:
+            except BadReply:
+                # §2.4 and §10.1 rule 3: a login reply that isn't a 200 with both cookies is AuthFailed,
+                # broken framing included, so the poller shows login_failed (red) instead of dropping
+                # the cycle. It still counts as nonsense (§13 item 7).
                 self._cookies = {}
                 self._add_nonsense()
-                raise _bad(self.label, "LOG", e.reply) from None
+                raise _refused_password(self.label) from None
         access, auth = f"Access_token_{self.uid}", f"Auth_token_{self.uid}"
         cookies = reply.cookies()
         if reply.status != 200 or access not in cookies or auth not in cookies:

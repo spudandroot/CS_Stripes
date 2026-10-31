@@ -456,8 +456,8 @@ is added to `i18n.ES` by architecture §10.6; the UI modules use the same pair.
       `height` to the text's bbox height + 4 and, when `wrap_px` is None, its `width` to the bbox width
       + 4. An empty text keeps the height of one line, so layouts don't jump.
    3. `get()` returns exactly what was last `set` (`""` before).
-4. "(origin unknown)" (states §5.3) is a translated Label next to an empty `BagText`, never text inside
-   it.
+4. "(origin unknown)" (states §5.3) is a translated Label next to an empty `BagText` (in a line card's
+   machine row, in its place, §9), never text inside it.
 5. `PictureView` details: `set_bmp(None)` or `b""` draws a grey `#e5e7eb` box with a `RULE_FG`
    outline and no text. Otherwise `bmp_to_image(bmp).convert("L")`, resized to the canvas width keeping
    1024:160 (`Image.LANCZOS` when shrinking, `Image.NEAREST` when enlarging), shown through
@@ -1519,7 +1519,7 @@ Line buttons, shown by role (§2.7) and enabled by state:
 | `name_label` | `view.name`, (UI_FONT, 11, "bold") |
 | `headline_label` | `text(view.headline)` in the view's colour |
 | `age_label` | `text(checked_text(...))`, `Hx.Small.TLabel`, right |
-| `origin` (`BagText` 13 bold, `wrap_px` 520) | `view.origin_line`; when `""`, `unknown_label` "(origin unknown)" shows instead |
+| `origin` (`BagText` 13 bold, `wrap_px` 520) | `view.origin_line`; when `""`, `unknown_label` "(origin unknown)" shows in its place and the `BagText` is unpacked (an empty one still measures a line high, so it would leave a gap) |
 | `details_label` | `text(d)` for each `view.details`, one per line, `Hx.Small.TLabel`; a detail whose text equals an alert line's message is left out (no duplicates) |
 | alert lines | one per `view.alerts`: "♪ " when `alert.sound`, then `text(alert.msg)`, then " · " and "acknowledged by {user}" (`acked_by`) or "not acknowledged" |
 
@@ -3342,6 +3342,7 @@ last.
 | `test_result_from_log_no_entry` | `test_hx_ui_send.py` | with the `send` entry removed from the share and the queue, `nav.open_result(send_id)` lists the live machine from its expected state with its `read_preview` picture and the note "This PC can't find the full record of this Send. These are the printers' latest pictures."; the sender's "Everything is right" confirms it; another identity sees no buttons; a second active machine not in the Send whose expected.json has a newer `format_version` doesn't stop it |
 | `test_line_board` | `test_hx_ui.py` | a hand-made board renders one card per line and one row per machine in order; origins in `BagText`; "(origin unknown)" for `""`; machine buttons follow `can_stop`, `can_resume`, `needs_send`, `confirm_pending_by` (same user only) and roles; BLUE rows have no buttons; with a `FakeClock` advanced 3 s, `age_label` reads 3 s more |
 | `test_row_closes_up_when_alerts_end` | `test_hx_ui.py` | a machine row whose alerts end is as tall as one that never had any: `alerts_frame` (like the details and the buttons) is unpacked when empty, and details, alerts and buttons keep that order |
+| `test_row_without_an_origin_has_no_gap` | `test_hx_ui.py` | a machine row with `origin_line` `""` shows `unknown_label` in place of the unpacked `origin`, so it is as tall as a row with an origin less the origin's height plus the label's; updated in place either way, the origin (or the label) stays above details, alerts and buttons |
 | `test_floor_layout` | `test_hx_ui.py` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2; 12 machines on 4 lines give `row_h` 71.71 and fit; 30 machines on 5 lines at 1280x800 give 44 px rows, `scrolls` and the rows narrower by the scrollbar; `fit_px`, `ellipsize` and `short_name` as §10.3 says |
 | `test_floor_board` | `test_hx_ui.py` | rows in board order under their lines' bands; names without the line's name; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="1280x800"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
 | `test_rows_fit_without_overlap` | `test_hx_ui.py` | at 1280x800 and 1920x1080, 6 machines on 2 lines and 12 on 4: no scrolling, the last row on screen, every text inside its column and row with `width` 0, one size per column, and the origin size the largest at which the widest origin fits |

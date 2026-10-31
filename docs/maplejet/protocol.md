@@ -699,7 +699,11 @@ One PC can poll 12 printers on separate threads because each printer still sees 
    never written to disk or a log.
 3. Anything else (no cookies, a 401, another status) forgets any cookies and raises `AuthFailed`
    "{printer} refused the password, or another printer is at its address." OPEN: what the printer
-   answers to a wrong password.
+   answers to a wrong password. A reply `http_exchange` can't frame (a bad status line or header
+   line, chunked, a header block too long: `BadReply("HTTP framing")`) is "anything else" too: it
+   raises `AuthFailed`, never `BadReply`, so `login()` raises only `AuthFailed` or `NoReply` (and
+   `PrinterBusy` for the gate) and the poller shows `login_failed` (red) instead of dropping the
+   cycle unjudged. It also counts as nonsense (§13 item 7).
 4. `NoReply`: one more try after `read_retry_s`, then `NoReply`.
 5. The first successful login doesn't count in `relogins`; each later one adds 1.
 
@@ -1026,7 +1030,8 @@ growth into "Something else is talking to printer X" (states.md). It goes up by 
 3. a write answered with something that isn't an integer code;
 4. an HTTP status other than 200 or 401;
 5. a web reply classified `foreign` or `odd`;
-6. a matched Load that fails the full parse or the slot check.
+6. a matched Load that fails the full parse or the slot check;
+7. a login reply with broken HTTP framing (it raises `AuthFailed`, §10.1 rule 3).
 
 It doesn't count `NoReply` (states.md counts that towards "unreachable"), `6` and `7` (counted in
 `busy_replies`, apart, so states.md can weigh them: with one request at a time, busy also hints at

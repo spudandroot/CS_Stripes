@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 import re
 import secrets
 import types
@@ -363,7 +364,15 @@ def _convert(hint, value, where):
     if hint is float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise _wrong(where, hint, value)
-        return float(value)
+        # A hand-edited file can hold a 400-digit int (float() raises OverflowError) or NaN or
+        # Infinity (json.loads takes them; Stripes never writes them): both are damage, so ValueError
+        try:
+            number = float(value)
+        except OverflowError:
+            raise ValueError(f"{where}: number out of range") from None
+        if not math.isfinite(number):
+            raise ValueError(f"{where}: not a finite number")
+        return number
     if hint is int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise _wrong(where, hint, value)
