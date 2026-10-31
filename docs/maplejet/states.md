@@ -51,7 +51,7 @@ Each machine has three layers. Each layer has one writer.
 |---|---|---|---|
 | Expected | E | the printer-lock holder: Send, test print, calibration, Stop, Resume, Set clocks, confirm, Leave it (send.md) | what should be on the printer, whether it should be printing, and whether the sender confirmed it |
 | Observed and judged | P | the assigned poller (§6) | the committed printer facts, the state code judged from them against E and L, and the machine's active alerts |
-| Shown | `BoardView` in memory | every PC's `StatusWatcher` (§7) | P's judgement, overlaid with what needs no printer reading: a fresh lock (blue), staleness (NOT MONITORED), an E the poller hasn't judged yet, and acknowledgements |
+| Shown | `BoardView` in memory | every PC's `StatusWatcher` (§7) | P's judgement, overlaid with what needs no printer reading: a fresh lock (blue), staleness (NOT MONITORED, and its alarm, §7 item 7), an E the poller hasn't judged yet, and acknowledgements |
 
 Rules:
 
@@ -61,7 +61,8 @@ Rules:
 2. A state code or an alert changes on a printer reading only when a second reading about a second
    later agrees (§3.8). Changes that come only from E, L or acknowledgements don't need one.
 3. Alerts are part of P, so they have one writer. Acknowledgements are separate files, written once
-   (storage.md §5.6).
+   (storage.md §5.6). The one exception is the `not_monitored` alarm: no poller is judging that
+   machine, so every PC's watcher derives it, with the same id, and keeps it in memory only (§7 item 7).
 4. The poller judges "printing off" and drift against E (plan). When E doesn't expect printing, a
    printer that is off is fine; when it does, it isn't.
 
@@ -85,7 +86,7 @@ alerts (§4.5), never on the code.
 | `test_running` | BLUE | TEST by {user}, step {step} of {of} (or TEST by {user} before the first step) | a fresh lock with purpose `test` or `calibration` | released (normally then `test_finished`), or stale (§3.6) | none |
 | `action_in_progress` | BLUE | Stopping printing: {user} · Resuming printing: {user} · Setting the clock: {user} (by purpose `stop`, `resume`, `clock`) · Printer in use: {user} on {computer} (any other purpose, such as a damaged lock's `unknown` or a newer version's purpose) | a fresh lock with one of those purposes, or any purpose not listed in this table | released or stale | none |
 | `checking` | GREY | Checking... | no P has been read yet, and it hasn't been missing for `not_monitored_s`; or P's age isn't known (§7, a P first seen long after it was judged); or P holds it (also a poller code: a worker starting after a long gap writes it until its first judgement, §6.3 step 1; its age is P's counter's, §7 item 2). The origin shows as unknown and `printing` is None | P is read, or 30 s pass (then `not_monitored`); the worker's first judgement | none |
-| `not_monitored` | GREY, or the last known RED or AMBER (§5.2) | NOT MONITORED | P's judged counter (§6.14) unchanged, or P missing, for `not_monitored_s` (30 s) on this PC's clock; a P from an older Stripes, without the field, uses its counter. Standalone: §6.12 | P's judged counter moves | Confirm |
+| `not_monitored` | GREY, or the last known RED or AMBER (§5.2) | NOT MONITORED | P's judged counter (§6.14) unchanged, or P missing, for `not_monitored_s` (30 s) on this PC's clock; a P from an older Stripes, without the field, uses its counter. Standalone: §6.12. A machine that was printing rings after 2 minutes of it (§7 item 7) | P's judged counter moves | Confirm |
 | `update_stripes` | GREY | Update Stripes to see this machine | P or E is from a newer format | this PC runs the newer Stripes | none |
 | `not_set_up` | GREY | No printer set up | (board_view) the machine's printer record is missing, inactive, or has no password (`token == ""`) | an administrator fixes it | none |
 
@@ -497,6 +498,7 @@ starts (§4.3).
 | `fonts_differ` | C25 | no | none | admins, monitor | the list matches again | |
 | `message_unreadable` | C11b | no | AMBER | notify, admins, monitor | a Load succeeds, or E.mode isn't `running`/`switch_pending` any more; acknowledged while not trusted | |
 | `not_from_stripes` | C21 | no | none (the code is amber already) | notify | the first Send, or printing read off; acknowledged while not trusted | |
+| `not_monitored` | every PC's watcher (§7 item 7), never `judge` | yes | none (sound only: the machine stays NOT MONITORED) | notify, last sender, floor | P's judged counter moves, E.mode isn't `running`, a fresh lock shows, or the machine is made inactive | `<judged>_<E.send_id>` |
 
 How the plan's alert table maps to these:
 
@@ -512,7 +514,7 @@ How the plan's alert table maps to these:
 | A Send not yet confirmed by the sender | not an alert: the amber `unconfirmed` code on the floor board and monitor |
 | Replies that don't make sense | `foreign_client`, without sound, to administrators and the monitor |
 | A printer that isn't answering and wasn't printing | not an alert: the grey `off` code |
-| Nobody is polling a line | not an alert: `not_monitored` (§5.1) |
+| Nobody is polling a line | the grey `not_monitored` code (§5.1); for a machine that was printing, after 2 minutes of it, the `not_monitored` alarm with sound (§7 item 7; owner decision, 31 Oct 2026) |
 | A Send interrupted by a PC crash | `send_interrupted` |
 | If stopping fails (plan, "When the operator says something's wrong") | `stop_failed` |
 | Daily check: an encoder change "raises an alert" | `encoder_changed` |
@@ -529,6 +531,13 @@ def alert_id(machine_id: str, kind: str, *, ref: str = "", at: float = 0.0) -> s
 
 Every id matches storage.md's alert-id pattern `^[A-Za-z0-9._-]{1,100}$`. An id is unique for each
 occurrence, so an old acknowledgement never silences a new alert (storage.md §5.6 rule 5).
+
+The watcher's `not_monitored` alarm (§7 item 7) uses `not_monitored_alarm_id(machine_id, value, at,
+send_id)` = `alert_id(machine_id, "not_monitored", ref=f"{value}_{send_id}", at=at)`, with P's last
+judged counter and `judged_at` (an older P: its counter and `written_at`) and E's `send_id`, e.g.
+`mc_5d1e2f3a4b.not_monitored.18740_sd_8a7b6c5d4e.1793275240200`. Every PC reads the same P and E, so
+every PC derives the same id and one ack silences them all; a new judgement or a new Send gives a new
+id.
 
 `judge` builds `Judgement.alerts` from the outcome's needs:
 
@@ -567,7 +576,9 @@ who gets the personal pop-up (ui.md), and which administrator warnings are liste
    oldest first, every alert in `board` that is active, has `sound`, has no `acked_by`, and either names
    this user (`"user:<name>"` with `same_user(name, identity.user)`) or has `"floor"` while
    `floor_board` is True (this PC has the floor board open).
-2. No sound alert is addressed to `"admins"`, so `sounding_alerts` needs no company record.
+2. No sound alert is addressed to `"admins"`, so `sounding_alerts` needs no company record. The
+   watcher's `not_monitored` alarm (§7 item 7) is in `MachineView.alerts` like any other, so it rings
+   through the same path and the same sound.
 3. ui.md's `AlertSounder` runs whenever the services run, including when Stripes is hidden in the tray:
    a notify user signed in anywhere hears their line. It calls `hx_win.play_alert(repeat=True)` when
    the list becomes non-empty and `hx_win.stop_alert()` when it becomes empty. It re-evaluates on every
@@ -593,7 +604,8 @@ who gets the personal pop-up (ui.md), and which administrator warnings are liste
 3. Propagation: every PC's watcher reads the ack file of each active alert by name every `watch_s`
    (5 s), so the sound stops on every PC within about 5 s (up to about 10 s if the SMB not-found cache
    hides the new file; OPEN item 6). The assigned poller also reads them (§6.4 step 4), copies `acked_by`
-   and `acked_at` into the alert in P, and logs `alert_acknowledged` once.
+   and `acked_at` into the alert in P, and logs `alert_acknowledged` once. No poller has the
+   `not_monitored` alarm: every watcher reads its ack file the same way, and the file is its record.
 4. What it changes: only the sound, plus the two "acknowledged while not trusted" endings in §4.1. A
    red mark stays while the problem is still there: the code and the alert stay active.
 5. Share down: an ack is applied on this PC only and isn't written (the alert ids of standalone checks
@@ -779,6 +791,9 @@ now, timings) -> BoardView`:
 3. Every other machine gets `machine_view(...)`, then each line gets `line_view(...)`.
 4. `BoardView(lines, share_ok, standalone, next_check_s, generated_at=now)`. `next_check_s` is set by the
    watcher from `PollerUpdate` (it isn't an argument here).
+5. The watcher then adds its own `not_monitored` alarms with `with_board_alerts(board, alerts, acks)`
+   (§7 item 7). They join the machine's `alerts`, details and `unacked_sound`, and change no code,
+   colour or headline, so lines and floor rows are as `board_view` made them.
 
 ```python
 def natural_key(name: str) -> list:   # "Line 2" before "Line 10": digit runs as ints, the rest casefolded
@@ -840,6 +855,7 @@ MAX_BAGS_PER_S = 5.0           # a bag counter may rise by at most this per seco
 DAILY_S = 86_400.0             # daily checks
 DST_KEEP_S = 86_400.0          # a pending daylight-saving clock set is kept this long
 ACK_RETRY_S = 600.0            # the watcher retries a failed ack write this long
+NOT_MONITORED_ALARM_S = 120.0  # a machine that was printing rings after this long NOT MONITORED (§7 item 7)
 UNCHECKED_LOADS = 2            # failed running-message Loads in a row before running_unchecked ...
 UNCHECKED_SLOW_SETS = 3        # ... or this many poll_slow_s without a successful one (§6.5)
 ```
@@ -1508,11 +1524,12 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
    machine becomes `not_monitored` after 30 s), `share_ok=False`. The last good P is the newer (by
    counter) of the watcher's last read and what this PC's own worker last wrote, so a drift this PC
    committed just before the outage shows red before any pass read it (owner decision, 31 Oct).
-5. `board = board_view(...)`; set `board.next_check_s` from the last `PollerUpdate`; set `latest`; post
-   `BoardUpdate(board)`. `latest` and its `BoardUpdate` change together under the watcher's lock, with
-   every own ack made during the pass applied first, so an `acknowledge()` while a pass reads the share
-   is never undone by that pass's board, and a pass that ends during `acknowledge()` is never replaced
-   by the older board (§4.5 item 2). The lock is never held across share I/O.
+5. `board = board_view(...)`, then the NOT MONITORED alarms (item 7); set `board.next_check_s` from the
+   last `PollerUpdate`; set `latest`; post `BoardUpdate(board)`. `latest` and its `BoardUpdate` change
+   together under the watcher's lock, with every own ack made during the pass applied first, so an
+   `acknowledge()` while a pass reads the share is never undone by that pass's board, and a pass that
+   ends during `acknowledge()` is never replaced by the older board (§4.5 item 2). The lock is never
+   held across share I/O.
 6. Share mode, a P whose judged counter this watcher has not yet seen move, with `judged_at`
    `not_monitored_s` or more old by this PC's clock while its age is still below `not_monitored_s`
    (storage.md §10 rule 1 counts a counter seen for the first time as fresh; for a P without `judged`,
@@ -1520,6 +1537,39 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
    state as just checked, until it moves or becomes `not_monitored` (owner-approved divergence,
    31 Oct). Once seen moving, `judged_at` is never used again, so a PC whose clock is off never loses a
    P that is being judged.
+7. **The NOT MONITORED alarm** (owner decision, 31 Oct 2026). NOT MONITORED is how a frozen poller, or a
+   printer that no PC can check, shows up: nobody reads the printer, so a wrong origin could print
+   unseen. No poller writes a judgement for such a machine, so every PC's watcher raises the alarm
+   itself, after `board_view`, with `hx_state.not_monitored_alarm` and its own record of each machine on
+   the board (`JudgedSeen`):
+   1. The record: P's judged counter (an older P: its counter) and `judged_at` (`written_at`) as last
+      read; whether this watcher has seen the counter move since it started; and, at the last good
+      judgement (the pass that first saw a new value, with the view monitored, not blue, not
+      `checking`, and P not paused for a lock), whether `P.printing` was True with E.mode `running`. A
+      paused write moves the counter but reads nothing, so the judgement before it stays the last good
+      one.
+   2. It rings when the view is `not_monitored`, the record saw the counter move and was printing with E
+      running, E.mode is still `running`, and this PC has shown NOT MONITORED for
+      `NOT_MONITORED_ALARM_S` (120 s) of share-mode passes in a row. A stuck worker is fenced and a
+      backup polls within about 70 s (§6.2 item 3.0), and normal takeovers are quicker, so 2 minutes of
+      NOT MONITORED means something is really wrong. With no backup PC it rings about 2.5 minutes after
+      the last judgement.
+   3. Never for a P this watcher hasn't seen move: after a night with every PC closed, the first PC
+      opened doesn't ring for every machine whose old P still says printing, and nothing rings at
+      startup. Never while this PC can't read the share (`share_ok` False, standalone): those have their
+      own banner; the record is kept, and the 120 s start again when the share is back. Never for an
+      inactive machine: it isn't on the board, and its record is dropped, so after it is made active
+      again it rings only once this PC has seen it judged. Never while E isn't `running` (stopped, test
+      finished, no Send yet, a Send switching), or while a fresh lock shows its blue code.
+   4. The alert: kind `not_monitored`, `sound` True, no colour, "No PC has checked {machine} for
+      {minutes} min" (the machine's name; minutes since the last judgement), drift's recipients (notify,
+      last sender, floor), `started_at` this PC's wall time when it started here, and the id of §4.2.
+      `with_board_alerts` adds it (§5.5 step 5); its ack is read by name like any other, and
+      `acknowledge()` treats it like any other. An ack silences it; the machine stays NOT MONITORED.
+   5. It ends when the judged counter moves, E stops being `running`, a lock shows, or the machine is
+      made inactive; a later occurrence has a new id. It adds sound only: P is unchanged, the machine
+      never looks better, and origin safety and the two-reading rule are as before. It isn't logged
+      (§9): every PC derives it, and its ack file is the record.
 
 `acknowledge(alert_ids: list[str]) -> None` (§11.3): records `Ack`s in memory at once, wakes the loop
 (the next board applies them), and queues the share writes, which the watcher thread makes after
@@ -1557,7 +1607,8 @@ follow where this summary is shorter):
    divides the lines. When a line's origins differ, each of its rows still shows its own origin, so
    every origin is listed.
 4. The floor-board PC rings for alerts with the `"floor"` recipient (`sounding_alerts(...,
-   floor_board=True)`). Its Acknowledge button appears only when the signed-in user may acknowledge
+   floor_board=True)`), the NOT MONITORED alarm too (§7 item 7): its row stays grey NOT MONITORED and
+   its bar flashes. Its Acknowledge button appears only when the signed-in user may acknowledge
    (§4.5).
 
 The three per-user settings are `HxSettings` fields (architecture §6.10; `maplejet.json`, storage.md
@@ -1612,6 +1663,9 @@ stored with `Msg.to_json()`.
 | `dst_clock_set` | §6.11 | `change`, `change_at`, `previous_offset_s`, `offset_s`, `ok`, `skipped`, `msg` (Msg or null), `clock` (send.md §9.5's record, §6.11 item 5) |
 | `poller_mode` | the coordinator's mode changes | `from_mode`, `to_mode` |
 | `internal_error` | §6.4 | `error` (one line), `traceback` (text) |
+
+The watcher's `not_monitored` alarm (§7 item 7) has no entries: every PC derives it, and its ack file
+is the record.
 
 None of these entries has a `send_id`, `run_id`, `action_id`, `record_id` or `film_id` at the top
 level, so the `ref` part of each machine entry's log name is the machine id (storage.md §6.3), and
@@ -1703,8 +1757,10 @@ Values: `machine` = `Machine.name`, `printer` = `Printer.name`, `computer`, `use
 | `fonts_differ` | Printer {printer} doesn't have the standard fonts | La impresora {printer} no tiene las fuentes estándar |
 | `message_unreadable` | Stripes can't read the message on {machine} | Stripes no puede leer el mensaje de {machine} |
 | `not_from_stripes` | {machine} is printing a message that wasn't sent from Stripes | {machine} está imprimiendo un mensaje que no se envió desde Stripes |
+| `not_monitored` | No PC has checked {machine} for {minutes} min | Ninguna PC revisa {machine} desde hace {minutes} min |
 
-`clock_off` rounds `minutes` to the nearest whole minute, at least 2.
+`clock_off` rounds `minutes` to the nearest whole minute, at least 2. `not_monitored` gives the whole
+minutes since the last judgement (`checked_age_s // 60`), refreshed at every pass.
 
 ### 10.3 Details, lines and the board
 
@@ -1818,6 +1874,21 @@ def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) ->
 def checked_text(age_s: float | None) -> Msg                                   # §5.7
 def board_banner(board: BoardView) -> Msg | None                               # §5.7
 def natural_key(name: str) -> list                                             # §5.5
+
+@dataclass(kw_only=True)
+class JudgedSeen:                     # one watcher's record of a machine's P (§7 item 7)
+    value: int                        # P.judged as last read (P.counter for an older P)
+    at: float = 0.0                   # P.judged_at (P.written_at)
+    moved: bool = False               # seen to move since this watcher started
+    printing: bool = False            # at the last good judgement: P.printing True, E.mode "running"
+    since: float | None = None        # clock.monotonic() of the first NOT MONITORED pass, share up
+    alarm_id: str = ""                # the alarm now, and its started_at
+    alarm_at: float = 0.0
+def not_monitored_alarm(seen: JudgedSeen | None, poll: PollStatus | None, view: MachineView,
+                        expected: ExpectedState | None, line: Line | None, *, share_ok: bool, mono: float,
+                        now: float, alarm_s: float) -> tuple[JudgedSeen | None, Alert | None]   # §7 item 7
+def not_monitored_alarm_id(machine_id: str, value: int, at: float, send_id: str) -> str  # §4.2
+def with_board_alerts(board: BoardView, alerts: dict[str, Alert], acks: dict[str, Ack]) -> BoardView  # §5.5
 ```
 
 Optional fields added to `Reading` (architecture §6.2):
@@ -1870,6 +1941,7 @@ storage.md §5.2's field list.
 
 ```python
 FOREIGN_MIN, FOREIGN_WINDOW_S, FOREIGN_CLEAR_S, MAX_BAGS_PER_S, DAILY_S, DST_KEEP_S, ACK_RETRY_S  # §6.1
+NOT_MONITORED_ALARM_S = 120.0                                                            # §7 item 7
 UNCHECKED_LOADS, UNCHECKED_SLOW_SETS, UNCHECKED_CONFIRMS                                 # §6.5
 PRIN_UNREAD_LIMIT = 3                                                                    # §6.6
 DECLINE_MAX_S = 900.0; DECLINE_MEMORY_S = 3600.0                                         # §6.2 item 3.0
@@ -2012,6 +2084,19 @@ message, and stale `LockInfo`s for every purpose.
     offers Stop, not Resume. It commits at once, and back needs a PRIN second reading (one that can't
     read PRIN keeps it).
 22. **Natural order**: only ASCII digit runs sort as numbers; "Bagger 1²" sorts and doesn't raise.
+23. **The NOT MONITORED alarm** (§7 item 7), pass by pass through `not_monitored_alarm`: a watcher that
+    saw P's judged counter move with the machine printing and E running: quiet for 119 s of NOT
+    MONITORED, rings at 120 s with the id `mc_5d1e2f3a4b.not_monitored.42_sd_8a7b6c5d4e.<judged_at ms>`,
+    sound, no colour, drift's recipients and "No PC has checked Line 1 Bagger 1 for 2 min" (and its
+    Spanish), the same id and start on later passes. On the board it only adds the alert, the detail
+    and `unacked_sound`: still grey (or the last known red) NOT MONITORED, also on the floor row; it
+    rings for the floor board and the notify user; an ack silences it. A P never seen to move rings
+    never (4 hours of passes), and rings once it is judged and goes stale again. Not with `share_ok`
+    False (the record kept; back, 120 s more, then the same id); not while E is stopped, test finished,
+    `none`, switching or missing, and a new Send gives a new id; not when the last good judgement had
+    printing off, E stopped or no E; not while a fresh lock shows (after it, 120 s more, the same id).
+    Paused writes keep the last good judgement. A new judged value ends it; the next occurrence has a
+    new id. An older P uses its counter and `written_at`. The text names the machine, never an id.
 
 ### 12.2 test_hx_poller.py (FakeWorld, FakePrinter, scaled timings or FakeClock)
 
@@ -2186,6 +2271,16 @@ of real time.
     and ack through a PRIN busy spell.
 32. **The share back after another message was selected** (§6.3 step 1, third exception): the old
     drift's origin is never shown again; red until share mode loads the new one.
+33. **The NOT MONITORED alarm** (§7 item 7, `FakeClock`): a PC polls the printing machine while PCs that
+    only watch look, then freezes. On every watcher: quiet for 119 s of NOT MONITORED, the alarm at
+    120 s with one id from P's `judged`, `judged_at` and E's `send_id`, ringing for the floor board and
+    the notify user; the machine grey NOT MONITORED with its origin, P unchanged. A PC first opened
+    after an 8-hour night never rings in an hour (one that watched before the night does). None while
+    this PC can't read the share (after it, 120 s more, the same id), in standalone mode, while E is
+    stopped, test finished or `none` (a new Send then rings at once with a new id), for an inactive
+    machine (nor after it is made active again), or while a Send's lock is held for 5 minutes (after
+    it, 120 s more, the same id). Another PC polling ends it; the next occurrence has a new id. An ack
+    on one PC silences the other within one pass; both keep the machine NOT MONITORED and stay quiet.
 
 ### 12.3 test_hx_sim.py (shared with storage.md and protocol.md)
 
@@ -2198,7 +2293,7 @@ occurrence); an acknowledgement on one simulated PC silences `sounding_alerts` o
 one `watch_s` (scaled); a sender confirming the moment a Send ends never sees the previous origin, nor
 GREEN with an origin the fake isn't printing, in the views sampled until the poller commits.
 
-Two cases from the review:
+Cases from the reviews (0 to 2) and from the owner (3, 31 Oct 2026):
 
 0. **A stuck worker thread** (real threads): the polling PC's worker blocks while its coordinator
    heart-beats: the other PC polls within 70 scaled seconds, the worker is fenced, and no board shows a
@@ -2212,6 +2307,11 @@ Two cases from the review:
    ends with read-backs that matched their own TN and XID (`MessageDesign.tn` and `xid`), and no Send
    is green with a content the fake didn't hold. Overlapping requests are allowed in this case
    (architecture §7.3 rule 7).
+3. **The NOT MONITORED alarm** (real threads, `NOT_MONITORED_ALARM_S` scaled): a stuck worker whose
+   printer the other PC polls within 70 scaled seconds never rings on either PC; once that PC's poller
+   stops too, both ring with one id. A stuck worker with no backup PC rings on its own PC's floor
+   board about 150 scaled seconds after it blocked (30 s to NOT MONITORED + 120 s), the machine grey
+   NOT MONITORED.
 
 ## 13. Notes for the other spec files
 
@@ -2274,7 +2374,8 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
 ## 15. Decisions made in this spec
 
 1. **Three layers, one decision point.** Only `judge()` turns printer readings into codes and alerts;
-   views only overlay a fresh lock, staleness, an unjudged E and acks.
+   views only overlay a fresh lock, staleness, an unjudged E and acks. The watcher's NOT MONITORED alarm
+   needs no printer reading: it is staleness with sound (decision 9).
 2. **The two-reading rule is applied to outcomes**, not to raw values: a reading that would change the
    code or the set of alerts is confirmed by re-reading only the facts that caused it. Changes caused
    only by E, a lock or an ack commit at once (they need no printer evidence).
@@ -2293,14 +2394,20 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
    amber, so warnings never hide a blue test or a red failure. Low ink and a clock off therefore show
    amber on the floor board.
 9. **NOT MONITORED never makes a machine look better**: it keeps a last known red or amber and greys
-   only green, blue and grey.
+   only green, blue and grey. Owner decision, 31 Oct 2026: it is no longer silent for a machine that
+   was printing. After 2 minutes of NOT MONITORED (`NOT_MONITORED_ALARM_S`), every PC's watcher that saw
+   the machine judged printing with E running rings the `not_monitored` alarm, with drift's sound and
+   recipients and one id on every PC. Not for a P the watcher never saw move (the first PC in the
+   morning), with the share unreadable, standalone, E not running, a lock, or an inactive machine. An
+   ack silences it; the machine stays NOT MONITORED (§7 item 7).
 10. **An E the poller hasn't judged yet is shown at once** (`expected_counter` in P), so a card never
     shows the old message as green right after a Send. Until the poller has judged it, an R that
     doesn't match E shows the origin as unknown and caps the colour at amber, also after a quick
     confirm (owner-approved divergence, 31 Oct).
 11. **Alert ids** are `<machine>.<kind>.<send or run id>` for alerts tied to a Send or test, and
     `<machine>.<kind>.<start ms>` otherwise; recipients are fixed when the alert starts; alerts continue
-    across a poller takeover.
+    across a poller takeover. The watcher's NOT MONITORED alarm is
+    `<machine>.not_monitored.<judged>_<send id>.<judged_at ms>`, the same on every PC (§4.2).
 12. **Leave it doesn't start a new alert**: the `send_failed` alert continues until acknowledged, and
     the line stays red (`left_red`).
 13. **"Something's wrong" and "Stopped, needs a Send" share one `send_rejected` alert** to the sender
@@ -2409,7 +2516,8 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
     after its last check (at most one mixed-up reply, which the two-reading rule turns into a false
     alarm, never a false green); a share write can land late (a board shows the old P for at most one
     tick); a stuck thread can't be killed and keeps this PC's gate for that printer. With no backup PC
-    the machine stays NOT MONITORED, which has no sound (decision 9 is unchanged).
+    the machine stays NOT MONITORED, and a machine that was printing rings after 2 minutes of it
+    (decision 9, owner decision 31 Oct 2026).
 41. **Printing that can't be read for long isn't green**: PRIN without a good value for
     `PRIN_UNREAD_LIMIT` (3) cycles in a row makes printing unknown and a green, `stopped` or `idle`
     machine amber `printing_unchecked`; busy-only cycles don't move `judged`. P keeps the last known

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import hx_fake
 import hx_message
@@ -28,8 +29,8 @@ import hx_share
 import hx_state
 import hx_time
 from hx_core import SYSTEM_CLOCK, EventBus
-from hx_model import (AMBER, GREEN, RED, STEP_BUILD, STEP_CHECK_MACHINE, STEP_LOCK, STEP_WAIT_POLLER, STEPS, TIMINGS,
-                      DesignItem, ExpectedState, LineChoice, MessageDesign, SendEvent, SendRequest, new_id)
+from hx_model import (AMBER, GREEN, GREY, RED, STEP_BUILD, STEP_CHECK_MACHINE, STEP_LOCK, STEP_WAIT_POLLER, STEPS,
+                      TIMINGS, DesignItem, ExpectedState, LineChoice, MessageDesign, SendEvent, SendRequest, new_id)
 from hx_share import settle_s
 
 F = 0.025
@@ -740,6 +741,93 @@ class PlantTests(unittest.TestCase):
         self.assertEqual(stale_green, [])
         hang.set()
         self.assertTrue(wait(lambda: w.done, 2))
+        plant.check_one_request_at_a_time()
+
+    def block_worker(self, pc, pid):
+        """The PC's worker for printer pid really blocks in its next cycle while its coordinator heart-beats.
+        Returns the worker once it is stuck."""
+        w = pc.poller._workers[pid]
+        hang = threading.Event()
+        self.addCleanup(hang.set)
+        stuck = threading.Event()
+
+        def blocked_cycle():
+            stuck.set()
+            hang.wait(30.0)
+        w._cycle = blocked_cycle
+        self.assertTrue(stuck.wait(2.0))
+        return w
+
+    def test_a_backup_pc_takes_over_before_the_not_monitored_alarm(self):
+        """states.md §7 item 7: a stuck worker whose printer the other PC polls within about 70 s never rings
+        the NOT MONITORED alarm (after 120 s of NOT MONITORED) on any PC. Once nobody polls it, both ring."""
+        self.enterContext(mock.patch.object(hx_poller, "NOT_MONITORED_ALARM_S", 120 * F))
+        plant = Plant(self, printers=1)
+        a, b = plant.pc("akim"), plant.pc("bob")
+        a.start()
+        b.start()
+        self.addCleanup(b.stop)
+        self.addCleanup(a.stop)
+        pid = plant.pids[0]
+        self.assertTrue(wait(lambda: plant.code(0) == "running_confirmed", 8))
+        time.sleep(4 * plant.timings.watch_s)           # both watchers have seen it judged and printing
+        poller, other = plant.pollers(0, [a, b])
+        w = self.block_worker(poller, pid)
+        t0 = time.monotonic()
+        codes, rang = set(), []
+        while time.monotonic() < t0 + 300 * F:
+            time.sleep(2 * F)
+            for pc in (a, b):
+                board = pc.watcher.latest
+                m = board.lines[0].machines[0]
+                codes.add(m.code)
+                rang += [x.id for x in m.alerts if x.kind == "not_monitored"]
+        with plant._lock:
+            by_other = [e for e in plant.exchanges if e[1] == other.name and e[3] >= t0]
+        self.assertTrue(by_other and (by_other[0][3] - t0) / F <= 70, by_other[:2])
+        self.assertTrue(w.fenced)
+        self.assertIn("not_monitored", codes)           # it was NOT MONITORED for a while...
+        self.assertEqual(rang, [])                      # ...but never long enough to ring
+        self.assertTrue(wait(lambda: all(pc.watcher.latest.lines[0].machines[0].code == "running_confirmed"
+                                         for pc in (a, b)), 2))
+        # The control: the backup's poller stops too, so nobody polls the printer (the stuck PC still
+        # declines it). Both watchers saw it judged printing, and both ring, with one id
+        time.sleep(4 * plant.timings.watch_s)
+        other.poller.stop()
+        alarms = lambda pc: [x.id for x in pc.watcher.latest.lines[0].machines[0].alerts if x.kind == "not_monitored"]
+        self.assertTrue(wait(lambda: alarms(a) and alarms(b), 300 * F))
+        self.assertEqual(alarms(a), alarms(b))
+        plant.check_one_request_at_a_time()
+
+    def test_a_stuck_worker_with_no_backup_pc_rings(self):
+        """states.md §7 item 7: the only PC that can poll the printer has a stuck worker. Nobody judges the
+        printing machine: NOT MONITORED after about 30 s, and the alarm about 120 s later, on that PC's own
+        board (its floor board rings), the machine still grey NOT MONITORED."""
+        self.enterContext(mock.patch.object(hx_poller, "NOT_MONITORED_ALARM_S", 120 * F))
+        plant = Plant(self, printers=1)
+        a = plant.pc("akim")
+        a.start()
+        self.addCleanup(a.stop)
+        pid = plant.pids[0]
+        self.assertTrue(wait(lambda: plant.code(0) == "running_confirmed", 8))
+        time.sleep(4 * plant.timings.watch_s)
+        self.block_worker(a, pid)
+        t0 = time.monotonic()
+        ringing = lambda: [x for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)
+                           if x.kind == "not_monitored"]
+        self.assertTrue(wait(ringing, 300 * F))
+        took = (time.monotonic() - t0) / F
+        # The last judgement was at most one cycle before the worker blocked: 30 s + 120 s after it, give or
+        # take a watcher pass and the test machine
+        self.assertGreaterEqual(took, 140)
+        self.assertLessEqual(took, 200)
+        (alarm,) = ringing()
+        p = plant.p(0)
+        self.assertEqual(alarm.id, hx_state.not_monitored_alarm_id(plant.mids[0], p.judged, p.judged_at,
+                                                                   "sd_0000000000"))
+        m = a.watcher.latest.lines[0].machines[0]
+        self.assertEqual((m.code, m.colour), ("not_monitored", GREY))
+        self.assertIn(pid, a.poller._fenced)
         plant.check_one_request_at_a_time()
 
     def test_slow_everything(self):

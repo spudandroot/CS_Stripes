@@ -36,7 +36,7 @@ import i18n
 from hx_core import FakeClock, Msg
 from hx_fake import FakeWorld
 from hx_message import merge_plan
-from hx_model import (ALLOWED_WRITE_TAGS, AMBER, BLUE, GREEN, GREY, RED, STEP_VERIFY_IDLE, TIMINGS, Alert,
+from hx_model import (ALLOWED_WRITE_TAGS, AMBER, BLUE, GREEN, GREY, RED, STEP_VERIFY_IDLE, TIMINGS, Ack, Alert,
                       BoardUpdate, BoardView, LineChoice, LineView, MachineResult, MachineView, PollerUpdate, PollStatus,
                       SendRequest, SendResult, ShareHealth, ShareUnavailable, new_id)
 from hx_protocol import GateRegistry, release_key
@@ -1209,6 +1209,59 @@ class AlertSounderTests(UiCase):
             alert("al_3", to=("user:EXAMPLE\\akim",))])])))
         self.assertFalse(sounder.playing)
         self.assertIsNone(nav.window("alerts"))
+
+    def test_the_not_monitored_alarm(self):
+        # states.md §7 item 7: the watchers' alarm for a printing machine nobody checks. Sound only: the row
+        # stays grey NOT MONITORED and its bar flashes; the floor board and the notify user ring, and
+        # Acknowledge silences it
+        services = self.make()
+        nav = services.nav
+        sounder = hx_ui_monitor.AlertSounder(services)
+        nav.sounder = sounder
+        kind = hx_state.ALERT_KINDS["not_monitored"]
+        alarm = Alert(id="mc_3.not_monitored.42_sd_1.1793275200000", machine_id="mc_3", line_id="ln_1",
+                      kind=kind.kind, sound=kind.sound, msg=Msg(kind.text, {"machine": "Line 1 Bagger 3", "minutes": 2}),
+                      started_at=1_793_275_350.0, recipients=["user:EXAMPLE\\jsmith", "floor"], colour=kind.colour)
+        lost = view("mc_3", colour=GREY, code="not_monitored", headline="NOT MONITORED", monitored=False,
+                    printing=None, age=150.0)
+        plain = board(line("ln_1", "Line 1", [view("mc_1"), lost]))
+        rung = hx_state.with_board_alerts(plain, {"mc_3": alarm}, {})
+        services.watcher.latest = rung
+        services.bus.post(BoardUpdate(board=rung))
+        services.bus.pump()
+        self.play.assert_called_once_with(repeat=True)
+        self.assertEqual(nav.window("alerts").alert_labels[0].cget("text"),
+                         "♪ No PC has checked Line 1 Bagger 3 for 2 min")
+        with mock.patch.object(hx_win, "monitors", return_value=[]):
+            nav.open_floor_board()
+        fb = nav.window("floor")
+        c = fb.canvas
+        self.assertEqual(c.itemcget(fb.status_items["mc_3"], "text"), "NOT MONITORED")
+        self.assertEqual(c.itemcget(fb.status_items["mc_3"], "fill"), DIM_FG)
+        self.assertEqual(c.itemcget(fb.bar_items["mc_3"], "fill"), COLOUR_HEX[GREY])
+        fb.flash()
+        if fb.flash_on:
+            fb.flash()                                  # the "off" half of the beat
+        self.assertEqual(c.itemcget(fb.bar_items["mc_3"], "fill"), CARD_BG)
+        self.assertEqual(c.itemcget(fb.bar_items["mc_1"], "fill"), COLOUR_HEX[GREEN])
+        self.assertTrue(shown(fb.ack_button))
+        with mock.patch.object(services.watcher, "acknowledge") as ack:
+            fb.ack_button.invoke()
+        ack.assert_called_once_with([alarm.id])
+        # Acknowledged (here or on another PC): quiet, and the row still grey NOT MONITORED, not flashing
+        done = hx_state.with_board_alerts(plain, {"mc_3": alarm}, {alarm.id: Ack(
+            alert_id=alarm.id, by="EXAMPLE\\jsmith", computer="FLOOR01", at=1_793_275_360.0)})
+        services.watcher.latest = done
+        services.bus.post(BoardUpdate(board=done))
+        services.bus.pump()
+        self.stop.assert_called_once_with()
+        self.assertFalse(sounder.playing)
+        fb.flash()
+        fb.flash()
+        self.assertEqual(c.itemcget(fb.bar_items["mc_3"], "fill"), COLOUR_HEX[GREY])
+        self.assertEqual(c.itemcget(fb.status_items["mc_3"], "text"), "NOT MONITORED")
+        self.assertFalse(shown(fb.ack_button))
+        fb.close_button.invoke()
 
     def test_silent_after_stop_services(self):
         # Quitting: stop_services silences first, then App.destroy() destroys the floor board,

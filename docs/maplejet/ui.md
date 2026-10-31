@@ -1579,6 +1579,9 @@ services run, including while Stripes is hidden in the tray (states §4.4 rule 3
    - `ringing` non-empty and not `playing`: `hx_win.play_alert(repeat=True)`, `playing = True`.
    - `ringing` empty and `playing`: `hx_win.stop_alert()`, `playing = False`.
    - A new alert while ringing doesn't restart the sound; there is no snooze (states §4.4 rule 4).
+   - The NOT MONITORED alarm (kind `not_monitored`, states §7 item 7: a machine that was printing and
+     no PC has checked for 2 minutes) arrives the same way, in `MachineView.alerts` with drift's
+     recipients, and rings with the same sound. Nothing here treats it differently.
 3. Personal pop-up: `personal` = the alerts of `ringing` with a `"user:<name>"` recipient where
    `same_user(name, identity.user)`. When `personal` holds an id not in `shown_ids`, the `AlertPopup`
    is opened (or updated and shown) with every `personal` alert, and the ids are added to `shown_ids`.
@@ -1754,7 +1757,9 @@ For each `FloorRow` `r` (and its `MachineView` `v`):
 5. **Age** (`age_items`): `text(checked_text(age))`, normal, `MUTED_FG`, `anchor="e"` at the rows' right
    edge minus 12 px; `age = r.checked_age_s + <seconds since the BoardUpdate>` (None stays None).
 6. **NOT MONITORED** rows (`v.code == "not_monitored"`): every text of the row in `DIM_FG`; the bar
-   keeps its colour (states keeps a last known red or amber).
+   keeps its colour (states keeps a last known red or amber). While its NOT MONITORED alarm rings
+   (states §7 item 7, `v.unacked_sound`) the bar flashes like any other; the status still reads "NOT
+   MONITORED", and Acknowledge silences it.
 7. **Dividers**: a 1 px `#e5e7eb` line between rows of the same line; the bands divide the lines. When
    a line's origins differ, each of its rows shows its own origin (states §5.6), so every origin is
    listed.
@@ -3361,6 +3366,7 @@ last.
 | `test_rows_fit_without_overlap` | `test_hx_ui.py` | at 1280x800 and 1920x1080, 6 machines on 2 lines and 12 on 4: no scrolling, the last row on screen, every text inside its column and row with `width` 0, one size per column, and the origin size the largest at which the widest origin fits |
 | `test_one_origin_size_never_cut_short`, `test_long_names_and_statuses_get_an_ellipsis`, `test_scrolls_when_the_rows_cannot_fit` | `test_hx_ui.py` | a very long origin shrinks every origin and is drawn whole; long names and statuses end in "…", origins never; 30 machines scroll with the wheel, a new board keeps the place, and a board that fits hides the scrollbar |
 | `test_alert_sounder` | `test_hx_ui.py` | `hx_win.play_alert`/`stop_alert` patched: a board with a sound alert to `user:EXAMPLE\jsmith` plays once (a second board doesn't replay); an acknowledged board stops it; a `"floor"` alert rings only while the floor board is open; the `AlertPopup` opens for the personal alert only |
+| `test_the_not_monitored_alarm` | `test_hx_ui.py` | a grey NOT MONITORED machine with the watcher's `not_monitored` alarm (`hx_state.with_board_alerts`): the sound plays and the pop-up shows "♪ No PC has checked Line 1 Bagger 3 for 2 min"; on the floor board the row still reads "NOT MONITORED" in `DIM_FG`, its grey bar flashes, and Acknowledge acknowledges the alarm's id; acknowledged: the sound stops, the bar stays grey, no Acknowledge button |
 | `test_alert_wav` | `test_hx_ui.py` | `assets/alert.wav` matches `alert_wav_bytes()` within 1 per sample; 22,050 Hz, mono, 16-bit, 66,150 frames |
 | `test_admin_save_and_conflict` | `test_hx_ui_admin.py` | change a line's name and save: revision + 1 and "Saved Line 1." ; after another store writes a newer revision, Save shows the `RevisionConflict` text and `reload_button` |
 | `test_admin_refuses_non_admin` | `test_hx_ui_admin.py` | `nav.open_admin()` for a sender only tells "Only Stripes Administrators can do this." |

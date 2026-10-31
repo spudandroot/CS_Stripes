@@ -125,6 +125,15 @@ These changes follow, all differing from the spec as first written:
    and failed leaves the origin unknown, but the drift alert stays open, with its acknowledgement:
    only a Load that works and a second one that agrees end it. So flaky reads never end an alarm
    nobody acknowledged, or ring again for one that was (states.md §3.4 C11e, §6.4, §6.12 item 7).
+4. **A machine nobody checks rings.** A machine that was printing and has shown NOT MONITORED for 2
+   minutes sounds the alarm as drift does, for the same people (the floor board, the line's notify
+   user and the last sender). NOT MONITORED is how a frozen poller, or a printer that no PC can check,
+   shows up, and a backup PC takes over a stuck printer within about 70 s, so 2 minutes of it means
+   something is really wrong. Each PC's status watcher raises it, and only for a machine it saw
+   checked while printing since it started, so the first PC opened in the morning doesn't ring for
+   last night's machines. Not while that PC can't read the server, for a machine that is stopped or
+   inactive, or during a Send. One acknowledgement silences every PC; the machine stays grey NOT
+   MONITORED (states.md §7 item 7, §15 decision 9).
 
 ## OPEN items
 

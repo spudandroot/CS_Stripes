@@ -73,6 +73,8 @@ Keep your real files on the internal share, **not in this repo**.
 
 ## MapleJet Hx printers (set-up for IT)
 
+Step by step, from nothing to a working rollout: the IT checklist in [`docs/maplejet/it-setup.md`](docs/maplejet/it-setup.md).
+
 **Network.** Give each printer a fixed IP address on its own network segment that only accepts
 port 80 from the floor PCs. Stripes talks to printers directly, never through a proxy, one
 request at a time. PCs ask the time server over SNTP (UDP 123). Change every printer's password
@@ -206,6 +208,8 @@ and logs the update (it never changes the old file). This also works when the sh
 at that first start: it happens at the next start. Without the folder, nothing is written.
 
 ### Trying a new version on one PC first
+
+The full test, with what you should see at each step: [`docs/maplejet/test-pc.md`](docs/maplejet/test-pc.md).
 
 1. Download `Stripes.exe` from the new release and **Unblock** it. Keep the old one on the share.
 2. On the test PC, put it in `%LocalAppData%\Programs\Stripes-test\` (not the Group Policy

@@ -3558,6 +3558,262 @@ class PrinUnreadTests(Base):
         self.assertEqual(set(codes), {"running_confirmed"})
 
 
+# --------------------------------------------------------------------------
+# The NOT MONITORED alarm (§7 item 7; owner decision, 31 Oct 2026)
+# --------------------------------------------------------------------------
+
+def nm_alarms(pc, machine_id):
+    """The not_monitored alarms of a machine on the PC's latest board."""
+    m = machine_on_board(pc, machine_id)
+    return [a for a in m.alerts if a.kind == "not_monitored"] if m is not None else []
+
+
+def ringing_on(pc):
+    """What this PC rings for with its floor board open."""
+    return hx_state.sounding_alerts(pc.watcher.latest, pc.identity, floor_board=True)
+
+
+class NotMonitoredAlarmTests(Base):
+    """Every PC's watcher rings for a machine that was printing when nobody has judged it for
+    NOT_MONITORED_ALARM_S of NOT MONITORED. The watching PCs don't poll (FakeClock)."""
+
+    def printing(self, sim, *watchers):
+        """PC akim polls the printing machine (E running, confirmed) while the watchers look. Then akim's PC
+        freezes for good (no request, no P write, no heartbeat), and nobody else can poll the printer."""
+        sim.expect()
+        a = sim.pc("akim")
+        for _ in range(8):
+            sim.run(5)
+            for w in watchers:
+                w.watcher.run_once()
+        self.assertEqual(sim.code(), "running_confirmed")
+        for w in watchers:
+            self.assertEqual(machine_on_board(w, sim.mid).code, "running_confirmed")
+        sim.pcs.remove(a)
+        return a
+
+    def passes(self, sim, seconds, *watchers, step=1):
+        """A pass of every watcher each step seconds: per pass, (the code on the first watcher's board,
+        every watcher's not_monitored alarm ids)."""
+        out = []
+        for _ in range(int(seconds // step)):
+            sim.run(step)
+            for w in watchers:
+                w.watcher.run_once()
+            out.append((machine_on_board(watchers[0], sim.mid).code,
+                        [a.id for w in watchers for a in nm_alarms(w, sim.mid)]))
+        return out
+
+    def ring(self, sim, *watchers):
+        """Passes each second until the watchers ring: NOT MONITORED for 119 s is quiet, 120 s rings on
+        every watcher with one id, which it returns."""
+        out = self.passes(sim, 60, *watchers)
+        start = next(i for i, (code, _) in enumerate(out) if code == "not_monitored")
+        out = out[start:] + self.passes(sim, 120 + start - len(out) + 1, *watchers)
+        self.assertEqual([x for x in out[:120] if x[1]], [])
+        self.assertEqual(len(out), 121)
+        code, ids = out[120]
+        self.assertEqual(code, "not_monitored")
+        self.assertEqual(len(ids), len(watchers))
+        self.assertEqual(len(set(ids)), 1)
+        return ids[0]
+
+    def quiet(self, rows):
+        return [r for r in rows if r[1]]
+
+    def test_two_minutes_after_not_monitored(self):
+        sim = self.sim()
+        carol, dave = PC(sim, "carol"), PC(sim, "dave")
+        self.printing(sim, carol, dave)
+        aid = self.ring(sim, carol, dave)
+        p = sim.p()
+        self.assertTrue(p.printing)
+        self.assertEqual(aid, f"{sim.mid}.not_monitored.{p.judged}_{SID}.{int(p.judged_at * 1000)}")
+        (a,) = nm_alarms(carol, sim.mid)
+        self.assertEqual((a.sound, a.colour, a.recipients), (True, "", ["user:" + JSMITH, "floor"]))
+        self.assertEqual(a.msg.english(), "No PC has checked Line 1 Bagger 1 for 2 min")
+        self.assertEqual([x.id for x in ringing_on(carol)], [aid])
+        self.assertEqual([x.id for x in ringing_on(dave)], [aid])
+        jsmith = PC(sim, "jsmith")                      # the line's notify user and the last sender
+        jsmith.watcher.run_once()
+        self.assertEqual(hx_state.sounding_alerts(dave.watcher.latest, jsmith.identity, floor_board=False), [a])
+        # Sound only: the machine stays grey NOT MONITORED, the floor row too, and P is unchanged
+        m = machine_on_board(carol, sim.mid)
+        self.assertEqual((m.code, m.colour, m.headline.text, m.unacked_sound, m.origin_line),
+                         ("not_monitored", GREY, "NOT MONITORED", True, ORIGIN))
+        row = next(r for r in hx_state.floor_board_rows(carol.watcher.latest) if r.machine_id == sim.mid)
+        self.assertEqual((row.colour, row.status.text), (GREY, "NOT MONITORED"))
+        self.assertEqual(sim.p(), p)
+        self.assertEqual(sim.p().alerts, [])
+        # It goes on, the same id, until something ends it
+        self.assertEqual({tuple(ids) for _, ids in self.passes(sim, 300, carol, dave, step=5)}, {(aid, aid)})
+
+    def test_a_pc_started_over_last_nights_p_never_rings(self):
+        sim = self.sim()
+        carol = PC(sim, "carol")
+        self.printing(sim, carol)
+        sim.run(8 * 3600)                               # the night: nobody polls, and carol makes no pass
+        erin = PC(sim, "erin")                          # the first PC opened in the morning
+        self.assertTrue(sim.p().printing)
+        self.assertEqual(sim.observer.read_expected(sim.mid).mode, "running")
+        rows = self.passes(sim, 3600, erin, step=5)
+        self.assertEqual(self.quiet(rows), [])
+        self.assertEqual(rows[-1][0], "not_monitored")
+        # Unlike a PC that watched it printing last night and stayed open: once its board has shown NOT
+        # MONITORED for two minutes (its own long pause starts the 30 s again, §6.2 item 3.0), it rings
+        rows = self.passes(sim, 160, carol, step=5)
+        self.assertTrue(rows[-1][1])
+        self.assertEqual(nm_alarms(erin, sim.mid), [])
+
+    def test_not_while_this_pc_cant_read_the_share(self):
+        sim = self.sim()
+        carol = PC(sim, "carol", fs=sim.world.fs.view(down=False))
+        self.printing(sim, carol)
+        aid = self.ring(sim, carol)
+        carol.store.fs.down = True                      # only carol: "Server unreachable" is its banner
+        rows = self.passes(sim, 600, carol, step=5)
+        self.assertEqual(self.quiet(rows), [])
+        self.assertFalse(carol.watcher.latest.share_ok)
+        self.assertEqual(ringing_on(carol), [])
+        self.assertEqual(rows[-1][0], "not_monitored")
+        # The share back: two more minutes first (pollers come back within that), then the same occurrence
+        carol.store.fs.down = False
+        carol.store.probe_now()                         # the store's probe runs on a real thread
+        deadline = time.monotonic() + 5
+        while not carol.store.available and time.monotonic() < deadline:
+            time.sleep(0.01)
+        rows = self.passes(sim, 125, carol)
+        first = next(i for i, r in enumerate(rows) if r[1])
+        self.assertEqual((first, rows[first][1]), (120, [aid]))
+
+    def test_not_in_standalone_mode(self):
+        sim = self.sim()
+        carol = PC(sim, "carol", fs=sim.world.fs.view(down=False))
+        self.printing(sim, carol)
+        self.ring(sim, carol)
+        carol.store.fs.down = True
+        carol.poller.mode = "standalone"                # its own checks haven't reached this machine yet
+        rows = self.passes(sim, 600, carol, step=5)
+        self.assertEqual(self.quiet(rows), [])
+        self.assertTrue(carol.watcher.latest.standalone)
+        self.assertEqual(rows[-1][0], "not_monitored")
+        self.assertEqual(ringing_on(carol), [])
+
+    def test_only_while_e_is_running(self):
+        sim = self.sim()
+        carol = PC(sim, "carol")
+        self.printing(sim, carol)
+        first = self.ring(sim, carol)
+        e = sim.observer.read_expected(sim.mid)
+        at = sim.clock.time()
+        for stopped in (dataclasses.replace(e, mode="stopped_by_user", printing_expected=False, stop_reason="user",
+                                            stopped_by=JSMITH, stopped_at=at),
+                        dataclasses.replace(e, mode="test_finished", printing_expected=False,
+                                            test={"run_id": RUN_ID, "kind": "test", "by": JSMITH, "step": 3,
+                                                  "of": 3}),
+                        dataclasses.replace(e, mode="none", printing_expected=False, send_id="", confirmed=False)):
+            with self.subTest(mode=stopped.mode):
+                sim.sender.write_expected(stopped)
+                rows = self.passes(sim, 300, carol, step=5)
+                self.assertEqual(self.quiet(rows), [])           # it ends at once and stays away
+                self.assertEqual(rows[-1][0], "not_monitored")
+        # E running again for a new Send, and nobody checks the printer: a new occurrence, a new id
+        sim.sender.write_expected(dataclasses.replace(e, send_id=SID2))
+        rows = self.passes(sim, 5, carol)
+        (second,) = rows[0][1]
+        self.assertNotEqual(second, first)
+        self.assertEqual(second, first.replace(SID, SID2))
+
+    def test_not_for_an_inactive_machine(self):
+        sim = self.sim()
+        carol = PC(sim, "carol")
+        self.printing(sim, carol)
+        self.ring(sim, carol)
+        data = carol.data.current
+        off = dataclasses.replace(data.machines[sim.mid], active=False)
+        carol.data.current = dataclasses.replace(data, machines={**data.machines, sim.mid: off})
+        carol.watcher.run_once()
+        self.assertIsNone(machine_on_board(carol, sim.mid))
+        self.assertEqual(ringing_on(carol), [])
+        sim.run(600)
+        carol.watcher.run_once()
+        self.assertEqual(ringing_on(carol), [])
+        # Active again: a fresh start, so it rings only after this PC has seen it judged again
+        carol.data.current = data
+        rows = self.passes(sim, 600, carol, step=5)
+        self.assertEqual(self.quiet(rows), [])
+        self.assertEqual(rows[-1][0], "not_monitored")
+
+    def test_not_while_a_lock_shows(self):
+        sim = self.sim()
+        carol = PC(sim, "carol")
+        self.printing(sim, carol)
+        aid = self.ring(sim, carol)
+        lock = sim.observer.lock(sim.pid, purpose="send", run_id=SID2)
+        self.assertEqual(lock.acquire(), "held")
+        codes = set()
+        for i in range(1, 301):                         # a Send holding the lock for 5 minutes
+            sim.run(1)
+            if i % 5 == 0:
+                self.assertTrue(lock._keep_once())
+            carol.watcher.run_once()
+            codes.add(machine_on_board(carol, sim.mid).code)
+            self.assertEqual(nm_alarms(carol, sim.mid), [])
+        self.assertEqual(codes, {"send_in_progress"})
+        lock.release()
+        # No poller after it either: NOT MONITORED again, and two minutes later the same occurrence
+        rows = self.passes(sim, 125, carol)
+        start = next(i for i, r in enumerate(rows) if r[0] == "not_monitored")
+        first = next(i for i, r in enumerate(rows) if r[1])
+        self.assertEqual((first - start, rows[first][1]), (120, [aid]))
+
+    def test_ends_when_judged_moves_and_a_later_one_has_a_new_id(self):
+        sim = self.sim()
+        carol = PC(sim, "carol")
+        self.printing(sim, carol)
+        first = self.ring(sim, carol)
+        judged = sim.p().judged
+        bob = sim.pc("bob")                             # a PC polls the printer again
+        rows = []
+        for _ in range(90):
+            sim.run(1)
+            carol.watcher.run_once()
+            rows.append((machine_on_board(carol, sim.mid).code, sim.p().judged, nm_alarms(carol, sim.mid)))
+            if rows[-1][0] == "running_confirmed":
+                break
+        self.assertEqual(rows[-1][0], "running_confirmed")
+        # It ended when the view stopped being NOT MONITORED, at the latest when judged moved
+        self.assertEqual([r for r in rows if r[0] != "not_monitored" and r[2]], [])
+        self.assertEqual([r for r in rows if r[1] != judged and r[2]], [])
+        sim.pcs.remove(bob)                             # bob's PC freezes too
+        second = self.ring(sim, carol)
+        self.assertNotEqual(second, first)
+        p = sim.p()
+        self.assertGreater(p.judged, judged)
+        self.assertEqual(second, hx_state.not_monitored_alarm_id(sim.mid, p.judged, p.judged_at, SID))
+
+    def test_an_ack_on_one_pc_silences_every_pc(self):
+        sim = self.sim()
+        carol, dave = PC(sim, "carol"), PC(sim, "dave")
+        self.printing(sim, carol, dave)
+        aid = self.ring(sim, carol, dave)
+        carol.watcher.acknowledge([aid])
+        self.assertEqual(ringing_on(carol), [])         # at once
+        carol.watcher.run_once()                        # writes the ack file
+        ack = sim.observer.read_ack(aid)
+        self.assertEqual(ack.by, carol.identity.user)
+        dave.watcher.run_once()                         # reads it within one watch_s
+        self.assertEqual(ringing_on(dave), [])
+        for pc in (carol, dave):
+            m = machine_on_board(pc, sim.mid)
+            self.assertEqual((m.code, m.colour, m.unacked_sound), ("not_monitored", GREY, False))
+            self.assertEqual([(a.id, a.acked_by) for a in nm_alarms(pc, sim.mid)], [(aid, carol.identity.user)])
+        # It stays quiet: the same occurrence keeps its id
+        rows = self.passes(sim, 600, carol, dave, step=5)
+        self.assertEqual({tuple(ids) for _, ids in rows}, {(aid, aid)})
+        self.assertEqual(ringing_on(carol) + ringing_on(dave), [])
+
+
 def machine_on_board(pc, machine_id):
     """The MachineView of a machine on the PC's latest board."""
     for line in pc.watcher.latest.lines:
@@ -3584,6 +3840,7 @@ class ConstantsTests(unittest.TestCase):
         self.assertEqual((hx_poller.MAX_BAGS_PER_S, hx_poller.DAILY_S, hx_poller.DST_KEEP_S, hx_poller.ACK_RETRY_S),
                          (5.0, 86_400.0, 86_400.0, 600.0))
         self.assertEqual((hx_poller.UNCHECKED_LOADS, hx_poller.UNCHECKED_SLOW_SETS), (2, 3))
+        self.assertEqual(hx_poller.NOT_MONITORED_ALARM_S, 120.0)
 
     def test_dst_change_id(self):
         self.assertEqual(hx_poller.dst_change_id(CHANGE, -18000.0, offset_fn=DST), "20261101-18000")
