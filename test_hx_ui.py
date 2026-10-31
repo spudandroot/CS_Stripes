@@ -815,6 +815,11 @@ class MonitorTests(UiCase):
 
 
 class FloorBoardTests(UiCase):
+    # The screen a board opens on unless a test names its own: a fake 1920x1080 one (the floor PCs'
+    # larger size), so that no test depends on the real screen of the machine running it (a 1024x768
+    # CI runner, a 1366x768 laptop). monitors=[] is Tk's real screen.
+    SCREENS = (hx_win.Monitor(0, 0, 0, 1920, 1080, True),)
+
     def board(self):
         ringing = alert("al_f", to=("floor", "user:EXAMPLE\\akim"), machine="mc_2")
         a = view("mc_1", origin="Product of USA")
@@ -825,9 +830,17 @@ class FloorBoardTests(UiCase):
         d = view("mc_4", line="ln_2", origin="", name="Line 2 Bagger 4")
         return board(line("ln_1", "Line 1", [a, b]), line("ln_2", "Line 2", [c, d]))
 
-    def open(self, services, b=None, **kw):
-        with mock.patch.object(hx_win, "monitors", return_value=kw.pop("monitors", [])):
+    def open(self, services, b=None, *, monitors=SCREENS, max_size=None, **kw):
+        """A board on the fake screens. max_size: the most the window may get; by default as big as
+        the fake screens. Tk keeps a window to the REAL screen otherwise, and on Windows to the real
+        screen less the window's frame: a 1280x800 board on a fake 1920x1080 screen got 1024x749 on a
+        1024x768 runner, so the fake screen alone isn't enough."""
+        with mock.patch.object(hx_win, "monitors", return_value=list(monitors)):
             fb = FloorBoard(self.root, services, **kw)
+        if max_size is None and monitors:
+            max_size = (max(m.width for m in monitors), max(m.height for m in monitors))
+        if max_size is not None:
+            fb.maxsize(*max_size)
         fb.show(self.board() if b is None else b)
         self.root.update_idletasks()
         return fb
@@ -922,6 +935,44 @@ class FloorBoardTests(UiCase):
         fb.destroy()
         fb = self.open(services, monitors=mons, size="huge")
         self.assertTrue(fb.full_screen)
+        fb.destroy()
+        # A window size bigger than a small screen: cut to the screen, each way on its own (ui.md §10.2)
+        small = [hx_win.Monitor(0, 0, 0, 1024, 768, True)]
+        for size, spec in (("1280x800", "1024x768"), ("1280x600", "1024x600"), ("800x900", "800x768"),
+                           ("800x600", "800x600")):
+            fb = self.open(services, monitors=small, size=size)
+            self.assertEqual((fb.geometry_spec, fb.full_screen), (f"{spec}+0+0", False), size)
+            fb.destroy()
+
+    def test_a_board_bigger_than_its_screen_shows_every_row(self):
+        # A 1280x800 board on a 1024x768 screen is cut to the screen, and Windows then keeps the window's
+        # frame on the screen too, so the window gets less than it asked for (1024x749 on a 1024x768 CI
+        # runner). A smaller maximum size stands in for the frame here. The board was first drawn for the
+        # size it asked for; the resize draws it again for the size it got: every row fits, or it scrolls
+        services = self.make()
+        small = [hx_win.Monitor(0, 0, 0, 1024, 768, True)]
+        for b, scrolls in ((self.big_board(4, 3), False), (self.big_board(4, 4), True)):
+            with self.subTest(machines=sum(len(ln.machines) for ln in b.lines)):
+                fb = self.open(services, b, size="1280x800", monitors=small, max_size=(1024, 720))
+                self.assertEqual(fb.geometry_spec, "1024x768+0+0")
+
+                def drawn_for_the_window():
+                    width, height = fb.winfo_width(), fb.winfo_height()
+                    return ((width, height) == (1024, 720) and fb._redraw_timer is None
+                            and fb.layout == floor_layout(width, height, len(fb.rows), len(fb.line_items),
+                                                          fb.scrollbar.winfo_reqwidth()))
+                self.pump(drawn_for_the_window)
+                c, lay = fb.canvas, fb.layout
+                self.assertEqual((lay.scrolls, shown(fb.scrollbar)), (scrolls, scrolls))
+                spans = self.check_rows(fb, "1024x720")
+                self.assertEqual(c.winfo_height(), 720 - lay.header_h)
+                if scrolls:
+                    self.assertEqual([float(v) for v in str(c.cget("scrollregion")).split()],
+                                     [0, 0, lay.width, lay.rows_h])
+                    self.assertLessEqual(spans[-1][1], lay.rows_h)                 # the last row can be reached
+                else:
+                    self.assertLessEqual(spans[-1][1], c.winfo_height())           # the last row isn't cut off
+                fb.destroy()
 
     def check_rows(self, fb, size):
         """Every row inside the room under the header, every text inside its column and its row,
