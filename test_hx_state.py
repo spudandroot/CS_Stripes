@@ -159,11 +159,11 @@ class TableTests(unittest.TestCase):
             "left_red": RED, "rejected": RED, "printing_on_unexpected": RED, "unreachable_printing": RED,
             "printing_off": RED, "drift": RED, "unknown_while_down": AMBER, "ink_out": RED,
             "cartridge_error": RED, "stopped_needs_send": RED, "test_finished": RED, "off": GREY,
-            "not_printing": AMBER, "message_unchecked": AMBER, "unconfirmed": AMBER,
+            "not_printing": AMBER, "message_unchecked": AMBER, "printing_unchecked": AMBER, "unconfirmed": AMBER,
             "confirmed_with_notes": AMBER, "not_from_stripes": AMBER, "stopped": GREY, "idle": GREY,
             "running_confirmed": GREEN}
         self.assertEqual(hs.STATE_CODES, expected_codes)
-        self.assertEqual(len(hs.STATE_CODES), 40)
+        self.assertEqual(len(hs.STATE_CODES), 41)
 
     def test_precedence_and_lists(self):
         judged = set(hs.STATE_CODES) - set(hs.VIEW_CODES)
@@ -323,6 +323,7 @@ ROWS = [
     ("off", facts(reachable=False, failures=3), expected(), {"prev": poll(printing=False)}, "off", []),
     ("off, no prev", facts(reachable=False, failures=3), None, {}, "off", []),
     ("message unchecked", facts(running=None), expected(), {}, "message_unchecked", []),
+    ("printing unchecked", facts(printing=None, printing_unchecked=True), expected(), {}, "printing_unchecked", []),
     ("unconfirmed", facts(), expected(confirmed=False, confirmed_by=""), {}, "unconfirmed", []),
     ("unconfirmed, printing not read", facts(printing=None), expected(confirmed=False), {}, "unconfirmed", []),
     ("confirmed with notes", facts(), expected(notes=["pc_time"]), {}, "confirmed_with_notes", []),
@@ -688,6 +689,200 @@ class UntrustedTests(unittest.TestCase):
         self.assertEqual(classify(down, expected("stop_requested_at_printer")).code, "stop_requested")
         self.assertEqual(classify(down, expected("test_finished")).code, "test_finished")
         self.assertEqual(classify(down, STOPPED).code, "off")
+
+
+class CarryTests(unittest.TestCase):
+    """§4.1: an alert carried while the printer can't be trusted ends at once when the E-only part of its
+    condition no longer holds; no reading is needed for that (§3.7 rule 2, §15 decision 2)."""
+    UNREACHABLE = dict(reachable=False, failures=3, printing=None, running=None, message_name=None, bag_count=None,
+                       ink_level=None, clock_offset_s=None)
+
+    def ends(self, prev, e, **r):
+        j = judge(prev, reading(**{**self.UNREACHABLE, **r}), e)
+        self.assertTrue(j.committed)
+        return [a.kind for a in j.alerts], [a.kind for a in j.ended]
+
+    def test_not_from_stripes_ends_at_the_first_send(self):
+        nfs = alert("not_from_stripes")
+        prev = poll("not_from_stripes", alerts=[nfs], expected_counter=0, reachable=False, failures=3, bags_recent=0)
+        alerts, ended = self.ends(prev, expected(counter=1))
+        self.assertNotIn("not_from_stripes", alerts)
+        self.assertIn("not_from_stripes", ended)
+        out = classify(facts(problem="wrong_printer"), expected(counter=1), prev=prev)
+        self.assertNotIn("not_from_stripes", kinds(out))
+        # Still carried while there is no Send (no E, or a first Send that failed before the switch)
+        self.assertIn("not_from_stripes", self.ends(prev, None)[0])
+        self.assertIn("not_from_stripes", self.ends(prev, expected("none", counter=0, failure=failure()))[0])
+
+    def test_printing_on_ends_when_e_changes(self):
+        on = alert("printing_on")
+        prev = poll("printing_on_unexpected", alerts=[on], reachable=False, failures=3, bags_recent=0)
+        stopped = dataclasses.replace(STOPPED, counter=5)
+        self.assertIn("printing_on", self.ends(prev, stopped)[0])                       # the same E: carried
+        self.assertEqual(self.ends(prev, expected(counter=6))[1], ["printing_on"])       # a Send
+        failed = dataclasses.replace(stopped, counter=6, failure=failure())              # a failed Send: E changed
+        self.assertIn("printing_on", self.ends(prev, failed)[1])
+        out = classify(facts(problem="login_failed"), expected(counter=6), prev=prev)
+        self.assertNotIn("printing_on", kinds(out))
+
+    def test_printing_off_ends_when_mode_isnt_running(self):
+        off = alert("printing_off")
+        prev = poll("off", alerts=[off], reachable=False, failures=3, printing=False, bags_recent=0)
+        self.assertIn("printing_off", self.ends(prev, expected())[0])                    # still running: carried
+        alerts, ended = self.ends(prev, dataclasses.replace(STOPPED, counter=6))
+        self.assertEqual((alerts, ended), ([], ["printing_off"]))
+        alerts, ended = self.ends(prev, expected("stop_requested_at_printer", counter=6))
+        self.assertEqual((alerts, ended), (["stop_failed"], ["printing_off"]))
+
+    def test_message_unreadable_ends_when_mode_isnt_running(self):
+        unreadable = alert("message_unreadable")
+        prev = poll("message_unchecked", alerts=[unreadable], reachable=False, failures=3, bags_recent=0,
+                    running_unchecked=True, running=None)
+        self.assertIn("message_unreadable", self.ends(prev, expected())[0])
+        self.assertEqual(self.ends(prev, dataclasses.replace(STOPPED, counter=6))[1], ["message_unreadable"])
+
+
+class PrintingUncheckedTests(unittest.TestCase):
+    """§6.6: PRIN not read for PRIN_UNREAD_LIMIT cycles in a row: printing is unknown, never green."""
+
+    def test_unknown_printing_is_amber_not_green(self):
+        out = classify(facts(printing=None, printing_unchecked=True), expected())
+        self.assertEqual((out.code, hs.STATE_CODES[out.code], kinds(out)), ("printing_unchecked", AMBER, []))
+        # Amber codes keep their own headline; only green is replaced
+        self.assertEqual(classify(facts(printing=None, printing_unchecked=True),
+                                  expected(confirmed=False, confirmed_by="")).code, "unconfirmed")
+        # The last known value stays in the facts (and so in P), with printing_unchecked set
+        f = hs.facts_from(poll(), reading(printing=None, printing_unchecked=True))
+        self.assertEqual((f.printing, f.printing_unchecked), (True, True))
+
+    def test_it_commits_at_once_and_back_needs_a_second_reading(self):
+        j = judge(poll(), reading(printing=None, printing_unchecked=True), expected())
+        self.assertTrue(j.committed)                   # it already sums PRIN_UNREAD_LIMIT cycles
+        self.assertEqual(j.state.code, "printing_unchecked")
+        prev = poll("printing_unchecked", printing=None, printing_unchecked=True)
+        j = judge(prev, reading(printing=True, printing_unchecked=False), expected())
+        self.assertFalse(j.committed)
+        self.assertEqual(j.recheck, ["PRIN"])
+        # A second reading whose PRIN couldn't be read takes prev's: it confirms nothing
+        r2 = reading(printing=None, printing_unchecked=None, second=True, pending_code=j.candidate.code,
+                     pending_alerts=j.candidate_alerts)
+        self.assertEqual(judge(prev, r2, expected()).state.code, "printing_unchecked")
+        r2 = dataclasses.replace(r2, printing=True, printing_unchecked=False)
+        j2 = judge(prev, r2, expected())
+        self.assertEqual((j2.committed, j2.state.code), (True, "running_confirmed"))
+
+    # PRIN unread for PRIN_UNREAD_LIMIT cycles while the printer answers everything else
+    UNREAD = dict(printing=None, printing_unchecked=True, ink_level=None)
+
+    def through(self, prev, r, e, lk=None):
+        """judge(), with a second reading that agrees when one is asked for, as the poller does."""
+        j = judge(prev, r, e, lk)
+        if not j.committed and j.recheck:
+            r2 = dataclasses.replace(r, second=True, at=r.at + 1, pending_code=j.candidate.code,
+                                     pending_alerts=j.candidate_alerts)
+            j = judge(prev, r2, e, lk)
+        return j
+
+    def active(self, j):
+        return {a.kind: a for a in j.alerts if a.active}
+
+    def test_alerts_that_need_printing_stay_with_their_ids_and_acks(self):
+        # A regression of the first PRIN_UNREAD_LIMIT fix: printing None ended every alert that needs it
+        none_e = expected("none", counter=0, send_id="", message_name="", fingerprint="", origin_line="",
+                          confirmed=False, confirmed_by="", sender="")
+        test_e = expected("test_running", test={"run_id": RUN_ID, "by": JSMITH})
+        stopped = dataclasses.replace(STOPPED, counter=5)
+        cases = [
+            ("ink_out", "ink_out", dict(ink_level=hs.INK_NONE), expected(), RED),
+            ("cartridge_error", "cartridge_error", dict(ink_level=hs.INK_NOT_DETECTED), expected(), RED),
+            ("printing_on", "printing_on_unexpected", {}, stopped, RED),
+            ("printing_off", "printing_off", dict(printing=False), expected(), RED),
+            ("test_still_printing", "test_orphaned", {}, test_e, RED),
+            ("not_from_stripes", "not_from_stripes", dict(expected_counter=0), none_e, AMBER),
+        ]
+        for kind, code, p_kw, e, colour in cases:
+            for acked_by in ("", AKIM):
+                with self.subTest(kind=kind, acked=bool(acked_by)):
+                    ref = RUN_ID if kind == "test_still_printing" else ""
+                    a = alert(kind, ref=ref, acked_by=acked_by)
+                    prev = poll(code, alerts=[a], **p_kw)
+                    j = self.through(prev, reading(**self.UNREAD), e)
+                    kept = self.active(j).get(kind)
+                    self.assertIsNotNone(kept, f"{kind} ended while printing can't be read")
+                    self.assertEqual((kept.id, kept.acked_by), (a.id, acked_by))
+                    self.assertEqual((j.state.code, j.state.colour), (code, colour))
+                    self.assertEqual(j.ended, [])
+
+    def test_an_acked_ink_out_keeps_its_id_after_a_busy_spell(self):
+        a = alert("ink_out", acked_by=AKIM)
+        prev = poll("ink_out", alerts=[a], ink_level=hs.INK_NONE)
+        j1 = self.through(prev, reading(**self.UNREAD), expected())
+        p1 = dataclasses.replace(prev, state=j1.state, alerts=j1.alerts, printing=j1.facts.printing,
+                                 printing_unchecked=j1.facts.printing_unchecked)
+        self.assertEqual((p1.printing, p1.printing_unchecked), (True, True))     # the last known value
+        j2 = self.through(p1, reading(printing=True, printing_unchecked=False, ink_level=hs.INK_NONE), expected())
+        ink = self.active(j2)["ink_out"]
+        self.assertEqual((ink.id, ink.acked_by), (a.id, AKIM))
+        self.assertEqual(j2.started, [])
+
+    def test_no_new_alert_and_no_grey_from_the_last_known_value(self):
+        # Printing unknown never starts an alert that needs it: ink out reads as low ink (amber, an
+        # alert), and printing last known on with E stopped isn't printing_on
+        j = self.through(poll(), reading(**{**self.UNREAD, "ink_level": hs.INK_NONE}), expected())
+        self.assertEqual((j.state.code, sorted(self.active(j))), ("printing_unchecked", ["low_ink"]))
+        stopped = dataclasses.replace(STOPPED, counter=6)
+        j = self.through(poll("stopped", printing=False), reading(**self.UNREAD), stopped)
+        self.assertEqual((j.state.code, j.state.colour, j.alerts), ("printing_unchecked", AMBER, []))
+        j = self.through(poll("stopped"), reading(**self.UNREAD), stopped)
+        self.assertEqual((j.state.code, j.alerts), ("printing_unchecked", []))
+        none_e = expected("none", counter=0, send_id="", message_name="", fingerprint="", origin_line="",
+                          confirmed=False, confirmed_by="", sender="")
+        j = self.through(poll("idle", printing=False, expected_counter=0), reading(**self.UNREAD), none_e)
+        self.assertEqual((j.state.code, j.state.colour, j.alerts), ("printing_unchecked", AMBER, []))
+        # A Stop asked at the printer, printing unknown: stop_requested, never stopped
+        j = self.through(poll("stop_failed", alerts=[alert("stop_failed")]), reading(**self.UNREAD),
+                         expected("stop_requested_at_printer", counter=5))
+        self.assertEqual((j.state.code, [a.kind for a in j.alerts]), ("stop_requested", ["stop_failed"]))
+
+    def test_the_last_known_value_counts_after_the_spell(self):
+        # Printing on, then unread, then silence while bags went out: went_silent, as without the spell
+        silence = reading(reachable=False, printing=None, failures=3, running=None, message_name=None,
+                          bag_count=None, ink_level=None, clock_offset_s=None)
+        for printing in (True, None):        # None: never read before PRIN became unreadable
+            prev = poll("printing_unchecked", printing=printing, printing_unchecked=True, bags_recent=12)
+            j = self.through(prev, silence, expected())
+            self.assertEqual((j.state.code, sorted(self.active(j))), ("unreachable_printing", ["went_silent"]))
+            # ... and PRIN read 0 afterwards (twice): red printing_off, as after a known on
+            j = self.through(prev, reading(printing=False, printing_unchecked=False), expected())
+            self.assertEqual((j.state.code, sorted(self.active(j))), ("printing_off", ["printing_off"]))
+        prev = poll("printing_unchecked", printing=False, printing_unchecked=True, bags_recent=12)
+        self.assertEqual(self.through(prev, silence, expected()).state.code, "off")
+        self.assertEqual(self.through(prev, reading(printing=False, printing_unchecked=False),
+                                      expected()).state.code, "not_printing")
+
+    def test_the_view_offers_stop_and_shows_printing_unknown(self):
+        unknown = poll("printing_unchecked", printing_unchecked=True)
+        v = view(unknown, e=expected())
+        self.assertEqual((v.code, v.colour, v.can_stop, v.printing), ("printing_unchecked", AMBER, True, None))
+        v = view(dataclasses.replace(unknown, printing=None), e=expected())
+        self.assertTrue(v.can_stop)
+        # Resume needs printing read off
+        off = poll("printing_off", printing=False, alerts=[alert("printing_off")])
+        self.assertTrue(view(off, e=expected()).can_resume)
+        self.assertFalse(view(dataclasses.replace(off, printing_unchecked=True), e=expected()).can_resume)
+        # Nothing ever sent from Stripes: a Send is still what it needs
+        none_e = expected("none", counter=0, send_id="", message_name="", fingerprint="", origin_line="",
+                          confirmed=False, confirmed_by="", sender="")
+        v = view(poll("printing_unchecked", printing=False, printing_unchecked=True, expected_counter=0), e=none_e)
+        self.assertTrue(v.needs_send)
+
+
+class NaturalKeyTests(unittest.TestCase):
+    def test_only_ascii_digits_are_numbers(self):
+        names = ["Bagger 10", "Bagger 2", "Bagger 1²", "Bagger \u0663", "Bagger 1"]
+        ordered = sorted(names, key=hs.natural_key)
+        self.assertEqual(ordered[:4], ["Bagger 1", "Bagger 1²", "Bagger 2", "Bagger 10"])
+        self.assertEqual(hs.natural_key("Line ²"), [(1, 0, "line ²")])
 
 
 # --------------------------------------------------------------------------

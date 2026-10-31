@@ -445,6 +445,25 @@ class ParserTests(unittest.TestCase):
                                             b"<RP/>\r\n<MARG>0,0</MARG>\r\n<X><Y>1</Y></X>\r\n</CTEXT>"))
         self.assertEqual(r.design.items[0].pairs[-3:], [("RP", ""), ("MARG", "0,0"), ("X.Y", "1")])
 
+    def test_nesting_depth(self):
+        # §11.1 item 3: at most MAX_SME_DEPTH elements open at once. A reply nested 1,000 levels deep (36 KB,
+        # well under MAX_SME_REPLY) raised RecursionError from _leaves instead of WebReadFailed, so load_slot
+        # didn't count it as nonsense and its callers took it for a Stripes bug
+        body = fixture("sme_load_slot9.bin")
+
+        def nested(levels):
+            return body.replace(b"<MARG>0,0</MARG>\r\n</CTEXT>", b"<MARG>0,0</MARG>" + b"<A>" * levels + b"<B>1</B>"
+                                + b"</A>" * levels + b"\r\n</CTEXT>", 1)
+        # SM > FCDOC > CTEXT is 3 deep, so 12 levels of A put B at 16
+        deepest = hp.parse_sme_reply(nested(12)).design.items[0].pairs[-1]
+        self.assertEqual(deepest, (".".join(["A"] * 12 + ["B"]), "1"))
+        self.assertEqual(hp.parse_sme_reply(nested(4)).design.items[0].pairs[-1], ("A.A.A.A.B", "1"))
+        for levels in (13, 1500):
+            with self.assertRaises(WebReadFailed) as e:
+                hp.parse_sme_reply(nested(levels))
+            self.assertEqual(e.exception.msg.text, "{printer} sent back a message Stripes doesn't recognise.")
+        self.assertLess(len(nested(1500)), hp.MAX_SME_REPLY)
+
     def test_failures(self):
         body = fixture("sme_load_slot9.bin")
         empty = fixture("sme_load_slot9_empty.bin")
@@ -816,6 +835,53 @@ class AutopilotTests(unittest.TestCase):
         with self.assertRaises(BadReply):
             c.check_uid()
         self.assertEqual(c.nonsense, 2)
+        self.assertEqual(fake.violations, [])
+
+    def test_a_deadline_is_checked_before_every_exchange(self):
+        # §9 item 2: with a deadline, no exchange starts that couldn't end by it, after the gate too:
+        # the write after the warm-up read and the retry of a read. A lock holder passes its lease end
+        # (send.md §10.5), so a PC that froze in between sends nothing after another PC may own the printer.
+        # Before, only the gate was checked, and a frozen command went out after a takeover
+        clock = FakeClock()
+        fake = start(self, clock=clock)
+        c = client(fake, clock)
+        froze = lambda seconds, answer: lambda: (clock.advance(seconds), answer)[1]
+        fake.override("HXUI", froze(6.0, "1109"))         # the PC froze 6 s while the warm-up read ran
+        with self.assertRaises(PrinterBusy):
+            c.command(Command.set("PRINT", 0), deadline=clock.monotonic() + hp.worst_case_s("command"))
+        self.assertEqual((tags(fake), fake.writes), (["HXUI"], []))
+        self.assertTrue(fake.printing)
+        fake.override("HXUI", None)
+        fake.reset_observations()
+        c.command(Command.set("PRINT", 1), deadline=clock.monotonic() + hp.worst_case_s("command"))
+        self.assertEqual(fake.writes, ["PRINT"])            # in time: sent as before
+        # A read whose retry couldn't end by the deadline raises the first error instead
+        for tag, call in (("PRIN", lambda d: c.read("PRIN", deadline=d)),
+                          ("PRIN", lambda d: c.query("PRIN", deadline=d)),
+                          ("HXUI", lambda d: c.check_uid(deadline=d))):
+            with self.subTest(call=call):
+                fake.reset_observations()
+                fake.override(tag, froze(3.0, "7"))
+                with self.assertRaises(PrinterBusy):
+                    call(clock.monotonic() + hp.worst_case_s("read"))
+                self.assertEqual(len(fake.requests), 1)
+                fake.override(tag, None)
+        # ... and so does one frozen in the gap before its retry
+        fake.reset_observations()
+        fake.override("PRIN", "7")
+        sleep = c.clock.sleep
+        with mock.patch.object(c.clock, "sleep", lambda s, cancel=None: (sleep(s), clock.advance(3.0))[0]):
+            with self.assertRaises(PrinterBusy):
+                c.read("PRIN", deadline=clock.monotonic() + hp.worst_case_s("read"))
+        self.assertEqual(len(fake.requests), 1)
+        fake.override("PRIN", None)
+        # read_twice and check_uid give the deadline to each read
+        fake.reset_observations()
+        self.assertEqual(c.read_twice("PRIN", deadline=clock.monotonic() + 11.0), 1)
+        c.check_uid(deadline=clock.monotonic() + 11.0)
+        with self.assertRaises(PrinterBusy):
+            c.read_twice("PRIN", deadline=clock.monotonic() + 5.5)     # the second read can't start in time
+        self.assertEqual(len(fake.requests), 4)
         self.assertEqual(fake.violations, [])
 
     def test_silent(self):
@@ -1277,6 +1343,18 @@ class WebTests(unittest.TestCase):
                 with fake.lock:
                     first, second = (q["t"] for q in fake.requests)
                 self.assertAlmostEqual(second - first, r, places=6)
+
+    def test_a_reply_nested_too_deep_is_nonsense(self):
+        # §10.6 item 7: a Load reply the parser refuses is WebReadFailed and adds 1 to nonsense, however deep
+        deep = b"<A>" * 1500 + b"<B>1</B>" + b"</A>" * 1500
+        self.fake.web_reply_hook = lambda body: body.replace(b"</CTDAT>", deep + b"</CTDAT>", 1)
+        with self.assertRaises(WebReadFailed) as e:
+            self.c.load_slot(0)                                 # slot 1 holds a message with a CTDAT
+        self.assertEqual(str(e.exception), "Printer 1 sent back a message Stripes doesn't recognise.")
+        self.assertEqual(self.c.nonsense, 1)
+        self.fake.web_reply_hook = None
+        self.assertEqual(self.c.load_slot(0).slot, 1)          # the gate was released
+        self.assertEqual(self.fake.violations, [])
 
     def test_wrong_slot(self):
         self.fake.web_reply_hook = lambda body: body.replace(b"<MSNO>9</MSNO>", b"<MSNO>10</MSNO>")

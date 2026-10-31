@@ -69,6 +69,7 @@ STATE_CODES = {
     "off": GREY,
     "not_printing": AMBER,
     "message_unchecked": AMBER,
+    "printing_unchecked": AMBER,
     "unconfirmed": AMBER,
     "confirmed_with_notes": AMBER,
     "not_from_stripes": AMBER,
@@ -86,7 +87,7 @@ PRECEDENCE = ("wrong_printer", "login_failed",
               "unreachable_printing", "printing_off", "drift", "unknown_while_down",
               "ink_out", "cartridge_error",
               "stopped_needs_send", "test_finished",
-              "off", "not_printing", "message_unchecked",
+              "off", "not_printing", "message_unchecked", "printing_unchecked",
               "unconfirmed", "confirmed_with_notes", "not_from_stripes",
               "stopped", "idle", "running_confirmed")
 
@@ -144,6 +145,7 @@ STATE_TEXTS = {
     "off": N_("Printer off"),
     "not_printing": N_("Printing is off"),
     "message_unchecked": N_("Can't read the message on this printer"),
+    "printing_unchecked": N_("Can't read the printer's state"),
     "unconfirmed": N_("Send not confirmed"),
     "confirmed_with_notes": N_("Printing, not fully checked"),
     "not_from_stripes": N_("Not sent from Stripes yet"),
@@ -232,6 +234,7 @@ ES = {
     "Printer off": "Impresora apagada",
     "Printing is off": "La impresión está apagada",
     "Can't read the message on this printer": "No se puede leer el mensaje de esta impresora",
+    "Can't read the printer's state": "No se puede leer el estado de la impresora",
     "Send not confirmed": "Envío no confirmado",
     "Printing, not fully checked": "Imprimiendo, sin revisión completa",
     "Not sent from Stripes yet": "Todavía no se envió desde Stripes",
@@ -378,6 +381,7 @@ class Reading:
     bags_recent: int | None = None        # §6.7
     foreign_client: bool | None = None    # §6.8; None: not computed (carry prev)
     running_unchecked: bool | None = None # §6.5 message check; None: not computed (carry prev)
+    printing_unchecked: bool | None = None  # §6.6: no good PRIN for PRIN_UNREAD_LIMIT cycles; None: carry prev
     daily: dict | None = None             # a daily check completed this cycle (§6.10)
     running_reset: bool = False           # R no longer describes the printer and no Load succeeded
     acked: dict[str, Ack] = field(default_factory=dict)   # acks found for prev's active alerts
@@ -399,6 +403,7 @@ class Facts:
     daily: dict = field(default_factory=dict)
     foreign_client: bool = False
     running_unchecked: bool = False
+    printing_unchecked: bool = False      # printing couldn't be read for long: F.printing is only the last known value
     failures: int = 0
     message_name: str | None = None
     bag_count: int | None = None
@@ -409,7 +414,7 @@ class Facts:
 
 
 _JUDGED = ("reachable", "problem", "printing", "running", "ink_level", "clock_offset_s", "daily",
-           "foreign_client", "running_unchecked")
+           "foreign_client", "running_unchecked", "printing_unchecked")
 _DISPLAY = ("failures", "message_name", "bag_count", "bags_recent", "ink_name", "head_temp_c", "clock_source")
 
 
@@ -482,9 +487,14 @@ def known_drift(prev: PollStatus | None) -> bool:
             or any(a.active and a.kind == "drift" for a in prev.alerts))
 
 
+def maybe_printing(prev: PollStatus | None) -> bool:
+    """P's last known printing is on, or was never known before PRIN became unreadable (§6.6)."""
+    return prev is not None and (prev.printing is True or (prev.printing is None and prev.printing_unchecked))
+
+
 def was_printing(prev: PollStatus | None, company: Company) -> bool:
     """The printer was printing bags just before it stopped answering (§3.7)."""
-    if prev is None or prev.printing is not True:
+    if not maybe_printing(prev):
         return False
     return company.bag_counter == "none" or (prev.bags_recent or 0) > 0
 
@@ -526,9 +536,10 @@ def can_acknowledge(identity: Identity, company: Company) -> bool:
 
 
 def natural_key(name: str) -> list:
-    """"Line 2" before "Line 10": digit runs as ints, the rest casefolded."""
-    return [(0, int(part), "") if part.isdigit() else (1, 0, part.casefold())
-            for part in re.split(r"(\d+)", name or "") if part]
+    """"Line 2" before "Line 10": ASCII digit runs as ints, the rest casefolded. Only ASCII digits:
+    str.isdigit() also takes "²", and int("²") raises."""
+    return [(0, int(part), "") if part.isascii() and part.isdigit() else (1, 0, part.casefold())
+            for part in re.split(r"([0-9]+)", name or "") if part]
 
 
 def worst(colours) -> str:
@@ -582,6 +593,7 @@ def prev_facts(prev: PollStatus | None) -> Facts:
     return Facts(reachable=prev.reachable, problem=prev.problem, printing=prev.printing, running=prev.running,
                  ink_level=prev.ink_level, clock_offset_s=prev.clock_offset_s, daily=dict(prev.daily or {}),
                  foreign_client=prev.foreign_client, running_unchecked=prev.running_unchecked,
+                 printing_unchecked=prev.printing_unchecked,
                  failures=prev.failures, message_name=prev.message_name, bag_count=prev.bag_count,
                  bags_recent=prev.bags_recent, ink_name=prev.ink_name, head_temp_c=prev.head_temp_c)
 
@@ -608,7 +620,10 @@ def facts_from(prev: PollStatus | None, reading: Reading) -> Facts:
     return Facts(
         reachable=bool(reading.reachable),
         problem=reading.problem if reading.reachable else old.problem,
+        # Printing that couldn't be read for PRIN_UNREAD_LIMIT cycles keeps its last known value, with
+        # printing_unchecked set: classify treats it as unknown (§6.6)
         printing=pick(reading.printing, old.printing),
+        printing_unchecked=pick(reading.printing_unchecked, old.printing_unchecked),
         running=running,
         ink_level=pick(reading.ink_level, old.ink_level),
         clock_offset_s=pick(reading.clock_offset_s, old.clock_offset_s),
@@ -653,7 +668,7 @@ def evidence(old: Facts, new: Facts, timings: Timings = TIMINGS) -> list[str]:
             add("uid")
         if "login_failed" in (old.problem, new.problem):
             add("login")
-    if old.printing != new.printing:
+    if old.printing != new.printing or old.printing_unchecked != new.printing_unchecked:
         add("PRIN")
     # A running message that couldn't be read is no reading to confirm; a Load that read something
     # different is, and needs a second Load to agree
@@ -739,8 +754,11 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
     printer = data.printers.get(machine.printer_id)
     printer_name = printer.name if printer is not None else machine.name
     trusted = F.reachable and F.problem == ""
-    on = trusted and F.printing is True
-    off_read = trusted and F.printing is False
+    # §6.6: PRIN unread for PRIN_UNREAD_LIMIT cycles. F.printing is only the last known value: nothing
+    # needs printing read on or off, and an alert that does stays as it is, the same id and acks
+    prin_unknown = trusted and F.printing_unchecked
+    on = trusted and not prin_unknown and F.printing is True
+    off_read = trusted and not prin_unknown and F.printing is False
     running = F.running
     failure = e.failure
     after_switch = bool(failure is not None and failure.after_switch)
@@ -772,11 +790,17 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
         needs.append(AlertNeed(kind=kind, ref=ref, colour=k.colour if colour is None else colour, msg=msg,
                                roles=k.roles))
 
-    def carry(kind):
-        # §3.7: while the facts can't be trusted an alert that needs a fresh reading stays, unless acknowledged
+    def carry(kind, *, acked_too=False):
+        # §3.7: while the facts can't be trusted an alert that needs a fresh reading stays, unless acknowledged.
+        # acked_too (printing unknown, §6.6): acknowledged ones stay too. True when one stays
+        kept = False
         for a in prev_active:
-            if a.kind == kind and not is_acked(a) and not any(n.kind == kind and n.ref == a.ref for n in needs):
-                needs.append(AlertNeed(kind=kind, ref=a.ref, colour=a.colour, msg=a.msg, roles=ALERT_KINDS[kind].roles))
+            if a.kind == kind and (acked_too or not is_acked(a)):
+                kept = True
+                if not any(n.kind == kind and n.ref == a.ref for n in needs):
+                    needs.append(AlertNeed(kind=kind, ref=a.ref, colour=a.colour, msg=a.msg,
+                                           roles=ALERT_KINDS[kind].roles))
+        return kept
 
     # C1, C2: another printer, or a refused login
     if F.reachable and F.problem == "wrong_printer":
@@ -791,7 +815,8 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
         ref = lk.run_id if lk is not None and lk.purpose in ("test", "calibration") else \
             str((e.test or {}).get("run_id") or "")
         still = prev_alert("test_still_printing", ref)
-        if on or (not trusted and prev is not None and prev.printing is True and not is_acked(still)):
+        if (on or (not trusted and maybe_printing(prev) and not is_acked(still))
+                or (prin_unknown and (still is not None or maybe_printing(prev)))):
             codes.add("test_orphaned")
             need("test_still_printing", ref=ref)
         else:
@@ -812,7 +837,7 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
         if on:
             codes.add("stop_failed")
             need("stop_failed")
-        elif not trusted or F.printing is None:
+        elif not trusted or prin_unknown or F.printing is None:
             codes.add("stop_requested")
             need("stop_failed")
 
@@ -827,13 +852,16 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
             codes.add("rejected")
         need("send_rejected", ref=e.send_id, values={"machine": machine.name, "user": _sender(e)})
 
-    # C8: printing switched on while Stripes expects it off
-    if trusted:
+    # C8: printing switched on while Stripes expects it off. While not trusted the alert is carried only
+    # while its E-only part still holds: it ends when E changes (§4.1), with no reading needed
+    e_same = prev is None or prev.expected_counter == e.counter
+    if trusted and not prin_unknown:
         if on and mode in ("stopped_by_user", "test_finished"):
             codes.add("printing_on_unexpected")
             need("printing_on")
-    else:
-        carry("printing_on")
+    elif mode in ("stopped_by_user", "test_finished") and e_same:
+        if carry("printing_on", acked_too=prin_unknown) and prin_unknown:
+            codes.add("printing_on_unexpected")     # printing unknown: the red state stays too
 
     # C9: went silent while printing bags
     silent_alert = prev_alert("went_silent")
@@ -845,16 +873,18 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
             need("went_silent")
 
     # C10, C10b: printing read off while it should be on
-    if trusted:
+    if trusted and not prin_unknown:
         if off_read and mode == "running" and not e.rejected and not after_switch:
-            seen_on = prev is not None and prev.reachable and prev.printing is True and prev.problem == ""
+            seen_on = prev is not None and prev.reachable and maybe_printing(prev) and prev.problem == ""
             if prev_alert("printing_off") is not None or seen_on:
                 codes.add("printing_off")
                 need("printing_off")
             elif failure is None:
                 codes.add("not_printing")
-    else:
-        carry("printing_off")
+    elif mode == "running" and not e.rejected and not after_switch:
+        # it ends once E.mode isn't running any more (§4.1); printing unknown: the red state stays too
+        if carry("printing_off", acked_too=prin_unknown) and prin_unknown:
+            codes.add("printing_off")
 
     # C11: drift
     drift_e = mode == "running" and not e.rejected and not after_switch and names_message
@@ -903,8 +933,8 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
                 codes.add("message_unchecked")
                 if F.running_unchecked:
                     need("message_unreadable")
-        else:
-            carry("message_unreadable")
+        elif mode in ("running", "switch_pending") and not e.rejected:
+            carry("message_unreadable")     # it ends once E.mode isn't running or switch_pending (§4.1)
 
     # C12: standalone, and the message on record can't be checked. Also while printing hasn't been
     # read since the outage began (a busy or nonsense PRIN at every check), and when this check read
@@ -921,14 +951,15 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
 
     # C13 to C15: ink
     if trusted:
-        if on and F.ink_level == INK_NONE:
-            codes.add("ink_out")
-            need("ink_out")
-        if on and F.ink_level == INK_NOT_DETECTED:
-            codes.add("cartridge_error")
-            need("cartridge_error")
         level = F.ink_level
-        if level in (INK_LOW, INK_CRITICAL) or (level in (INK_NOT_DETECTED, INK_NONE) and not on):
+        red_ink = False
+        # Printing unknown (§6.6): a red ink alert stays while INKL still reads the same, never a new one
+        for kind, lvl in (("ink_out", INK_NONE), ("cartridge_error", INK_NOT_DETECTED)):
+            if level == lvl and (on or (prin_unknown and prev_alert(kind) is not None)):
+                codes.add(kind)
+                need(kind)
+                red_ink = True
+        if level in (INK_LOW, INK_CRITICAL) or (level in (INK_NOT_DETECTED, INK_NONE) and not red_ink):
             need("low_ink", text=LOW_INK_TEXTS[level])
     else:
         carry("ink_out")
@@ -954,22 +985,27 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
             codes.add("unconfirmed")
         elif e.notes:
             codes.add("confirmed_with_notes")
+        elif prin_unknown:
+            codes.add("printing_unchecked")     # printing unknown for long: never green (§6.6)
         else:
             codes.add("running_confirmed")
 
-    # C20: stopped by a user
+    # C20: stopped by a user. Printing unknown (§6.6): never grey "Stopped", amber
     if not e.rejected and e.stop_reason != "test" and not on and stopped_off:
-        codes.add("stopped")
+        codes.add("printing_unchecked" if prin_unknown else "stopped")
 
-    # C21: never sent from Stripes
+    # C21: never sent from Stripes. Printing unknown (§6.6): its warning stays, the same id and acks;
+    # without one, amber, never grey "Not printing"
     if mode == "none":
         if on:
             codes.add("not_from_stripes")
             need("not_from_stripes")
+        elif prin_unknown:
+            codes.add("not_from_stripes" if carry("not_from_stripes", acked_too=True) else "printing_unchecked")
         else:
             codes.add("idle")
-    if not trusted:
-        carry("not_from_stripes")
+        if not trusted:
+            carry("not_from_stripes")   # the first Send (E.mode isn't none) ends it (§4.1)
 
     # C22: the printer clock
     clock_alert = False
@@ -1169,7 +1205,8 @@ def judge(prev: PollStatus | None, reading: Reading, expected: ExpectedState | N
         differ = _judged_differences(f_old, f_new)
         if out_old.key() == new_key:
             commit = True                       # E, a lock or an ack caused it
-        elif differ and differ <= {"foreign_client", "running_unchecked"}:
+        elif differ and differ <= ({"foreign_client", "running_unchecked"}
+                                   | ({"printing_unchecked"} if f_new.printing_unchecked else set())):
             commit = True                       # each already sums many requests
         elif not reading.second:
             recheck = evidence(f_old, f_new, timings)
@@ -1319,13 +1356,16 @@ def machine_view(machine: Machine, poll: PollStatus | None, poll_age_s: float | 
     blue = code in BLUE_CODES
     e = expected
     reachable = poll is not None and poll.reachable
-    can_stop = not blue and monitored and reachable and poll.printing is True
-    can_resume = (not blue and monitored and reachable and poll.printing is False
+    # Printing unknown (§6.6): it may be printing, so Stop stays; Resume needs printing read off
+    unchecked = poll is not None and poll.printing_unchecked
+    can_stop = not blue and monitored and reachable and (poll.printing is True or unchecked)
+    can_resume = (not blue and monitored and reachable and poll.printing is False and not unchecked
                   and code in ("stopped", "not_printing", "printing_off")
                   and e is not None and bool(e.send_id) and e.confirmed and not e.rejected
                   and not e.resume_blocked and e.failure is None)
-    needs_send = code in NEEDS_SEND_CODES or (code == "interrupted_new" and e is not None
-                                              and e.mode == "switch_pending")
+    needs_send = (code in NEEDS_SEND_CODES
+                  or (code == "interrupted_new" and e is not None and e.mode == "switch_pending")
+                  or (code == "printing_unchecked" and (e is None or e.mode == "none")))
     confirm_by = confirm_id = ""
     if (not blue and code not in ("update_stripes", "not_set_up") and e is not None and e.mode == "running"
             and not e.confirmed and not e.rejected and e.failure is None and e.send_id):
@@ -1346,7 +1386,8 @@ def machine_view(machine: Machine, poll: PollStatus | None, poll_age_s: float | 
                        headline=headline, details=details,
                        origin_line="" if checking else effective_origin(poll, expected),
                        message_name=message_name, checked_age_s=poll_age_s, monitored=monitored,
-                       printing=poll.printing if monitored and not checking else None, alerts=alerts,
+                       printing=poll.printing if monitored and not checking and not unchecked else None,
+                       alerts=alerts,
                        unacked_sound=any(a.sound and not a.acked_by for a in alerts),
                        can_stop=can_stop, can_resume=can_resume, needs_send=needs_send,
                        confirm_pending_by=confirm_by, confirm_send_id=confirm_id, test=test,

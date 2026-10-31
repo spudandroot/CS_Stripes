@@ -471,7 +471,11 @@ Returns every problem, in this order (texts in §19):
 
 These are called by the admin screens before saving (ui.md) and again, for the records used, by
 `merge_plan` and `plan_test`. A non-empty list blocks the save, except `origin_conflicts`, which is a
-warning.
+warning. Of `validate_company`, `merge_plan` and `plan_test` run rules 3 and 4 only, the ones a Send
+or a test relies on (`company.json` may be edited by hand). Rules 1, 2 and 5 are for the Company page:
+`validate_choice` step 5 checks the countries a Send uses, and the build refuses text a printer can't
+take (§6.3 step 2). A time server that can't be asked falls back to the PC's clock, with amber (§9.2
+rule 7).
 
 `validate_company(company)`:
 
@@ -481,6 +485,8 @@ warning.
 2. Ink names not empty and unique; each `cartridge` in `CARTRIDGES` and `colour` in `INK_COLOURS`.
 3. `1 <= lot_min_digits <= lot_max_digits <= 20`; `free_text_max` 1 to 100.
 4. `standard_fonts`: exactly 6 non-empty names. `bag_counter` in `("PMCNT", "MSCNT", "none")`.
+5. `time_server` and `time_server_fallback` (stripped): one with exactly one `:` has ASCII digits
+   `0`-`9` after it, from 1 to 65535 (§9.2 rule 1 would ask anything else as part of the name).
 
 `origin_conflicts(data, company)`: with `company`'s countries, each print text (any status) whose items
 now hold origin words gives "Print text {name} now contains words about origin: {words}.", and each line
@@ -534,7 +540,9 @@ Every problem with one `LineChoice`, in this order (texts in §19; `{line}` is `
    repeats.
 3. The product exists and is active; the film is in `films_for_line(line, product_id, data)`; the print
    text is in `print_texts_for_film(film, data)`.
-4. The lot (§3.3), when the print text has a lot item.
+4. The lot (§3.3), when the print text has a lot item. First the company's lot rule itself (§4.1
+   rule 3, its text): `company.json` may be edited by hand, and a broken rule is a problem, never an
+   exception.
 5. Countries, unless the film is pre-printed: at least one; each a `Country.name` of an active country;
    no repeats.
 6. Free text (§3.3), for each free-text item of the print text.
@@ -553,7 +561,8 @@ can call it per line while the sender fills it in.
 1. `identity.is_sender(data.company)` is false: raise `NotAllowed(Msg(N_("Only Stripes MapleJet Senders
    can send.")))`.
 2. `request.lines` is empty: problem "Choose at least one line." A line id twice, a machine id twice
-   across lines, or two machines with the same printer: a problem each.
+   across lines, or two machines with the same printer: a problem each. Then `validate_company`'s
+   rules 3 and 4 (§4.1), a problem each.
 3. `validate_choice` for each line, problems appended in order.
 4. Any problem: raise `PlanError(problems[0], problems=problems)`. Nothing has been written anywhere.
 5. Otherwise build one `MachinePlan` per machine, lines in request order and machines in
@@ -1086,9 +1095,10 @@ because a poller worker never waits on the time server.
 
 1. Set clocks and the daylight-saving set only: read DATE and TIME first (`client.read`) and keep them
    as "before" for the log. A Send skips this (the poll status already shows the clock offset).
-2. `cmd = clock_command(time.now_from(reading).local)`; `lock.check(budget_s=worst_case_s("command"))`
-   when a lock is held; `client.command(cmd)`. Any error is the step's failure; the TD is never
-   repeated.
+2. The guard first (§10.5: `lock.check(budget_s=worst_case_s("command"))` when a lock is held, which
+   gives the deadline), then `cmd = clock_command(time.now_from(reading).local)`, so a wait in the guard
+   never makes the TD late; `client.command(cmd, deadline=...)`. Any error is the step's failure; the TD
+   is never repeated.
 3. `d = client.read("DATE")`, `t = client.read("TIME")`, `printer = hx_protocol.clock_from(d, t)`,
    `expected = time.now_from(reading).local`.
 4. `abs((printer - expected).total_seconds()) <= CLOCK_SET_TOLERANCE_S`: done. Otherwise read DATE and
@@ -1227,13 +1237,19 @@ its first Send waits up to 15 s longer. That is the safe side of the not-found c
 
 ### 10.5 Step check_machine
 
-Before every request of every step, `lock.check(budget_s=hx_protocol.worst_case_s(<call>, timings))`
-with the call about to be made (`"read"`, `"command"`, `"check_uid"`, `"read_twice"`, `"load_slot"`,
-`"fonts"`), and every web call gets `deadline = clock.monotonic() + worst_case_s(<call>)`
-(`load_slot(slot, deadline=...)`, `fonts(deadline=...)`). So no request can still be running when
-another PC may judge the lock stale (storage.md §11.3). `LockLost` makes the machine red at the current
-step with its message; nothing more is sent to that printer and its expected state isn't written (the
-lock is someone else's now). The same rule holds in every later step and in §13 and §15.
+Before every request of every step, the guard: `lock.check(budget_s=hx_protocol.worst_case_s(<call>,
+timings))` with the call about to be made (`"read"`, `"command"`, `"check_uid"`, `"read_twice"`,
+`"load_slot"`, `"fonts"`). It returns the call's deadline, and every client call carries it
+(`deadline=...`): the lock's `lease_end()` (storage.md §11.3), and for a web call also no later than
+`clock.monotonic() + worst_case_s(<call>)`; an Autopilot call under a `local_only` lock gets None. The
+client checks the deadline after the gate and before every exchange (protocol.md §9 item 2), so a call
+that passed the guard and then waited (this PC's gate, a frozen PC) is refused, nothing sent, instead of
+going out after another PC may have taken the printer. So no request can still be running when another
+PC may judge the lock stale. `LockLost` makes the machine red at the current step with its message;
+nothing more is sent to that printer and its expected state isn't written (the lock is someone else's
+now). A call refused at its deadline raises `PrinterBusy` (or the web call's own error); the step then
+checks the lock again, and when the lease has run out it fails with `LockLost`'s message instead,
+nothing written. The same rule holds in every later step and in §13 and §15.
 
 1. Post `running`. `client = clients.client(printer)`: `AuthFailed` is a failure.
 2. `client.check_uid()`: `WrongPrinter` is a failure (the message names both UIDs).
@@ -1597,7 +1613,7 @@ Per machine:
 
 1. Lock (purpose `stop`); a `local_only` lock carries on with the note `no_lock`. Wait for the poller.
 2. `client.check_uid()`. (Every request here and below follows the §10.5 rule: `lock.check(budget_s=...)`
-   first, web calls with a deadline.)
+   first, and every call with the deadline it gives.)
 3. `client.command(Command.set("PRINT", 0))`.
 4. `client.read_twice("PRIN")` must be 0 (two readings a second apart that agree, plan: "reads twice to
    confirm it's off").
@@ -1626,7 +1642,7 @@ match wins:
 | `mode` is `switch_pending` or `test_running` | "{machine} is in the middle of a Send or a test." |
 | `rejected` | "The last Send to {machine} was rejected. Send again instead." |
 | `mode == "test_finished"` or `stop_reason == "test"` | "{machine} needs a Send after the test print." |
-| `resume_blocked`, or `failure` is set | "{machine} needs a new Send before it can print again." |
+| `resume_blocked`, or `failure` is set, or `mode` is none of `running`, `stopped_by_user`, `stop_requested_at_printer` (an unknown mode, from a hand-edited or damaged file, fails closed) | "{machine} needs a new Send before it can print again." |
 | not `confirmed` | "The last Send to {machine} wasn't confirmed. Send again instead." |
 | otherwise (`running`, `stopped_by_user`, `stop_requested_at_printer`) | None: allowed |
 
@@ -1769,7 +1785,7 @@ afterwards: a normal admin edit, and the film's status doesn't change.
    prints.")))`.
 2. Problems (all collected, then `PlanError`): the machine exists ("The machine chosen for this test no
    longer exists.") and is active; its printer is set up; `print_speed` is set; the film exists (any
-   status) and passes `validate_film`.
+   status) and passes `validate_film`; the company passes `validate_company`'s rules 3 and 4 (§4.1).
 3. Kind `"test"`, per machine mode: `ranges.vary` must be `"position"` on encoder machines and `"delay"`
    on delay machines. Encoder machines need `head_distance_mm` (calibrated) and the film's `length_mm`.
    `ranges.step > 0` and `ranges.start <= ranges.stop`; the values are `start + i × step` for `i = 0 ..
@@ -1869,7 +1885,9 @@ to that printer at once and the result says to switch printing off at the printe
    {machine} couldn't be emptied."
 3. The expected state's row "Test finished" (or "Test not stopped" when step 1 failed), and the line
    status row "Test finished". The machine shows "Stopped, needs a Send", Resume is blocked, and it
-   needs a normal Send before production.
+   needs a normal Send before production. Each is written only after `lock.check()` passes: when the
+   lock was lost, or a call in steps 1-2 was refused at its lease deadline and the lease has run out
+   (§10.5), nothing is written, because the printer and its line may be another PC's now.
 4. Log `test_end`. Post `TestEvent(status="cleared")` (or `"failed"`) and `TestFinished`.
 5. Release the lock.
 
@@ -2014,7 +2032,11 @@ machines stay far below storage.md's 8 MB limit.
 
 `result_from_log(entry)` rebuilds the `SendResult` from `send_id`, `sender`, `computer`, `started_at`,
 `finished_at`, `time_source`, `from_local_copy`, `data_as_of`, each `machines[i].result` (designs back
-through `design_from_log`), `log_name = entry.get("log_name", "")` and `log_queued = False`.
+through `design_from_log`), `log_name = entry.get("log_name", "")` and `log_queued = False`. A damaged
+entry raises `KeyError` or `ValueError`, never anything else: a time that isn't a finite number (a
+hand-edited 400-digit int, NaN, a string, true) is `ValueError`, as `from_json` treats a damaged file,
+and so is a `machines`, machine, `result`, `readbacks` or readback of the wrong kind, or a picture that
+isn't text.
 `request_from_log(entry)` is `from_json(SendRequest, entry["request"])`.
 
 ### 17.3 send_switch (hx-sends): per machine, right before PRINTMSG
@@ -2183,6 +2205,7 @@ redefine them.
 | The free-text limit must be 1 to 100 characters. | El límite de texto libre debe ser de 1 a 100 caracteres. |
 | The standard font list must have 6 fonts. | La lista de fuentes estándar debe tener 6 fuentes. |
 | The bag counter must be PMCNT, MSCNT or none. | El contador de bolsas debe ser PMCNT, MSCNT o none. |
+| Time server {host}: the port after the colon must be a number from 1 to 65535. | Servidor de hora {host}: el puerto después de los dos puntos debe ser un número de 1 a 65535. |
 | Print text {name} now contains words about origin: {words}. | El texto de impresión {name} ahora contiene palabras de origen: {words}. |
 | The code of {name} now contains words about origin: {words}. | El código de {name} ahora contiene palabras de origen: {words}. |
 | The test must vary the print position on encoder machines and the delay on delay machines. | La prueba debe variar la posición de impresión en máquinas con encoder y el retardo en máquinas por retardo. |
@@ -2306,6 +2329,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | | conflicts | adding the alias `LOT` to a country makes `origin_conflicts` name the print text whose lot item has `Lot ` before it, and `merge_plan` then refuses it |
 | | restricted | a two-line, three-machine plan restricted to one machine of line 2: `machines` holds only that `MachinePlan`; the request has one line with that one machine id; both have the same new `send_id`, which differs from the old; `created_at`, `from_local_copy` and `data_as_of` are unchanged; `merge_plan(restricted.request, ...)` equals `restricted.machines` |
 | | records | `validate_company`, `validate_line`, `validate_machine`, `validate_film`: one failing case per rule; a machine coded `US` is refused |
+| | hand-edited company | a broken lot rule gives its problem from `validate_choice` and `merge_plan`, never `re.error`; a bad bag counter, free-text limit, font list or lot rule gives its problem from `merge_plan` and `plan_test`; a bad time-server port doesn't block them (§4.1) |
 | PositionTests | encoder | the §5.1 table, `wrapped` included; texts `(150 - 412 + 0) mod 610 = 348 mm` and `(150 - 412 - 3) mod 610 = 345 mm` |
 | | delay | §5.2's examples; text `480 + 20 = 500 ms = 500000 µs`; `test=True` ignores the adjustment and ends with ` (test print: adjustment ignored)` |
 | | film stop | `film_stop_warning(348, 300, 610)` has `end` `648` and `length` `610`; `(348, 200, 610)` and `(348, None, 610)` are None; `merge_plan` adds "Print length unknown" for an encoder machine whose film has none |
@@ -2364,6 +2388,9 @@ purpose. No test waits more than about 0.5 s of real time.
 | | unticked | Line 1 with two machines, only Bagger 1 ticked: the `send` entry's line has `unticked == [{"machine_id": <Bagger 2>, "origin_line": ..., "printing": ...}]` from Bagger 2's poll status |
 | | previous confirmed | after a confirmed Send, a second Send that fails at verify_idle: its `MachineResult.previous_confirmed` is True and `failure_rows` carries it; after an unconfirmed first Send it is False |
 | | lock budget | the keeper's refreshes made to fail (`fail_replace=10**6` on the sender's view) from the start of check_machine: the machine is red with `LockLost` before 30 s minus the next call's `worst_case_s`, and the fake receives no request after that |
+| LeaseTests | lease deadline | a Send, confirm, Stop, check_resume, Resume, Set clocks and a test print: every client call carries a deadline no later than the lease end of the held lock it runs under |
+| | frozen PC | the guard before PRINTMSG passes, then the clock jumps past the lease and another PC takes the lock over: no request reaches the fake after the takeover, no PRINTMSG, the machine red at `switch` with `LockLost`'s message |
+| | frozen test end | a test print's end procedure: the guard before PRINT 0 passes, then the clock jumps past the lease, another PC takes the lock over and writes the line status: no request reaches the fake after the takeover, the test fails, and the line status and expected state are as the other PC left them (§15.5 step 3) |
 | | offline, then back | share down (`fs.view(down=True)` for the sender's store after a first good Send, so `cached_expected` is known): AMBER, `no_lock`, `log_queued`; share back: `record_offline(find_send(...))` writes the "Recorded after an outage" row (mode `running`, AMBER, notes `no_lock`), and a poller then judges `unconfirmed`, not `drift`; with another Send's E written meanwhile, it writes nothing |
 | ConfirmTests | right | the sender confirms: the expected state is confirmed and GREEN; a `send_confirm` entry; the line status confirmed |
 | | no send entry | the `send` entry deleted from the share and the queue after a Send (as after a crash): `pending_confirmation` still lists the live machine from its expected state; `confirm(..., True)` by the sender confirms it and logs `send_confirm` with the machine from E and `sender` from E; by `akim` it raises `NotAllowed`; the candidates are the machine of the `send_switch` entry, and with that entry removed too, every active machine, where a second machine not in the Send whose expected.json has a newer `format_version` is skipped, not raised |
@@ -2387,6 +2414,7 @@ purpose. No test waits more than about 0.5 s of real time.
 | | stop test | cancel after step 1: the end procedure still runs |
 | | needs the server | the share down: refused before any request |
 | | calibration | kind `spacing`, length 610, rough 400: DLYMM 365 then 55; the same on an encoder machine with `head_distance_mm` None: `plan_test` raises nothing and the run sends DLYMM 365 then 55 |
+| LogTests | damaged send entry | `result_from_log` with `started_at`, `finished_at` or `data_as_of` a 400-digit int, NaN, infinity, a string, true or an object, and with `machines` a number or an object, a machine a string or null, a `result` a number or null, `readbacks` a number, a readback a number, or a picture not text: `ValueError` each (§17.2) |
 | SafetyTests | whitelist | across the whole file: every fake's `writes` within `ALLOWED_WRITE_TAGS`; never SETPPARAM; never "SAVEMSG to the printing slot" |
 
 Failure injections ("each failure"):
@@ -2515,7 +2543,9 @@ Failure injections ("each failure"):
 38. **A held lock must record "switch pending" before PRINTMSG**; if it can't, the machine fails before
     the switch, so a crash can never leave a switched printer without its record.
 39. **Every printer call is bounded by the lock**: `lock.check(budget_s=worst_case_s(call))` before it,
-    and web calls take a deadline (storage.md §11.3).
+    and every call carries the lock's lease end as its deadline, checked inside the client before each
+    exchange (storage.md §11.3, protocol.md §9 item 2). A PC that froze after its guard sends nothing
+    once the lease is over.
 40. **A Send made without the share is recorded afterwards** by `record_offline`, only when the
     machine's expected state is still the one the Send started from (counter and send_id), so a
     legitimate amber Send doesn't turn into a red drift alert when the share returns.

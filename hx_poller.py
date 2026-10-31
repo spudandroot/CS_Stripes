@@ -52,6 +52,9 @@ ACK_RETRY_S = 600.0            # the watcher retries a failed ack write this lon
 UNCHECKED_LOADS = 2            # failed running-message Loads in a row before running_unchecked ...
 UNCHECKED_SLOW_SETS = 3        # ... or this many poll_slow_s without a successful one (§6.5)
 UNCHECKED_CONFIRMS = 3         # ... or this many failed confirming Loads in a row (owner decision, 31 Oct)
+PRIN_UNREAD_LIMIT = 3          # cycles in a row without a good PRIN value before printing counts as unknown (§6.6)
+DECLINE_MAX_S = 900.0          # a stuck-worker decline doubles from lock_stale_s up to this (§6.2 item 3.0) ...
+DECLINE_MEMORY_S = 3600.0      # ... each time the printer is fenced again within this of the last fence
 
 EXTRA_LOAD_GAP_S = 30.0        # at most one MSGNAM-triggered Load per printer this often (§6.4 step 9)
 DAILY_ITEMS = ("ECOMOD", "PLDEL", "MNPL", "PRPL", "PLVO", "PLWR", "NZRO")
@@ -159,6 +162,8 @@ class _Cycle:
         self.load_ok = False         # ... and succeeded
         self.load_failed = False     # ... and failed: no reply, busy, or a reply that can't be used
         self.busy_rose = False       # the last call got a busy reply from the printer
+        self.uid_read = False        # an HXUI value was read
+        self.login_done = False      # a login got a reply (accepted or refused)
 
 
 # --------------------------------------------------------------------------
@@ -223,6 +228,12 @@ class _Worker:
         self.acks_logged = set()
         self.fail_end = None         # clock.monotonic() when the last failed request ended
         self.replied = False         # a request got a reply this tick
+        self.informed = False        # this tick learnt something: a good value, a finding, or no reply (§6.14 judged)
+        self.prin_unread = 0         # cycles in a row whose PRIN read got no good value (§6.6)
+        self.p_read = None           # clock.monotonic() just before the last rival check's read of P
+        self.superseded = False      # a write found a newer P by another PC: the next cycle's rival check decides
+        self.write_failed = False    # the last write_poll failed or raised
+        self.fenced = False          # the coordinator gave up on this worker (stuck): it must never act again
 
     # ---- control from the coordinator (any thread)
 
@@ -239,8 +250,14 @@ class _Worker:
     def set_waiting(self, alert_id, names):
         self.waiting = {**self.waiting, alert_id: list(names)}
 
+    def fence(self):
+        """The coordinator's watchdog found no progress (states.md §6.2 item 3.0): from now on this worker
+        sends nothing and writes no P; its next tick ends it."""
+        self.fenced = True
+        self.wake.cancel()
+
     def wants_out(self):
-        return bool(self.handover_to or self.stop_reason or self.poller._cancel.cancelled)
+        return bool(self.fenced or self.handover_to or self.stop_reason or self.poller._cancel.cancelled)
 
     # ---- the thread
 
@@ -263,9 +280,12 @@ class _Worker:
     # ---- one tick
 
     def tick(self):
+        if self.fenced:
+            self.done = True        # given up on by the coordinator: no request, no write
+            return
         now = self.clock.monotonic()
         self.next_wake = now + self.timings.poll_fast_s
-        self.replied = False
+        self.replied = self.informed = False
         try:
             try:
                 if not self.started:
@@ -284,7 +304,9 @@ class _Worker:
                     return
                 self._cycle()
             except _Abandon:
-                if self.wants_out():
+                if self.fenced:
+                    self.done = True
+                elif self.wants_out():
                     self._leave()
             except _ShareStop:
                 self._share_stop()
@@ -322,15 +344,47 @@ class _Worker:
     def _share_fine(self, kind):
         self.fail_since[kind] = None
 
+    def _superseded(self):
+        """§6.4 step 7.2, for every write: once this worker's last good P write is stale_s / 2 old (the PC
+        slept, or the worker was stuck), another PC may have taken over meanwhile. P is read first, and a
+        newer P by another PC, a yield to this one included, is never written over: _Abandon, and the next
+        cycle's rival check adopts it, waits or yields."""
+        now = self.clock.monotonic()
+        if self.p_ok is None or now - self.p_ok < self.timings.stale_s / 2:
+            return
+        if self.p_read is not None and self.p_read >= self.p_ok and now - self.p_read < self.timings.stale_s / 4:
+            return                  # a rival check read P just now (_still_alone): no second read on a slow share
+        try:
+            found = self.store.read_poll(self.machine_id)
+        except FormatTooNew:
+            self.done = True
+            self._log({"type": "polling_stopped", "reason": "rank", "yielded_to": ""})
+            raise _Abandon() from None
+        except ShareUnavailable:
+            self._share_trouble()
+            raise _Abandon() from None
+        except (ShareError, ValueError):
+            return
+        if found is None or found.machine_id != self.machine_id:
+            return
+        self.poller._note_counter(self.machine_id, found.counter)
+        if found.poller and found.poller != self.key and found.counter > self.p.counter:
+            self.superseded = True
+            raise _Abandon()
+
     def _write(self, status):
         """One write_poll; True when it succeeded. A failure (or a slow success) counts for §6.13."""
+        self._superseded()
         waiting = self.waiting
         if waiting:
             status = dataclasses.replace(status, alerts=[
                 dataclasses.replace(a, waiting=list(waiting[a.id])) if a.id in waiting else a for a in status.alerts])
         for attempt in (1, 2):
             status = dataclasses.replace(status, counter=self._next_counter(), poller=self.key)
+            if self.fenced:
+                raise _Abandon()
             t0 = self.clock.monotonic()
+            self.write_failed = True    # until it returns: a bug raised from it counts too
             try:
                 self.store.write_poll(status)
             except ValueError:
@@ -349,9 +403,15 @@ class _Worker:
                 return False
             break
         took = self.clock.monotonic() - t0
+        self.write_failed = False
         self.p = dataclasses.replace(status, written_at=self.clock.time())
         self.p_ok = t0
         self.poller._note_written(self.p)
+        if took >= self.timings.stale_s / 2:
+            # It landed, but so late that another PC may have taken over meanwhile, and this write may
+            # have replaced its P: it proves nothing about now (§6.4 step 7.2). Stop share-mode polling;
+            # the rank and rival rules decide afresh
+            raise _ShareStop()
         if took > self.timings.stale_s / 4:
             self._share_trouble("write")
         else:
@@ -371,6 +431,7 @@ class _Worker:
             found = store.read_poll(self.machine_id)
         except FormatTooNew:
             self.done = True        # a newer Stripes owns this file: never overwrite it
+            self.poller._note_progress(self.printer_id)
             return
         except (ShareUnavailable, ShareError):
             self.done = True
@@ -386,6 +447,7 @@ class _Worker:
                 # settle it. Don't start; the next pass decides again. Between two PCs that both see each
                 # other the rank check settles a start race (§6.3 step 2)
                 self.done = True
+                self.poller._note_progress(self.printer_id)     # it stood aside on purpose (§6.2 item 3.0)
                 return
             base = found
         else:
@@ -393,16 +455,30 @@ class _Worker:
         bags = 0 if age >= t.silent_window_s else base.bags_recent
         start = dataclasses.replace(base, printer_id=self.printer_id, paused_for_lock="", yielded_to="",
                                     standalone=False, bags_recent=bags)
+        seen = self.standalone_seen
+        if (found is not None and found.running is not None and seen is not None and seen.message_name is not None
+                and hx_state.norm_name(seen.message_name) != hx_state.norm_name(found.running.name)):
+            # This PC's standalone checks read another message name than R's while the share was down:
+            # R no longer says what prints, so it is unknown until this worker's first Load (a known drift
+            # keeps its alert, C11e), never shown as printing again
+            start = dataclasses.replace(start, running=None)
+        # The long-gap rule judges by P's judged counter: bookkeeping writes (a start, a settle, a yield)
+        # move the counter and written_at without reading the printer (§6.3 step 1)
+        if found is not None and found.judged is not None:
+            gap = self.poller._judged_age(found) or 0.0
+            gap_at = found.judged_at
+        else:
+            gap, gap_at = age, (found.written_at if found is not None else 0.0)
         if found is not None and found.state is not None and found.state.colour not in (RED, AMBER) and (
-                age >= t.not_monitored_s or self.clock.time() - found.written_at >= t.not_monitored_s):
+                gap >= t.not_monitored_s or self.clock.time() - gap_at >= t.not_monitored_s):
             # Nobody judged this printer for long (a share outage, every PC closed overnight): the copied
             # state, under a counter that moves again, would show as just checked. Until this worker's
             # first judgement it is "Checking...", or the red or amber this PC's standalone checks found
             # (only share mode clears those). A red or amber in P is kept as it is (§6.3 step 1;
             # owner-approved divergence, 31 Oct). The facts stay, so judge still needs its evidence
-            seen = self.standalone_seen.state if self.standalone_seen is not None else None
-            if seen is not None and seen.colour in (RED, AMBER):
-                state = seen
+            seen_state = seen.state if seen is not None else None
+            if seen_state is not None and seen_state.colour in (RED, AMBER):
+                state = seen_state
             else:
                 state = MachineSnapshot(code="checking", colour=GREY, headline=Msg(hx_state.STATE_TEXTS["checking"]),
                                         since=self.clock.time())
@@ -424,6 +500,7 @@ class _Worker:
         self.started_mono = now
         self.load_ok_mono = moment
         self.loads_failed = UNCHECKED_LOADS if start.running_unchecked else 0
+        self.prin_unread = PRIN_UNREAD_LIMIT if start.printing_unchecked else 0
         self.failures = start.failures if not start.reachable else 0
         self.problem = start.problem
         self.foreign = start.foreign_client
@@ -443,15 +520,19 @@ class _Worker:
         if yielded_to:
             try:
                 self._write_status(yielded_to=yielded_to, paused_for_lock="")
-            except _ShareStop:
-                pass
+            except (_ShareStop, _Abandon):
+                pass                # a newer P by another PC (or a stuck worker's fence): left alone
             except Exception:       # a bug in the write: stop all the same; P goes stale and is taken over
                 traceback.print_exc()
         self.done = True
+        self._standing_aside()      # it gave the printer away on purpose
         self._log({"type": "polling_stopped", "reason": reason, "yielded_to": yielded_to})
 
     def _leave(self):
         """The coordinator asked to stop or hand over, or the poller stops."""
+        if self.fenced:
+            self.done = True
+            return
         if self.stop_reason == "share":
             self.done = True
             self._log({"type": "polling_stopped", "reason": "share", "yielded_to": ""})
@@ -463,6 +544,12 @@ class _Worker:
         order = assign(self.poller.printer_ids, self.poller.live).get(self.printer_id) or []
         others = [k for k in order if k != self.key]
         self._finish("stop", others[0] if others else "")
+
+    def _standing_aside(self):
+        """A worker that read P and stands aside for another PC is working, not stuck (§6.2 item 3.0), as
+        long as its own last P write didn't fail: one whose every write fails must still be found."""
+        if not self.fenced and not self.write_failed:
+            self.poller._note_progress(self.printer_id)
 
     def _share_stop(self):
         self.done = True
@@ -485,6 +572,8 @@ class _Worker:
             self._write_status(state=state, paused_for_lock="")
         except _ShareStop:
             self._share_stop()
+        except _Abandon:
+            pass                    # a newer P by another PC: the next cycle's rival check decides
         except Exception:
             # P can't be written either: the next tick tries again. Meanwhile p_ok stands still, so no
             # request fits its deadline after stale_s / 2 (§6.4 step 7.2), and another PC can take over
@@ -527,7 +616,12 @@ class _Worker:
     def _paused(self, token):
         self.lock_seen = True
         self.loads_failed = self.confirms_failed = 0
-        self._write_status(paused_for_lock=token)
+        # A paused write counts as judged (§6.14): the board shows the lock while it is fresh, and a long
+        # Send doesn't show NOT MONITORED when it ends
+        self._write_status(paused_for_lock=token, **self._judged_now())
+
+    def _judged_now(self):
+        return {"judged": (self.p.judged or 0) + 1, "judged_at": self.clock.time()}
 
     # ---- one request (§6.4 step 7)
 
@@ -537,9 +631,11 @@ class _Worker:
             raise _NoMore()
         if self.wants_out():
             raise _Abandon()
+        self._lock_check()
+        # Right before the keep-fresh write and the request, so a pause anywhere before them (the lock
+        # read included) is seen (§6.4 step 7.2)
         if not self._still_alone():
             raise _Abandon()
-        self._lock_check()
         t = self.timings
         budget = t.http_timeout_s if kind == "web" else hx_protocol.worst_case_s(kind, t)
         now = self.clock.monotonic()
@@ -556,6 +652,8 @@ class _Worker:
             raise _NoMore()
         client = cyc.client
         nonsense, busy = client.nonsense, client.busy_replies
+        if self.fenced:
+            raise _Abandon()
         try:
             return fn(end)
         finally:
@@ -569,16 +667,24 @@ class _Worker:
         writes over that PC's P or polls alongside it (§6.4 step 7.2)."""
         if self.clock.monotonic() - self.p_ok < self.timings.stale_s / 2:
             return True
-        return self._rival_check(self.poller.live)
+        before = self.p
+        if not self._rival_check(self.poller.live):
+            return False
+        # It adopted another PC's newer P (a yield back to this PC): this cycle's readings predate it, so the
+        # cycle ends unjudged and the next one starts from that P
+        return self.p is before
 
-    def _replied(self, cyc):
+    def _replied(self, cyc, *, useful=True):
+        """useful=False: a busy or nonsense reply, which tells nothing about the printer's state."""
         cyc.failures = 0
         cyc.replied = True
         self.replied = True
+        self.informed = self.informed or useful
         self.backoff_i = 0
         self.last_answer_at = self.clock.time()
 
     def _no_reply(self, cyc):
+        self.informed = True        # not answering is a finding too
         cyc.failures += 1
         cyc.stopped = True
         self.failures = cyc.failures
@@ -594,10 +700,10 @@ class _Worker:
             raise _NoMore()
         except PrinterBusy:
             if cyc.busy_rose:
-                self._replied(cyc)      # the printer answered busy
+                self._replied(cyc, useful=False)    # the printer answered busy
             return _MISSING
         except BadReply:
-            self._replied(cyc)          # it answered nonsense, which the client threw away
+            self._replied(cyc, useful=False)        # it answered nonsense, which the client threw away
             return _MISSING
         except AuthFailed:
             self._replied(cyc)
@@ -618,6 +724,7 @@ class _Worker:
         value = self._read(cyc, "HXUI")
         if value is _MISSING:
             return
+        cyc.uid_read = True
         self.need_hxui = False
         if value != printer.uid:
             self.problem = "wrong_printer"
@@ -625,6 +732,16 @@ class _Worker:
             raise _NoMore()
         if self.problem == "wrong_printer":
             self.problem = ""
+
+    def _prin(self, cyc, r):
+        """PRIN into r.printing; a busy or nonsense reply counts towards PRIN_UNREAD_LIMIT (§6.6)."""
+        value = self._read(cyc, "PRIN")
+        if value is _MISSING:
+            self.prin_unread += 1
+            return False
+        self.prin_unread = 0
+        r.printing = bool(value)
+        return True
 
     def _load(self, cyc, r, *, required):
         """The running message (slot 0) into r.running; a failed Load counts in the message check."""
@@ -896,12 +1013,13 @@ class _Worker:
             self._write_status()        # the coordinator stops this worker at its next pass
             return
 
-        # 1. Still mine?
+        # 1. Still mine? Also before the first request when a write found a newer P by another PC
+        # (_superseded): this cycle adopts it, waits or yields first (§6.4 step 7.2)
         order = assign(poller.printer_ids, poller.live).get(self.printer_id) or []
         if order and order[0] != self.key:
             self._finish("rank", order[0])
             return
-        if self.rank_checked and not self._rival_check(poller.live):
+        if (self.rank_checked or self.superseded) and not self._rival_check(poller.live):
             return
 
         # 2. E
@@ -1010,15 +1128,11 @@ class _Worker:
                 if unreachable:
                     self.backoff_i += 1
                     self.next_attempt = None
-                    value = self._read(cyc, "PRIN")         # one attempt
-                    if value is not _MISSING:
-                        r.printing = bool(value)
+                    self._prin(cyc, r)                       # one attempt
                 else:
                     if self.need_hxui or slow_due or self.problem:
                         self._hxui(cyc, printer)
-                    value = self._read(cyc, "PRIN")
-                    if value is not _MISSING:
-                        r.printing = bool(value)
+                    self._prin(cyc, r)
                     if self._dst_due(change):
                         self._clock_set(cyc, r, machine, change)
                     else:
@@ -1071,11 +1185,14 @@ class _Worker:
         - a live one ranks below this PC and yields at its own rank check. Until P shows that yield,
           or P has been quiet for stale_s, this worker makes no request and doesn't write P (P keeps
           one writer), and continues from what that PC wrote."""
+        read_at = self.clock.monotonic()
+        self.superseded = False
         try:
             found = self.store.read_poll(self.machine_id)
         except FormatTooNew:
             # A newer Stripes polls this printer: stop without overwriting its file
             self.done = True
+            self.poller._note_progress(self.printer_id)
             self._log({"type": "polling_stopped", "reason": "rank", "yielded_to": ""})
             return False
         except ShareUnavailable:
@@ -1090,11 +1207,28 @@ class _Worker:
         me = self.key
         age = self.store.poll_age(self.machine_id)
         quiet = age is not None and age >= self.timings.stale_s      # nobody has written P for stale_s
+        live_keys = {hb.key for hb in live}
+        if (found is not None and found.poller and found.poller != me and found.poller not in live_keys
+                and self.p_ok is not None and self.p is not None and found.counter <= self.p.counter
+                and self.clock.time() - found.written_at >= self.timings.stale_s / 2):
+            # A late write by a superseded owner that isn't live: a share write it gave up on that landed
+            # later, or a PC that paused inside its write. Its counter isn't above this worker's last write
+            # (equal when it lands before this worker's second write: both counted on from the same P) and
+            # it was made long ago, unlike a poller's that is starting or polling too (storage.md §12.6
+            # rule 9). Neither adopted nor yielded to: this worker carries on, and its next write puts its
+            # own P back
+            self._log({"type": "late_write_ignored", "writer": found.poller, "counter": found.counter})
+            found = None
+        if (found is not None and found.poller and found.poller != me and found.yielded_to == me
+                and self.p is not None and found.counter > self.p.counter and not self.rival):
+            # Another PC polled meanwhile and yielded back: continue from its newer P (its state, alerts
+            # and their ids, its clock set), never from this worker's older copy (§6.4 step 7.2)
+            self._adopt(found)
         other = ""
         if found is not None and found.poller and found.poller != me and found.yielded_to != me and not quiet:
             other = found.poller
         if other:
-            if other not in {hb.key for hb in live}:
+            if other not in live_keys:
                 self._adopt(found)      # the yield carries that PC's latest P, not this worker's older copy
                 self._finish("rank", other)
                 return False
@@ -1104,12 +1238,15 @@ class _Worker:
                 return False
             self.rival = other
         if not self.rival:
+            self.p_read = read_at       # P is this worker's (or was yielded to it): _superseded needn't read again
             return True
         if found is not None and found.poller == self.rival:
             self._adopt(found)
         if not other and (quiet or (found is not None and found.poller == self.rival and found.yielded_to == me)):
             self.rival = ""             # it yielded, or nobody is writing P any more: poll on
+            self.p_read = read_at
             return True
+        self._standing_aside()      # waiting for that PC to yield
         return False
 
     def _adopt(self, found):
@@ -1126,6 +1263,7 @@ class _Worker:
         self.problem = found.problem
         self.inherited_bags = max(self.inherited_bags, found.bags_recent or 0)
         self.loads_failed = UNCHECKED_LOADS if found.running_unchecked else 0
+        self.prin_unread = PRIN_UNREAD_LIMIT if found.printing_unchecked else 0
         self.confirms_failed = 0
         self.need_hxui = self.need_load = self.r_stale = True
 
@@ -1143,6 +1281,9 @@ class _Worker:
             r.running_unchecked = (self.loads_failed >= UNCHECKED_LOADS
                                    or self.confirms_failed >= UNCHECKED_CONFIRMS
                                    or now - self.load_ok_mono >= UNCHECKED_SLOW_SETS * t.poll_slow_s)
+            if not r.second:
+                # A second reading sets it itself: from its own PRIN read, else prev's (_second_reading)
+                r.printing_unchecked = self.prin_unread >= PRIN_UNREAD_LIMIT
             if r.bags_recent is None and self.samples:
                 r.bags_recent = self._recent_bags()
             if self.r_stale and r.running is None:
@@ -1208,6 +1349,9 @@ class _Worker:
                 self.confirms_failed += 1
                 load_failed = True
             self._finish_reading(r2, again)
+            if (("uid" in j.recheck and not again.uid_read)
+                    or ("login" in j.recheck and not again.login_done)):
+                r2.problem = self.p.problem     # not read again: the second reading confirms nothing (§3.8)
             r, cyc = r2, again
             j = hx_state.judge(self.p, r, e, lock, machine, line, data, t)
             if failed and not j.committed and self.confirms_failed >= UNCHECKED_CONFIRMS:
@@ -1232,30 +1376,59 @@ class _Worker:
         self._write_judgement(j, r, e, cyc)
 
     def _second_reading(self, cyc, r, items, data):
+        """Each rechecked item is read again. One that can't be (no reply, busy, nonsense, too late) takes
+        prev's value, never the first reading's, so it confirms nothing (§3.8): a stray value read once
+        never commits on its own."""
         printer = data.printers.get(self.printer_id)
+        p = self.p
         done = set()
         if "load" in items:
             r.running = None        # never the first Load's R: a confirming Load that isn't made confirms nothing
+        prev_daily = p.daily or {}
+        for item in items:
+            if item in ("reach", "PRIN"):
+                r.printing = r.printing_unchecked = None
+            elif item == "INKL":
+                r.ink_level = None
+            elif item == "clock":
+                r.clock_offset_s = None
+            elif item == "MSGNAM":
+                r.message_name = None
+            elif item.startswith("daily:") and r.daily is not None:
+                tag = item[len("daily:"):]
+                values = dict(r.daily.get("values") or {})
+                before = prev_daily.get("values") or {}
+                if tag in before:
+                    values[tag] = before[tag]
+                else:
+                    values.pop(tag, None)
+                r.daily = dict(r.daily, values=values)
+            elif item == "fonts" and r.daily is not None:
+                r.daily = dict(r.daily, fonts=prev_daily.get("fonts"))
         try:
             for item in items:
                 if item in ("reach", "PRIN"):
                     if "PRIN" in done:
                         continue
                     done.add("PRIN")
-                    value = self._read(cyc, "PRIN")
-                    if value is not _MISSING:
-                        r.printing = bool(value)
+                    if self._prin(cyc, r):
+                        r.printing_unchecked = False
                 elif item == "uid":
                     self._hxui(cyc, printer)
                 elif item == "login":
                     try:
-                        self._call(cyc, "login", lambda end: cyc.client.login())
+                        self._call(cyc, "login", lambda end: cyc.client.login(deadline=end))
+                        cyc.login_done = True
                         self._replied(cyc)
                         if self.problem == "login_failed":
                             self.problem = ""
-                    except AuthFailed:
+                    except (AuthFailed, BadReply, WebReadFailed):
+                        # Refused, or a login reply that can't be used (§10.1 rule 3): login_failed
+                        cyc.login_done = True
                         self._replied(cyc)
                         self.problem = "login_failed"
+                    except PrinterBusy:
+                        pass        # nothing sent (this PC's gate was busy until too late): confirms nothing
                     except NoReply:
                         self._no_reply(cyc)
                         raise _NoMore()
@@ -1308,7 +1481,12 @@ class _Worker:
             state=j.state, alerts=j.alerts, foreign_client=f.foreign_client, problem=f.problem,
             expected_counter=(e.counter if e is not None else 0) if j.committed else p.expected_counter,
             reread_seen=self.reread_seen, unreachable_since=unreachable_since, running_ok_at=self.running_ok_at,
-            running_unchecked=f.running_unchecked, dst=self.dst, standalone=False)
+            running_unchecked=f.running_unchecked, printing_unchecked=f.printing_unchecked, dst=self.dst,
+            standalone=False)
+        if cyc is None or self.informed:
+            # Judged freshness (§6.14): only a judgement that learnt something moves `judged`. A cycle whose
+            # every reply was busy or nonsense keeps it, so the board's age goes on growing
+            new = dataclasses.replace(new, **self._judged_now())
         if not self._still_alone():
             return
         sha = new.running.preview_sha256 if new.running is not None else ""
@@ -1495,7 +1673,8 @@ class _StandaloneCheck:
             self.problem = "login_failed"
         answered = None              # wall time of the last reading that got a reply
         for attempt in (1, 2):
-            r = Reading(at=clock.time(), reachable=True, standalone=True)
+            # Standalone has its own rule for printing it couldn't read (C12), not PRIN_UNREAD_LIMIT
+            r = Reading(at=clock.time(), reachable=True, standalone=True, printing_unchecked=False)
             cyc = _Cycle(None, self.failures)
             if client is None:
                 r.problem, r.failures = self.problem, self.failures
@@ -1556,7 +1735,7 @@ class _StandaloneCheck:
             ink_name=f.ink_name, ink_level=f.ink_level, head_temp_c=f.head_temp_c, clock_offset_s=f.clock_offset_s,
             running=f.running, daily=f.daily, state=j.state, alerts=j.alerts, foreign_client=f.foreign_client,
             problem=f.problem, expected_counter=e.counter if e is not None else 0, unreachable_since=since,
-            running_unchecked=f.running_unchecked, standalone=True)
+            running_unchecked=f.running_unchecked, printing_unchecked=f.printing_unchecked, standalone=True)
         poller._set_local(self.machine_id, self.status)
         base_entry = {"machine_id": self.machine_id, "printer_id": self.printer_id, "line_id": machine.line_id}
         if j.changed and j.state is not None:
@@ -1633,6 +1812,16 @@ class Poller:
         self._refresh_wanted = False
         self._last_refresh = None
         self._rng = random.Random()
+        # The stuck-worker watchdog (§6.2 item 3.0)
+        self._progress = {}          # printer id -> clock.monotonic() of this PC's last good P write for it
+        self._rank0 = {}             # printer id -> clock.monotonic() since this PC has ranked first for it
+        self._started = {}           # printer id -> clock.monotonic() when this PC last started a worker for it
+        self._fenced = {}            # printer id -> (fenced worker, clock.monotonic() when it was fenced)
+        self._strikes = {}           # printer id -> (fences in a row, clock.monotonic() of the last one)
+        self._probation = {}         # printer id -> clock.monotonic() its decline ended, until a good P write
+        self._last_share_pass = None
+        self._resumed_at = None      # the first share pass after this coordinator itself was paused
+        self._judged = CounterWatch(clock)      # P's judged counters, for a worker's long-gap rule (§6.3)
 
     # ---- the public calls
 
@@ -1707,7 +1896,7 @@ class Poller:
             self._coordinate()
             self._next_coord = now + self._coordinator_wait(now)
         with self._lock:
-            workers = list(self._workers.values())
+            workers = list(self._workers.values()) + [w for w, _ in self._fenced.values() if w is not None]
         for w in workers:
             if not w.done and (self.clock.monotonic() >= w.next_wake - _DUE_S or w.wants_out()):
                 w.tick()
@@ -1787,6 +1976,19 @@ class Poller:
     def _note_written(self, status):
         with self._lock:
             self._written[status.machine_id] = status
+        self._note_progress(status.printer_id)
+
+    def _note_progress(self, printer_id):
+        """A good P write by this PC's worker, or a worker waiting for another PC that writes P (§6.2 item 3.0)."""
+        with self._lock:
+            self._progress[printer_id] = self.clock.monotonic()
+
+    def _judged_age(self, p):
+        """How long this PC has seen P's judged counter at its value (0.0 on a change or a first sight);
+        None for a P without one (an older Stripes wrote it)."""
+        if p is None or p.judged is None:
+            return None
+        return self._judged.see("judged:" + p.machine_id, p.judged)
 
     def _written_polls(self):
         with self._lock:
@@ -1859,17 +2061,84 @@ class Poller:
             return False
 
     def _beat(self):
+        with self._lock:
+            declined = sorted(self._fenced)
         self.store.heartbeat().beat(can_poll=self.reach.can_poll(), last_printer_reach=self.reach.last_printer_reach,
                                     polling=self._running_printers(), monitor_open=self._monitor_open,
-                                    floor_board=self._floor_board)
+                                    floor_board=self._floor_board, declined=declined)
 
     def _running_printers(self):
         with self._lock:
             return sorted(pid for pid, w in self._workers.items() if not w.done)
 
+    def _stuck_check(self, now):
+        """§6.2 item 3.0: a printer this PC ranks first for, and has kept a worker for (running, or started
+        again after failed starts), with no good P write by this PC for not_monitored_s: its worker is
+        fenced and the printer declined in the heartbeat, so every PC ranks the next PC first and the
+        backups stop handing it back. It stays declined until the fenced worker has ended and the
+        decline's time has passed: lock_stale_s, doubled for each fence within DECLINE_MEMORY_S of the
+        last, up to DECLINE_MAX_S. Then the normal handover brings it back, on probation: if the first
+        worker started after that ends without a good P write (the fault is still there), the printer is
+        declined again at once, without another not_monitored_s wait."""
+        t = self.timings
+        me = self.identity.key
+        last, self._last_share_pass = self._last_share_pass, now
+        if last is None or now - last >= t.stale_s:
+            self._resumed_at = now      # share mode just began, or this PC itself was paused: no worker's fault
+        with self._lock:
+            for pid, (w, at) in list(self._fenced.items()):
+                ended = w is None or w.done or (w.thread is not None and not w.thread.is_alive())
+                if ended and now - at >= self._decline_s(pid):
+                    del self._fenced[pid]
+                    self._probation[pid] = now
+            for pid, ended_at in list(self._probation.items()):
+                if self._progress.get(pid, -math.inf) >= ended_at:
+                    del self._probation[pid]        # a good P write since: it works again
+            workers = dict(self._workers)
+            fenced = set(self._fenced)
+            probation = dict(self._probation)
+        ranks = assign(self.printer_ids, self.live)
+        data = self.data.current
+        for pid in self.printer_ids:
+            order = ranks.get(pid) or []
+            if pid in fenced or not order or order[0] != me:
+                self._rank0.pop(pid, None)  # another PC polls it by rank: not this PC's to watch
+                continue
+            since = max(self._rank0.setdefault(pid, now), self._progress.get(pid, -math.inf), self._resumed_at)
+            w = workers.get(pid)
+            kept = w is not None or self._started.get(pid, -math.inf) >= since
+            # On probation: the first worker started since the decline ended, ended without a good P write
+            again = (pid in probation and self._started.get(pid, -math.inf) >= probation[pid]
+                     and (w is None or w.done))
+            if not again and (not kept or now - since < t.not_monitored_s):
+                continue
+            if w is not None:
+                w.fence()
+            with self._lock:
+                if w is not None and self._workers.get(pid) is w:
+                    del self._workers[pid]
+                self._fenced[pid] = (w, now)
+                self._probation.pop(pid, None)
+                count, at = self._strikes.get(pid, (0, -math.inf))
+                self._strikes[pid] = (count + 1 if now - at < DECLINE_MEMORY_S else 1, now)
+                decline = self._decline_s(pid)
+            self._rank0.pop(pid, None)
+            mid = w.machine_id if w is not None else ""
+            machine = data.machines.get(mid) if data is not None and mid else None
+            self._log({"type": "internal_error", "error": "worker_stuck", "machine_id": mid, "printer_id": pid,
+                       "line_id": machine.line_id if machine is not None else "", "stuck_s": round(now - since, 1),
+                       "declined_s": decline})
+
+    def _decline_s(self, pid):
+        """How long a fenced printer stays declined (§6.2 item 3.0): lock_stale_s, doubled for each fence in
+        a row (fences less than DECLINE_MEMORY_S apart), up to DECLINE_MAX_S."""
+        count, _ = self._strikes.get(pid, (1, 0.0))
+        return min(self.timings.lock_stale_s * 2 ** max(0, count - 1), max(DECLINE_MAX_S, self.timings.lock_stale_s))
+
     def _share_pass(self, data, printers, now):
         store, t = self.store, self.timings
         me = self.identity.key
+        self._stuck_check(now)
         self._beat()
         live = store.live_heartbeats()
         self.live = live
@@ -1889,11 +2158,15 @@ class Poller:
                     self._seen[machine.id] = (p, read_at)
             if p is not None:
                 self._note_counter(machine.id, p.counter)
+                self._judged_age(p)
             age = store.poll_age(machine.id)
             age = 0.0 if age is None else age
             order = ranks.get(printer.id) or []
             with self._lock:
                 w = self._workers.get(printer.id)
+                declined = printer.id in self._fenced
+            if declined:
+                continue            # its fenced worker may still be stuck in a call: never a second one
             if age >= t.stale_s and w is None:
                 unpolled.append((printer, machine))
             if w is not None and not w.done:
@@ -1905,7 +2178,11 @@ class Poller:
             if newer or me not in order:
                 continue
             rank = order.index(me)
-            names_me = p is not None and ((p.poller == me and not p.yielded_to) or p.yielded_to == me)
+            # This PC's own yield to a PC whose heartbeat now declines the printer (§6.2 item 3.0) is void:
+            # P is still this PC's write, so that PC never polled after it
+            void = (p is not None and p.poller == me and bool(p.yielded_to) and p.yielded_to != me
+                    and any(hb.key == p.yielded_to and printer.id in (hb.declined or ()) for hb in live))
+            names_me = p is not None and ((p.poller == me and (not p.yielded_to or void)) or p.yielded_to == me)
             if p is not None and age < t.stale_s and not names_me:
                 continue            # fresh and another PC's, which hasn't yielded to this one
             if rank == 0:
@@ -1947,6 +2224,7 @@ class Poller:
         w = _Worker(self, printer_id, machine_id, reason, standalone=seen)
         with self._lock:
             self._workers[printer_id] = w
+            self._started[printer_id] = self.clock.monotonic()
         if self._threaded:
             w.thread = self._start_thread(w.run, f"hx-poll-{printer_id}")
 
@@ -2242,7 +2520,7 @@ class StatusWatcher:
                     polls[m.id] = self._last_good(m.id)
                     age = store.poll_age(m.id)
                     if age is not None:
-                        poll_ages[m.id] = age
+                        poll_ages[m.id] = self._judged_age(m.id, polls[m.id], age)
                 else:
                     self._watch.missing("poll:" + m.id)
                     poll_ages[m.id] = self._watch.age("poll:" + m.id)
@@ -2270,8 +2548,10 @@ class StatusWatcher:
                 if p is not None:
                     polls[m.id] = p
                 age = store.poll_age(m.id)
-                if age is not None and p is not None and self._unproven(m.id, p, age):
-                    age = None
+                if age is not None and p is not None:
+                    age = self._judged_age(m.id, p, age)
+                    if self._unproven(m.id, p, age):
+                        age = None
                 if age is not None:
                     poll_ages[m.id] = age
                 lk = self._locks.get(m.printer_id)
@@ -2301,18 +2581,29 @@ class StatusWatcher:
             return own
         return p
 
+    def _judged_age(self, machine_id, p, age):
+        """The age the board shows (§7 item 2): how long P's judged counter has stood still, never less than
+        the counter's own age. Bookkeeping writes (a takeover's start, settle and yield) move the counter
+        without reading the printer. A P without the field (an older Stripes) has the counter's age, and so
+        does P's own "Checking..." (a worker starting after a long gap, §6.3 step 1), which says just that."""
+        if p.judged is None or (p.state is not None and p.state.code == "checking"):
+            return age
+        return max(age, self._watch.see("judged:" + machine_id, p.judged))
+
     def _unproven(self, machine_id, p, age):
-        """A P this watcher hasn't seen move yet, written long ago by its writer's clock: the share's counter
+        """A P this watcher hasn't seen move yet, judged long ago by its writer's clock: the share's counter
         rule counts a counter seen for the first time as fresh (storage.md §10 rule 1), so a P left
         overnight would show as just checked for not_monitored_s after Stripes starts. Its age is
         unknown instead ("Checking...") until it moves or that rule makes it NOT MONITORED. Only before
-        the first move, so a PC whose clock is off never loses a P that is being written."""
+        the first move, so a PC whose clock is off never loses a P that is being written. P's judged
+        counter and judged_at count, or for an older file its counter and written_at."""
+        value, at = (p.counter, p.written_at) if p.judged is None else (p.judged, p.judged_at)
         seen = self._counters.get(machine_id)
-        if seen is None or (seen[0] != p.counter and not seen[1]):
-            seen = self._counters[machine_id] = [p.counter, seen is not None]
+        if seen is None or (seen[0] != value and not seen[1]):
+            seen = self._counters[machine_id] = [value, seen is not None]
         if seen[1]:
             return False
-        return age < self.timings.not_monitored_s and self.clock.time() - p.written_at >= self.timings.not_monitored_s
+        return age < self.timings.not_monitored_s and self.clock.time() - at >= self.timings.not_monitored_s
 
     def _read_share(self, data, machines):
         """Fresh reads into the last-good caches; False when the share went away part-way."""
@@ -2322,10 +2613,14 @@ class StatusWatcher:
         placeholder = lambda m: PollStatus(machine_id=m.id, printer_id=m.printer_id, poller="", state=MachineSnapshot(
             code="update_stripes", colour=GREY, headline=Msg(hx_state.STATE_TEXTS["update_stripes"]), since=0.0))
         try:
+            written = self.poller._written_polls()
             for m in machines:
                 s = seen.get(m.id)
                 if s is not None and now - s[1] < self.timings.heartbeat_s:
                     p = s[0]
+                    own = written.get(m.id)
+                    if own is not None and own.machine_id == m.id and (p is None or own.counter > p.counter):
+                        p = own     # this PC's worker wrote P since the coordinator read it (a start, say)
                 else:
                     try:
                         p = store.read_poll(m.id)

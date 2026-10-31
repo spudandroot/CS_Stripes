@@ -245,10 +245,14 @@ def text(msg: Msg | None) -> str:
 
 
 def when(epoch: float | None) -> str:
-    """A time as shown everywhere in the MapleJet screens (never translated)."""
+    """A time as shown everywhere in the MapleJet screens (never translated). Never raises: times
+    come from other PCs' files, and one this PC can't show (inf, nan, out of range) is "?"."""
     if epoch is None:
         return ""
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "?"
 
 
 def join_names(names: list[str]) -> str:
@@ -276,10 +280,11 @@ def setup_styles(root: tk.Misc) -> None:
     style.configure("Hx.Card.TFrame", background=CARD_BG)
     style.configure("Hx.Card.TLabel", background=CARD_BG)
     # stripes.App defines these; set them only where it hasn't (tests, the self-check),
-    # with its own values, so they are never redefined
+    # with its own values, so they are never redefined. configure(name, option) gives the style's
+    # own value ("" when unset); lookup() would inherit the theme's "." foreground and never be empty
     for name, colour in (("Warn.TLabel", COLOUR_HEX[AMBER]), ("Ok.TLabel", COLOUR_HEX[GREEN]),
                          ("Bad.TLabel", COLOUR_HEX[RED]), ("Muted.TLabel", MUTED_FG)):
-        if not style.lookup(name, "foreground"):
+        if not str(style.configure(name, "foreground") or ""):
             style.configure(name, foreground=colour)
 
 

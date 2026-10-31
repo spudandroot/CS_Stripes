@@ -24,14 +24,14 @@ import hx_fake
 import hx_send
 import hx_share
 import i18n
-from hx_core import CancelToken, EventBus, Msg
+from hx_core import SYSTEM_CLOCK, CancelToken, Clock, EventBus, Msg
 from hx_fake import FakePrinter
 from hx_message import (NOTE_TEXTS, STEP_TEXTS, fingerprint, merge_plan, origin_from_design, plan_test,
                         resume_refusal)
 from hx_model import (ALLOWED_WRITE_TAGS, AMBER, GREEN, RED, STANDARD_FONTS, STEP_BUILD, STEP_CHECK_CHOICE,
                       STEP_CHECK_MACHINE, STEP_CONFIRM_1, STEP_CONFIRM_2, STEP_LOCK, STEP_SET_CLOCK, STEP_SWITCH,
                       STEP_VERIFY_IDLE, STEP_WAIT_POLLER, STEPS, TIMINGS, ActionEvent, ActionFinished, Calibration,
-                      ExpectedState, Line, LineChoice, LockHeld, Machine, NotAllowed, PlanError, PollStatus,
+                      ExpectedState, Line, LineChoice, LineStatus, LockHeld, Machine, NotAllowed, PlanError, PollStatus,
                       RunningMessage, SendEvent, SendFinished, SendRequest, ShareError, ShareUnavailable, TestEvent,
                       TestFinished, TestRanges, TestResult, from_json, new_id, to_json)
 from hx_protocol import ClientPool, GateRegistry, release_key
@@ -174,11 +174,12 @@ class PC:
         self.data = hx_share.DataService(store=self.store, local=self.local, bus=EventBus(), identity=identity,
                                          timings=timings)
         self.data.run_once()
-        self.clients = ClientPool(key=release_key(), gates=GateRegistry(), timings=timings)
+        # The world's clock throughout (the real one, except in LeaseTests)
+        self.clients = ClientPool(key=release_key(), clock=world.clock, gates=GateRegistry(), timings=timings)
         self.time = world.time_source()
         self.time.timeout_s = 0.2
         self.kw = dict(store=self.store, data=self.data, clients=self.clients, time=self.time, identity=identity,
-                       timings=timings)
+                       clock=world.clock, timings=timings)
         self.pipeline = hx_send.SendPipeline(**self.kw)
         self.actions = hx_send.PrinterActions(**self.kw)
 
@@ -192,10 +193,10 @@ class PC:
 class Base(unittest.TestCase):
     timings = FAST
 
-    def world(self, printers=None, *, timings=None):
+    def world(self, printers=None, *, timings=None, clock=SYSTEM_CLOCK):
         tmp = tempfile.mkdtemp(prefix="hx_send_")
         self.addCleanup(shutil.rmtree, tmp, True)
-        self.w = hx_fake.FakeWorld(tmp, printers=printers or [{}], timings=timings or self.timings)
+        self.w = hx_fake.FakeWorld(tmp, printers=printers or [{}], timings=timings or self.timings, clock=clock)
         self.addCleanup(self.w.close)
         self.addCleanup(self.check_whitelist, self.w)
         self._polls = {}
@@ -2001,10 +2002,210 @@ class LogTests(unittest.TestCase):
         self.assertEqual(d["preview_b64"], "Qk0AAQ==")
         self.assertEqual(hx_send.design_from_log(d), design)
 
+    def test_a_damaged_send_entry_is_a_value_error(self):
+        # §17.2: result_from_log's times are checked as hx_model checks a file. A hand-edited 400-digit
+        # int raised OverflowError, which the result window's (KeyError, ValueError) didn't catch
+        entry = {"send_id": "sd_8a7b6c5d4e", "started_at": 1793275200.5, "finished_at": 1793275230, "machines": []}
+        r = hx_send.result_from_log(entry)
+        self.assertEqual((r.started_at, r.finished_at, r.data_as_of), (1793275200.5, 1793275230.0, None))
+        self.assertEqual(hx_send.result_from_log(dict(entry, started_at=None, data_as_of=5)).started_at, 0.0)
+        for key in ("started_at", "finished_at", "data_as_of"):
+            for value in (10 ** 400, float("nan"), float("inf"), "soon", True, {"t": 1}):
+                with self.subTest(key=key, value=str(value)[:12]):
+                    with self.assertRaises(ValueError):
+                        hx_send.result_from_log(dict(entry, **{key: value}))
+        # Its lists, objects and pictures too: a TypeError from iterating or indexing one escaped the window
+        result = {"machine_id": "mc_0123456789", "colour": RED, "ok": False, "step": STEP_LOCK,
+                  "previous_preview_b64": "",
+                  "readbacks": [{"slot": 9, "name": "A", "empty": False, "preview_b64": ""}]}
+        self.assertEqual(hx_send.result_from_log(dict(entry, machines=[{"result": result}])).machines[0].step,
+                         STEP_LOCK)
+        for name, machines in (("machines", 5), ("machines", {"result": result}), ("machine", ["x"]),
+                               ("machine", [None]), ("result", [{"result": 5}]), ("result", [{"result": None}]),
+                               ("readbacks", [{"result": dict(result, readbacks=5)}]),
+                               ("readback", [{"result": dict(result, readbacks=[5])}]),
+                               ("preview_b64", [{"result": dict(result, readbacks=[dict(result["readbacks"][0],
+                                                                                        preview_b64=5)])}]),
+                               ("previous_preview_b64", [{"result": dict(result, previous_preview_b64=[1])}])):
+            with self.subTest(damaged=name, machines=str(machines)[:30]):
+                with self.assertRaises(ValueError):
+                    hx_send.result_from_log(dict(entry, machines=machines))
+
     def test_notes_order(self):
         self.assertEqual(hx_send._ordered(["cancelled", "no_lock", "pc_time", "no_lock"]),
                          ["pc_time", "no_lock", "cancelled"])
         self.assertEqual(hx_send.LOG_TYPES["test_step"], "hx-admin")
+
+
+_CHECKED = threading.local()       # .lock: the PrinterLock last checked on this thread (LeaseTests)
+
+
+class JumpClock(Clock):
+    """The real clock, plus jumps: a PC that froze (asleep, a paused VM) finds time moved on at once."""
+
+    def __init__(self):
+        self.offset = 0.0
+
+    def time(self):
+        return time.time() + self.offset
+
+    def monotonic(self):
+        return time.monotonic() + self.offset
+
+    def sleep(self, seconds, cancel=None):
+        return SYSTEM_CLOCK.sleep(seconds, cancel)
+
+    def jump(self, seconds):
+        self.offset += seconds
+
+
+class Seen:
+    """A PrinterClient seen through: each printer call with its deadline, and the lease end of the lock
+    last checked on that thread when the call was made. before(name, cmd) runs first, if given."""
+    CALLS = ("read", "query", "command", "check_uid", "read_twice", "load_slot", "fonts", "firmware")
+
+    def __init__(self, client, calls, timings, before=None):
+        self._client, self._calls, self._timings, self._before = client, calls, timings, before
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if name not in self.CALLS:
+            return attr
+
+        def call(*args, **kw):
+            if self._before is not None:
+                self._before(name, args)
+            lock = getattr(_CHECKED, "lock", None)
+            lease = lock._last_ok + self._timings.lock_stale_s / 2 if lock is not None and lock.state == "held" \
+                else None
+            self._calls.append((name, args[0] if args else None, kw.get("deadline"), lease))
+            return attr(*args, **kw)
+        return call
+
+
+class LeaseTests(Base):
+    """send.md §10.5: every printer call made under a lock carries the lock's lease end as its deadline,
+    so a call that passed its guard and then waited (the gate, a frozen PC) is refused, not sent late."""
+
+    def watch(self, pc, before=None):
+        calls = []
+        real = pc.clients.client
+        pc.clients.client = lambda printer: Seen(real(printer), calls, self.timings, before)
+        real_check = hx_share.PrinterLock.check
+
+        def check(lock, budget_s=0.0):
+            _CHECKED.lock = lock
+            return real_check(lock, budget_s)
+        patcher = mock.patch.object(hx_share.PrinterLock, "check", check)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def test_every_printer_call_under_a_lock_has_the_lease_deadline(self):
+        self.quiet()
+        w = self.world()
+        pc = self.pc()
+        self.own_poll(pc)
+        fake, mid = w.printers[0], self.mid()
+        fake.override("PMCNT", rising())
+        calls = self.watch(pc)
+        result, _, _ = self.send(pc)
+        self.assertTrue(result.machines[0].ok)
+        pc.pipeline.confirm(result.send_id, [mid], True)
+        self.assertTrue(pc.actions.stop([mid], lambda e: None).machines[0].ok)
+        self.assertTrue(pc.actions.check_resume(mid).allowed)
+        self.assertTrue(pc.actions.resume([mid], lambda e: None).machines[0].ok)
+        self.assertTrue(pc.actions.set_clocks([mid], lambda e: None).machines[0].ok)
+        admin = self.pc("admin", admin=True, sender=False)
+        self.own_poll(admin)
+        test_calls = self.watch(admin)
+        plan = plan_test(mid, w.ids["film"], TestRanges(vary="delay", start=480, stop=490, step=10),
+                         admin.data.current, admin.identity)
+        self.assertTrue(admin.print_run(plan).run(lambda e: None).ok)
+        calls += test_calls
+        self.assertGreater(len(calls), 60)
+        self.assertEqual({name for name, *_ in calls}, {"check_uid", "read", "command", "fonts", "load_slot",
+                                                         "read_twice"})
+        for name, arg, deadline, lease in calls:
+            with self.subTest(call=name, arg=arg):
+                self.assertIsNotNone(lease)                     # made under a held lock
+                self.assertIsNotNone(deadline)
+                self.assertLessEqual(deadline, lease + 1e-6)
+        self.assertClean(fake)
+
+    def test_a_frozen_pc_sends_nothing_after_a_takeover(self):
+        # The guard before PRINTMSG passed; then the PC froze longer than the lease (asleep, a paused VM)
+        # and another PC took the stale lock over. On waking the command is refused: nothing reaches the
+        # printer, and the Send ends red with the lock's text. Before, PRINTMSG went out after the takeover
+        self.quiet()
+        clock = JumpClock()
+        w = self.world(clock=clock)
+        a, b = self.pc(), self.pc("akim")
+        self.own_poll(a)
+        fake, pid = w.printers[0], w.ids["printer1"]
+        taker = b.store.lock(pid, purpose="send", run_id=new_id("sd"), line_id=w.ids["line"], machine_id=self.mid())
+        self.addCleanup(taker.release)
+        marks = {}
+
+        def freeze(name, args):
+            if name != "command" or args[0].tag != "PRINTMSG" or marks:
+                return
+            for _ in range(4):                                  # A's keeper stops by itself once frozen
+                b.store.read_lock(pid)
+                if (b.store.lock_age(pid) or 0.0) >= self.timings.lock_stale_s:
+                    break
+                clock.jump(self.timings.lock_stale_s + 1)
+            self.assertEqual(taker.acquire(), "held")
+            marks["requests"] = len(fake.requests)
+        self.watch(a, before=freeze)
+        result, _, _ = self.send(a)
+        r = result.machines[0]
+        self.assertIn("requests", marks)
+        self.assertEqual(len(fake.requests), marks["requests"])  # nothing after the takeover
+        self.assertNotIn("PRINTMSG", fake.writes)
+        self.assertEqual((r.ok, r.step, r.msg.english()), (False, STEP_SWITCH, LOCK_LOST))
+        self.assertEqual(a.store.read_lock(pid).token, taker.token)
+        self.assertClean(fake)
+
+    def test_a_frozen_test_end_writes_nothing_after_a_takeover(self):
+        # The test print's end procedure: the guard before PRINT 0 passed, then the admin PC froze past the
+        # lease and B took the printer over and wrote the line's status. PRINT 0 is refused at its deadline
+        # (nothing reaches the printer), and nothing is written. Before, the refusal was an ordinary
+        # failure there, so the rows step ran and the admin PC wrote "Stopped, needs a Send" over B's Send
+        self.quiet()
+        clock = JumpClock()
+        w = self.world(clock=clock)
+        admin, b = self.pc("admin", admin=True, sender=False), self.pc("akim")
+        self.own_poll(admin)
+        fake, pid, mid, line_id = w.printers[0], w.ids["printer1"], self.mid(), w.ids["line"]
+        fake.override("PMCNT", rising())
+        taker = b.store.lock(pid, purpose="send", run_id=new_id("sd"), line_id=line_id, machine_id=mid)
+        self.addCleanup(taker.release)
+        marks = {}
+
+        def freeze(name, args):
+            if name != "command" or args[0].tag != "PRINT" or ">0<" not in args[0].xml or marks:
+                return
+            for _ in range(4):                                  # the admin PC's keeper stops by itself
+                b.store.read_lock(pid)
+                if (b.store.lock_age(pid) or 0.0) >= self.timings.lock_stale_s:
+                    break
+                clock.jump(self.timings.lock_stale_s + 1)
+            self.assertEqual(taker.acquire(), "held")
+            b.store.write_line_status(LineStatus(line_id=line_id, send_id="sd_bbbbbbbbbb"))
+            marks.update(requests=len(fake.requests), line=b.store.read_line_status(line_id),
+                         expected=b.store.read_expected(mid))
+        self.watch(admin, before=freeze)
+        plan = plan_test(mid, w.ids["film"], TestRanges(vary="delay", start=480, stop=490, step=10),
+                         admin.data.current, admin.identity)
+        result = admin.print_run(plan).run(lambda e: None)
+        self.assertIn("requests", marks)
+        self.assertEqual(len(fake.requests), marks["requests"])  # nothing after the takeover
+        self.assertFalse(result.ok)
+        self.assertEqual(to_json(b.store.read_line_status(line_id)), to_json(marks["line"]))
+        self.assertFalse(marks["line"].stopped_needs_send)
+        self.assertEqual(to_json(b.store.read_expected(mid)), to_json(marks["expected"]))
+        self.assertEqual(admin.store.read_lock(pid).token, taker.token)
 
 
 class SafetyTests(Base):

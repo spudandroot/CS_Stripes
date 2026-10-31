@@ -627,8 +627,13 @@ str, `read_at` float, `preview_sha256` str) · `daily` dict · `state` MachineSn
 list[str], `active` bool, `colour` str, `ref` str, `acked_by` str, `acked_at` float|null, `ended_at`
 float|null, `waiting` list[str]) · `foreign_client` bool · `problem` str · `expected_counter` int ·
 `reread_seen` str · `unreachable_since` float|null · `running_ok_at` float|null · `running_unchecked`
-bool · `dst` dict · `standalone` bool. The fields after `foreign_client`, and the Alert fields after
-`active`, are states.md's additions (architecture.md §5.8 lists them all).
+bool · `dst` dict · `standalone` bool · `judged` int|null · `judged_at` float · `printing_unchecked`
+bool. The fields after `foreign_client`, and the Alert fields after `active`, are states.md's additions
+(architecture.md §5.8 lists them all). `judged` moves only with a judgement or a paused write
+(states.md §6.14), so it says when the printer was last really checked; every other write copies it. A
+file from an older Stripes has no `judged` (null): readers then use the counter, as before. With
+`printing_unchecked` true (PRIN unread for `PRIN_UNREAD_LIMIT` cycles, states.md §6.6), `printing` is
+the last known value, not a fresh reading.
 
 Write rules, enforced by `ShareStore.write_poll`:
 
@@ -681,7 +686,10 @@ Write rules, enforced by `ShareStore.write_poll`:
  "running_ok_at": 1793275170.4,
  "running_unchecked": false,
  "dst": {},
- "standalone": false
+ "standalone": false,
+ "judged": 18730,
+ "judged_at": 1793275205.12,
+ "printing_unchecked": false
 }
 ```
 
@@ -820,8 +828,9 @@ list[str] · `origin_line` str · `machines` dict[str, str] · `confirmed` bool 
 
 `file_type` `heartbeat`. Class `HeartbeatInfo`. Fields: `key` str · `computer` str · `user` str ·
 `pid` int · `version` str · `counter` int · `written_at` float · `can_poll` bool ·
-`last_printer_reach` float|null · `polling` list[str] · `monitor_open` bool · `floor_board` bool.
-The protocol is in §12.
+`last_printer_reach` float|null · `polling` list[str] · `monitor_open` bool · `floor_board` bool ·
+`declined` list[str] (printer ids this PC won't poll for now: its worker for them is stuck, states.md
+§6.2 item 3.0; missing in an older file, which declines nothing). The protocol is in §12.
 
 ```json
 {
@@ -838,7 +847,8 @@ The protocol is in §12.
  "last_printer_reach": 1793275204.9,
  "polling": ["pr_9c8b7a6d5e"],
  "monitor_open": true,
- "floor_board": false
+ "floor_board": false,
+ "declined": []
 }
 ```
 
@@ -1096,8 +1106,8 @@ set is poll.json's `dst` (states.md §6.10, §6.11), so a PC that takes a printe
 | Operation | Behaviour |
 |---|---|
 | `read_bytes(path)` | `hx_win.open_for_read(path)` (FILE_SHARE_READ, WRITE and DELETE), read everything, close at once. On `PermissionError` (a sharing violation from a program that doesn't share delete) it retries after 0.05, 0.1 and 0.2 s (`READ_RETRY_S`), then raises. `FileNotFoundError` propagates. A handle is never kept open. |
-| `write_whole(path, data)` | 1) `tmp = f"{path}.{tmp_tag}-{secrets.token_hex(3)}.tmp"`. 2) `open(tmp, "xb")`, write, `flush`, `os.fsync`, close. 3) `os.replace(tmp, path)`; on `PermissionError` it retries after 0.05, 0.1, 0.2, 0.4, 0.8 and 1.6 s (`REPLACE_RETRY_S`, about 3.2 s in all, inside the 5 s share timeout). 4) On final failure it removes `tmp` (best effort) and raises. It never creates parent folders. |
-| `create_exclusive(path, data)` | `os.open(path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY)` (CREATE_NEW: atomic on the server, so exactly one PC wins). On `FileExistsError` it returns False. Otherwise it writes all of `data` through that same descriptor, then `os.fsync`, closes, and returns True. If anything fails after the create, it closes and raises, leaving the partial file. |
+| `write_whole(path, data)` | 1) `tmp = f"{path}.{tmp_tag}-{secrets.token_hex(3)}.tmp"`. 2) `open(tmp, "xb")`, write, `flush`, `os.fsync`, close. 3) `os.replace(tmp, path)`; on `PermissionError` it retries after 0.05, 0.1, 0.2, 0.4, 0.8 and 1.6 s (`REPLACE_RETRY_S`, about 3.2 s in all, inside the 5 s share timeout). 4) On final failure it removes `tmp` (best effort) and raises. It never creates parent folders. 5) A write whose caller gave up (the share timeout, §9.1 item 3) never commits: right before each replace attempt it checks that, and if so removes `tmp` and raises. So the file stays as the caller was told, and a stuck write can't land later over a newer owner's lock, `poll.json` or `expected.json`. The same holds for `copy_in`'s commit. |
+| `create_exclusive(path, data)` | `os.open(path, O_WRONLY | O_CREAT | O_EXCL | O_BINARY)` (CREATE_NEW: atomic on the server, so exactly one PC wins). On `FileExistsError` it returns False. Otherwise it writes all of `data` through that same descriptor, then `os.fsync`, closes, and returns True. If anything fails after the create, it closes and raises, leaving the partial file. A create whose caller gave up (rule 3) takes its file back: after the close it removes the file and raises, but only while less than `lock_stale_s / 2` has passed since just before `os.open`. Before then no other PC can have judged the file stale and taken it over (§11.4), so the file removed is the one made. Otherwise a lock no one knew it held (`acquire()` said `local_only`) would keep every other PC out for 60 s. Later than that, the file is left to go stale. |
 | `rename(src, dst)` | Windows: `os.rename` (fails if `dst` exists). Elsewhere: `os.link(src, dst)` then `os.unlink(src)`, so an existing `dst` also fails. Returns False on `FileNotFoundError` (src gone) or `FileExistsError` (dst exists). Never replaces. |
 | `listdir(path)` | `os.listdir`. `FileNotFoundError` propagates. |
 | `makedirs(path)` | `os.makedirs(path, exist_ok=True)` |
@@ -1111,6 +1121,11 @@ The remaining file rules:
    `status/machines`, `status/lines`, `status/locks` and `status/pollers` and removes `*.tmp` files
    whose tag has its own 12-hex prefix but another pid. These were left by an earlier crashed run of
    this user on this PC; `SingleInstance` means no other live process has that prefix.
+3. "Gave up" is known through the hx-io job: the pool marks each thread's current job, and the caller's
+   timeout marks the job abandoned. `FileOps` called directly (no pool) writes as before. A replace
+   already issued when the caller gives up can still land: a named residual (§11.8 item 3). So can a
+   create that hung `lock_stale_s / 2` or more, or one that finished just as the caller gave up: its
+   lock is left until it goes stale (liveness only, 60 s).
 
 ### 8.2 Windows notes
 
@@ -1144,6 +1159,14 @@ The remaining file rules:
    ignoring case.
 8. **Encoding.** UTF-8 everywhere. PowerShell 5.1's `Set-Content -Encoding UTF8` writes a BOM, which
    readers accept (§0.3).
+9. **The C runtime hides network errors.** `create_exclusive`'s `os.open` and the temp file's
+   `open(tmp, "xb")`, their writes, and the read and seek after `open_for_read` (`read_bytes`, `_size`)
+   go through the C runtime, whose `OSError` has only an errno: a lost server (winerror 64, 1231 ...)
+   reads as `EINVAL`, and 53 or 67 as `ENOENT`, which §9.2 takes for a folder error. So when one of
+   these steps fails with no `winerror`, `FileOps` asks the server once more
+   through `hx_win.open_for_read(path)` (CreateFileW), whose error has the winerror, and raises that error
+   instead when it is in `NETWORK_WINERRORS`. Then the share is marked down as for a read, and a lock
+   taken meanwhile is `local_only` (amber), not a red folder error. Any other error stands.
 
 ## 9. ShareStore: timeouts and share health
 
@@ -1234,6 +1257,10 @@ status files through that store.
 
 Keys are `poll:<machine_id>`, `expected:<machine_id>`, `line:<line_id>`,
 `lock:<printer_id>:<token>` (with `lock:<printer_id>` for "no lock file") and `hb:<heartbeat key>`.
+The status watcher and the poller's coordinator each keep their own `CounterWatch` for
+`judged:<machine_id>` (P's `judged` counter, §5.2), fed from the P they read: the board's freshness
+and a worker's long-gap rule (states.md §5.1, §6.3 step 1). The counter's `poll:` key still drives
+takeover, handover and `check_poller_paused`.
 A damaged lock file is seen with the counter `zlib.crc32(raw bytes)`. Keys untouched for 3,600 s are
 pruned on the next `see`.
 
@@ -1262,7 +1289,7 @@ No share operation runs while holding it, so `check()` never blocks on the share
 | `unheld` | Not acquired yet, or released |
 | `held` | Our lock file is on the share, with our token |
 | `local_only` | The share was unreachable at acquire time. Only `store.local_locks` protects the printer, against this PC's own poller. Results are amber |
-| `lost` | Our file is gone or names another token, or there has been no good refresh for `lock_stale_s / 2` (30 s). `check()` raises `LockLost` |
+| `lost` | Our file is gone or names another token, or there has been no good refresh for `lock_stale_s / 2` (30 s), or a refresh or release came too late to prove anything (§11.3, §11.5). `check()` and `lease_end()` raise `LockLost` |
 
 ### 11.2 Acquire
 
@@ -1276,9 +1303,10 @@ No share operation runs while holding it, so `check()` never blocks on the share
    the store (a copy is returned by `store.local_lock_info(printer_id)`, §15, for the standalone
    status watcher). This comes before any share access, so this PC's poller steps aside at once.
 3. Build a `LockInfo` with a new `token`, our `user`, `computer` and `pid`, the purpose and ids,
-   `counter` 1, `acquired_at = clock.time()` and an empty `note`.
-4. `create_exclusive("status/locks/<printer_id>.lock", encode_json("lock", ...))`. On success, the
-   state is `held`; return `"held"`.
+   `counter` 1, `acquired_at = clock.time()` and an empty `note`. Steps 4 to 6 run holding the store's
+   mutex for this printer, so a pending release's retry can't remove the file made here (§11.5).
+4. `t0 = clock.monotonic()`, then `create_exclusive("status/locks/<printer_id>.lock", encode_json("lock",
+   ...))`. On success, the state is `held` and `last_ok = t0`; return `"held"`.
 5. `ShareUnavailable` at any point: the state is `local_only`; return `"local_only"`. The
    registration stays.
 6. If the file exists, `read_lock(printer_id)`, which updates the watch. If the file has vanished in
@@ -1298,12 +1326,15 @@ retries, the age is known.
 1. Read the lock file by name.
 2. If the file is missing, or holds another token: the state becomes `lost`, and the keeper stops
    without writing.
-3. Otherwise set `counter += 1`, merge any note given to `update(**note)` since the last refresh, and
-   `write_bytes` the whole file. On success, record `last_ok = clock.monotonic()`. Just before writing,
-   if `clock.monotonic() − last_ok >= lock_stale_s / 2`, the state becomes `lost` and the keeper never
-   writes again, as in step 4. A holder that stalled that long (the PC slept, the process was
-   suspended) may already be judged stale or taken over elsewhere, so it must not revive its lock or
-   write over a new holder's file.
+3. Otherwise set `counter += 1`, merge any note given to `update(**note)` since the last refresh, take
+   `t0 = clock.monotonic()` and `write_bytes` the whole file. Just before writing, if `t0 − last_ok >=
+   lock_stale_s / 2`, the state becomes `lost` and the keeper never writes again, as in step 4. A holder
+   that stalled that long (the PC slept, the process was suspended) may already be judged stale or
+   taken over elsewhere, so it must not revive its lock or write over a new holder's file. On success:
+   if `clock.monotonic() − t0 >= lock_stale_s / 2` the state becomes `lost` (the PC froze inside the
+   write: it proves nothing, and may have landed over a new holder's file); otherwise `last_ok = t0`,
+   never the time the write returned, as the poller's `p_ok` (states.md §6.4 step 7). Other PCs can't
+   see the new counter before `t0`, so a lease counted from `t0` always ends first.
 4. On `ShareError` or `ShareUnavailable`: if `clock.monotonic() − last_ok >= lock_stale_s / 2`, the
    state becomes `lost` and the keeper never writes again. Another PC can only take over after 60 s
    without change on its own clock, and this rule stops a holder that lost the share from ever
@@ -1311,8 +1342,9 @@ retries, the age is known.
 
 For a `local_only` lock the keeper does nothing.
 
-`last_ok` starts at the moment `acquire()` created or took over the file, and moves on every
-successful refresh (step 3).
+`last_ok` starts at `t0`, the time taken just before the `create_exclusive` that made the file (§11.2
+step 4, §11.4 step 3), not after it returned nor after the takeover's remove and log, and moves on every
+successful refresh (step 3). A slow or frozen share call can only shorten the lease, never stretch it.
 
 `check(budget_s: float = 0.0)` raises `LockLost(Msg(N_("Another PC took over this printer's lock.")))`
 when the state is `lost`, or when the state is `held` and `clock.monotonic() − last_ok + budget_s >=
@@ -1323,6 +1355,12 @@ the worst case of that call (`hx_protocol.worst_case_s`, protocol.md §8.3), so 
 running when another PC may judge the lock stale: the last request starts at least `budget_s` before
 `last_ok + lock_stale_s / 2`, and other PCs wait `lock_stale_s` after the last refresh they saw. A
 holder that gets `LockLost` stops talking to that printer at once (send.md decides what is shown).
+
+`lease_end() -> float | None` is `last_ok + lock_stale_s / 2`, read under the internal lock: the time by
+which every printer call made under this lock must have ended. None for a `local_only` (or unheld)
+lock; `LockLost` when lost. Holders pass it as the deadline of every printer call (send.md §10.5), and
+the client checks it after the gate and before every exchange (protocol.md §9 item 2). So a call that
+passed `check()` and then waited (this PC's gate, a frozen PC) is refused instead of sent late.
 
 ### 11.4 Takeover of a stale lock
 
@@ -1338,22 +1376,36 @@ store's watch.
    that lock's info.
 4. Remove `aside` (best effort). Write `lock_taken_over` to hx-events (§6.7) with
    `ShareStore.append_log`. If that fails, print to stderr and carry on.
-5. The state is `held`; return `"held"`.
+5. The state is `held`, with `last_ok` the `t0` taken just before step 3's create; return `"held"`.
 
 Only one rename of X can succeed, so of several PCs taking over at the same moment exactly one ends up
-holding the lock.
+holding the lock. Step 2 compares only the token, not the counter, on purpose: a healthy holder stops by
+its own lease (§11.3) at least 25 s before any other PC may call its lock stale, so a same-token
+refresh can only land in the taker's gap from a frozen or stuck holder, which its own rules already
+stop; a counter check would only delay the takeover by another 60 s.
 
 ### 11.5 Release
 
 `release()` is idempotent.
 
 1. Stop the keeper and join it, waiting at most `lock_refresh_s`.
-2. If the state is `held`: read X. If it still has our token, remove it. If the removal fails
-   (`ShareError` or `ShareUnavailable`), record the token in the store's pending releases. The probe
-   (§9.3) and every later successful operation retry those removals, for up to 10 minutes, and only
-   while the file still holds that token. Until the file is gone, this store's `read_lock` treats a
-   file holding a released token as no lock, so this PC's poller resumes at once. Other PCs see it go
-   stale after 60 s.
+2. Reading X and then removing it by name is two share calls, safe only while no other PC can take the
+   file over in between: while `clock.monotonic() < until = last_ok + lock_stale_s / 2`, the bound
+   `check()` uses, which ends at least 25 s before any other PC may call the lock stale. So: if the state
+   is `held` but that time has passed (the holder stalled), the state becomes `lost` and the file isn't
+   touched. Otherwise read X; if it still has our token (and it is still before `until`), remove it. If
+   the removal fails (`ShareError` or `ShareUnavailable`), record the token in the store's pending
+   releases. The probe (§9.3) and every later successful operation retry those removals, by the same
+   read-then-remove, only before `until` and only while the file still holds that token. Until then,
+   this store's `read_lock` treats a file holding a released token as no lock, so this PC's poller
+   resumes at once. After `until` the store forgets the token: the file is an ordinary stale lock,
+   taken over through §11.4's rename (which has one winner), by this PC too; this PC's poller may pause
+   up to one more `lock_stale_s` for it (fails closed). Other PCs see it go stale after 60 s.
+   The bound covers other PCs, not this PC's own next lock on the printer: a retry (on whatever thread
+   just had a good share call) could read the released file, then a new `acquire()` on another thread
+   remove it and make its own, and then the retry's remove delete that new lock. So the two take turns:
+   `acquire()` holds a per-printer mutex of the store while it works on the share, and a retry takes it
+   without waiting, or skips that printer (the `acquire()` clears the old file itself).
 3. If the state is `lost`, the file isn't touched.
 4. Remove the `local_locks` entry and the private `LockInfo`. The state becomes `unheld`.
 
@@ -1419,17 +1471,60 @@ Sequence of a normal Send (architecture.md §7.3, with file names):
 | File | Result |
 |---|---|
 | missing | None. `watch.missing("lock:<id>")` |
-| holds a token this store released (§11.5) | None |
+| holds a token this store released, before that token's `until` (§11.5) | None |
 | valid | its `LockInfo`. `watch.see("lock:<id>:<token>", counter)` |
 | newer format | a `LockInfo` built from the stable keys (§3.4), still treated as a lock |
 | damaged | `LockInfo(printer_id=..., token=f"damaged-{crc:08x}", user="", computer="", pid=0, purpose="unknown", counter=crc)`, where `crc = zlib.crc32(raw)`. It stays a lock until it has been unchanged for `lock_stale_s`, then it is taken over |
+
+### 11.8 Residual risks of the lock (named, for the owner's sign-off)
+
+What §11.2 to §11.5 can't close, and what it costs. architecture.md §7.3 rule 8 repeats items 1 and 2.
+
+1. **One late request after a freeze.** A printer can't tell an old owner from a new one. A PC that
+   freezes between its last time check (inside the client, right before an exchange) and the request
+   leaving delivers that one request when it wakes, maybe after another PC took over. The gap is
+   microseconds, up to `http_timeout_s` while connecting, plus TCP retransmitting a request already sent
+   (about 20 s with Windows defaults, normally inside the margin); the freeze must last about 25-30 s or
+   more. Bound: one exchange per frozen thread, then `LockLost` at its next guard. The new holder's TN
+   and XID read-backs and the poller's drift rule catch it: a message switch goes red in about 7-12 s, a
+   same-name content edit waits for the slow Load (about 60-65 s). The poller's own microsecond gap
+   between its last check and its keep-fresh write is the same kind (states.md §6.4).
+2. **The monotonic clock must count sleep.** Every lease is `clock.monotonic()` time. Python 3.12 on
+   Windows uses `GetTickCount64`, which counts sleep and hibernation, so a woken holder fails `check()`.
+   A VM pause or restore that the guest's monotonic clock doesn't see would let a woken holder pass
+   `check()` until its keeper next reads the file: at most `lock_refresh_s` (5 s) plus one read of
+   overlap. To check on the test PC: `time.get_clock_info("monotonic")` and a sleep and resume while a
+   lock is held. **Plant rule: PCs that run Stripes never sleep or hibernate while it runs (power
+   policy), and are not VMs that can be paused.**
+3. **A share call already issued can still land.** §8.1 stops a write that hasn't reached its replace,
+   and takes back a create that made its file less than `lock_stale_s / 2` before, but a replace,
+   rename or remove already issued when the caller gave up can still land later (the SMB client's
+   session timeout is about 60 s, and it may replay after a reconnect). For the lock this costs
+   liveness only: the new holder is evicted at its next refresh (5 s or less) with "Another PC took
+   over this printer's lock.", and the printer looks locked and unpolled for 60 s, as after a crash.
+   The same fail-closed result follows when a frozen holder's refresh lands over a new holder's file
+   (§11.3 step 3: both stop). A lock create that hung longer than that bound, or finished just as its
+   caller gave up, leaves a lock no one holds: the printer looks locked for 60 s (§8.1 rule 3). For
+   `poll.json` and `expected.json` a board can be wrong until the next poll write (5 s or less) or the
+   next Send. Closing it fully needs per-token beat files, the lock token in `expected.json` and
+   ordered poll counters: a format change, deferred.
+4. **Two takers in one gap.** A losing taker whose stale decision came before the winner's takeover
+   renames the winner's fresh file aside for up to three share calls (§11.4 step 2 puts it back). That
+   needs two takers within milliseconds, or a taker frozen between its read and its rename. Bound: the
+   winner's Send fails red, a ghost lock lasts 60 s, and at most one poller request overlaps.
+5. **A refresh in flight at release.** `release()` waits for the keeper only `lock_refresh_s`; a refresh
+   still in flight can land after the removal and leave a ghost lock with a released token. This PC
+   ignores it until `until`; other PCs pause up to 60 s. Liveness only.
+6. **Read lag.** Two holders become possible if one PC's reads of the lock lag the share by 30 s or
+   more (Offline Files, DFS replicas). §8.2 note 5 already rules that out (one server, `CachingMode
+   None`).
 
 ## 12. Heartbeats and poller assignment
 
 ### 12.1 Heartbeats
 
 1. `store.heartbeat()` returns this store's single `Heartbeat`. Its `key` is `identity.key`.
-2. `beat(can_poll=, last_printer_reach=, polling=, monitor_open=, floor_board=)` writes
+2. `beat(can_poll=, last_printer_reach=, polling=, monitor_open=, floor_board=, declined=())` writes
    `status/pollers/<key>.json` whole, with `counter` + 1 (starting at 1 per process),
    `written_at = clock.time()` and `version = store.version`. The poller calls it every
    `heartbeat_s`. The store keeps its last `HeartbeatInfo` in memory.
@@ -1448,7 +1543,7 @@ Sequence of a normal Send (architecture.md §7.3, with file names):
    file for 10 s.
 4. Clean-up: a file whose counter this store has seen unchanged for `40 × stale_s` (600 s) is
    removed, best effort. A live PC whose file was removed recreates it at its next beat.
-5. The result is sorted by key.
+5. The result is sorted by key, each with its `declined` list (§12.4 leaves the PC out for those).
 
 ### 12.3 Can poll: reach memory and the reachability probe
 
@@ -1499,12 +1594,13 @@ def assign(printer_ids, heartbeats):
     for hb in heartbeats:
         if hb.can_poll:
             pollers.setdefault(hb.key, hb)            # one entry per key
-    return {pid: [hb.key for hb in sorted(pollers.values(),
+    return {pid: [hb.key for hb in sorted((hb for hb in pollers.values() if pid not in (hb.declined or ())),
                                           key=lambda hb: (-score(pid, hb.computer), hb.key))]
             for pid in printer_ids}
 ```
 
-1. Rank 0 is the one that polls. Each printer's list is the takeover order.
+1. Rank 0 is the one that polls. Each printer's list is the takeover order. A heartbeat is left out
+   for the printers in its `declined` list, so the next PC is rank 0 for them on every PC.
 2. Scores depend on the computer, not the user or process. A restarted Stripes on the same PC keeps
    its printers, and two users signed in on one PC sit next to each other in every ranking. The one
    with the lower key polls, and the other takes over on the same PC.
@@ -1563,7 +1659,20 @@ These are the file-level rules behind architecture.md §7.3. states.md builds th
 6. A poller re-checks its rank (from `live_heartbeats()` and `assign()`) before every cycle.
 7. A poller whose `poll.json` writes or lock reads have failed for `stale_s / 2` stops share-mode
    polling of that printer (states.md switches it to standalone mode). Otherwise another PC could
-   judge it stale and start while it is still talking to the printer.
+   judge it stale and start while it is still talking to the printer. So does one whose write
+   succeeded but took `stale_s / 2` or more: it may have landed over another PC's file.
+8. **Superseded writes.** A poller whose last good write is `stale_s / 2` or more old reads
+   `poll.json` before any write and never writes over a newer one by another PC (a higher counter), a
+   yield to it included; it adopts a newer one yielded to it and continues from that (states.md §6.4
+   step 7.2).
+9. **Late writes.** A `poll.json` by a PC that isn't live, with a counter not above the poller's own
+   last write (equal is the likeliest case: the late write and the new poller's start write both
+   counted on from the same file) and `written_at` at least `stale_s / 2` old by the reader's clock,
+   is a late write by a
+   superseded owner (a share write it gave up on that landed later, or a PC that paused inside its
+   write). The poller neither adopts it nor yields to it, logs `late_write_ignored`, and its next
+   write puts its own file back. SMB has no compare-and-swap, so the landing itself can't be prevented:
+   a board can show the old file for at most one tick.
 
 ## 13. DataService
 
@@ -1953,6 +2062,8 @@ class PrinterLock:
     def token(self) -> str: ...   # "" unless held
     def check(self, budget_s: float = 0.0) -> None: ...   # §11.3: LockLost when lost, or when a call
                                                           # of budget_s could outlive the lock
+    def lease_end(self) -> float | None: ...   # §11.3: last_ok + lock_stale_s / 2; None when local_only
+                                               # or unheld; LockLost when lost
 
 # ReachMemory (§12.3)
 class ReachMemory:
@@ -2057,6 +2168,10 @@ sleeps more than 0.5 s in real time.
    a new entry in `calls`; after `share_retry_s` one probe runs; after clearing `hang`, the next probe
    makes `available` True. `down=True` gives `ShareUnavailable` at once. A `PermissionError` gives
    `ShareDenied` and `available` stays True. No more than `POOL_MAX` threads ever exist.
+   A write the caller gave up on never lands (hung before the write, or after the temp file was
+   written), so an abandoned `poll.json` or `expected.json` write never replaces a newer owner's, and
+   an abandoned lock create takes its file back while that is safe, but not after `lock_stale_s / 2`
+   (§8.1 rule 3).
 8. **Logs:** `append_log` writes `logs/<kind>/<YYYY-MM>/<name>`, and the name matches §6.3. Entries at
    1793491199.999 (31 Oct 2026 23:59:59.999 UTC) and 1793491200.0 land in `2026-10` and `2026-11`.
    `decode_log` of every proper prefix of a valid file gives None, and so does a file with one byte
@@ -2098,6 +2213,12 @@ sleeps more than 0.5 s in real time.
       a healthy lock's `check(budget_s=10)` never raises.
     - Thread use: a lock acquired on one thread, then `check()`, `update(step=1)` and `release()`
       from another thread work, and `release()` from a third thread is still idempotent.
+    - The lease (§11.3): a refresh that froze `lock_stale_s / 2` or more, before or after it landed,
+      makes the lock `lost`, also with a poller polling past it; a slow refresh, create or takeover
+      log keeps the time taken before its write as `last_ok`; `lease_end()` is `last_ok + 30 s`, None
+      when `local_only`, `LockLost` when lost. An abandoned refresh never replaces a takeover.
+    - Release (§11.5): a pending release never removes a new holder's lock, nor this PC's own new
+      lock, and is forgotten when its lease ends; a release after a stall leaves a taker's file alone.
     - `check_poller_paused` returns `"paused"` (token match, or own poller key), `"polling"` (fresh,
       other token), `"stale"` (15 s unchanged), and `"missing"` only after 15 s missing (at 14 s it
       is `"polling"`).
@@ -2145,6 +2266,10 @@ sleeps more than 0.5 s in real time.
      `PermissionError`.
    - Clean-up grants Full control first.
    - The test is skipped if `icacls` fails.
+6. **The C runtime hides network errors** (`CRuntimeErrorTests`, every platform, Windows faked):
+   a lost server (winerror 53, 64, 1231) on a create, a temp file's open or write, a commit, a read or
+   a size check gives `ShareUnavailable` and a `local_only` lock; a folder error (3, 87) stays
+   `ShareError` (§8.2 note 9).
 
 ## 18. Notes for the other spec files
 
@@ -2247,8 +2372,9 @@ sleeps more than 0.5 s in real time.
 14. **A lock holder stops refreshing after 30 s of failed refreshes** (half of `lock_stale_s`). It
     can never recreate its file after another PC's takeover.
 15. **A takeover that moved the wrong file aside puts it back** and raises `LockHeld`.
-16. **Released locks whose removal failed** are retried for 10 minutes and ignored by this PC's own
-    poller.
+16. **Released locks whose removal failed** are retried, and ignored by this PC's own poller, only
+    while the lease still runs (`last_ok + lock_stale_s / 2`, §11.5); after that the file is an ordinary
+    stale lock.
 17. **A damaged lock is still a lock**, judged by the crc32 of its bytes, and taken over after 60 s.
 18. **Rendezvous score by computer, not process**, with ties by key. A restart keeps a PC's
     printers; two users on one PC back each other up; the load spreads across PCs.

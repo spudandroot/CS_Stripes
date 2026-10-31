@@ -458,9 +458,10 @@ def same_user(a, b):
 
 
 def _natural_key(name):
-    # "Bagger 2" before "Bagger 10": digit runs as numbers, the rest casefolded
-    return [(0, int(part), "") if part.isdigit() else (1, 0, part.casefold())
-            for part in re.split(r"(\d+)", name or "") if part]
+    # "Bagger 2" before "Bagger 10": ASCII digit runs as numbers, the rest casefolded. Only ASCII digits:
+    # str.isdigit() also takes "²", and int("²") raises
+    return [(0, int(part), "") if part.isascii() and part.isdigit() else (1, 0, part.casefold())
+            for part in re.split(r"([0-9]+)", name or "") if part]
 
 
 # --------------------------------------------------------------------------
@@ -955,6 +956,7 @@ class HeartbeatInfo:             # status\pollers\<key>.json
     polling: list[str] = field(default_factory=list)    # printer ids this PC is polling now
     monitor_open: bool = False
     floor_board: bool = False
+    declined: list[str] = field(default_factory=list)   # printer ids this PC won't poll for now (a stuck worker)
 
 
 @dataclass(kw_only=True)
@@ -1038,6 +1040,9 @@ class PollStatus:                # status\machines\<machine_id>.poll.json; one w
     running_unchecked: bool = False          # committed fact: the running message can't be read
     dst: dict = field(default_factory=dict)  # the daylight-saving clock set of the current change
     standalone: bool = False     # True only in Poller.local_statuses() in standalone mode
+    judged: int | None = None    # +1 only by a write that judged a reading, or paused for a lock; None: older file
+    judged_at: float = 0.0       # wall time of that write (display and first sight only)
+    printing_unchecked: bool = False         # committed fact: printing couldn't be read for PRIN_UNREAD_LIMIT cycles
 
 
 @dataclass(kw_only=True)

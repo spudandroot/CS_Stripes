@@ -257,6 +257,8 @@ ES = {
     "The free-text limit must be 1 to 100 characters.": "El límite de texto libre debe ser de 1 a 100 caracteres.",
     "The standard font list must have 6 fonts.": "La lista de fuentes estándar debe tener 6 fuentes.",
     "The bag counter must be PMCNT, MSCNT or none.": "El contador de bolsas debe ser PMCNT, MSCNT o none.",
+    "Time server {host}: the port after the colon must be a number from 1 to 65535.":
+        "Servidor de hora {host}: el puerto después de los dos puntos debe ser un número de 1 a 65535.",
     "Print text {name} now contains words about origin: {words}.":
         "El texto de impresión {name} ahora contiene palabras de origen: {words}.",
     "The code of {name} now contains words about origin: {words}.":
@@ -855,6 +857,18 @@ def validate_company(company):
             or any(ink.cartridge not in CARTRIDGES or ink.colour not in INK_COLOURS for ink in company.inks)):
         problems.append(Msg(N_("Ink names must be unique, each with a cartridge type and a colour.")))
 
+    problems += _company_send_problems(company)
+    for host in (company.time_server, company.time_server_fallback):
+        if not _time_port_ok(host):
+            problems.append(Msg(N_("Time server {host}: the port after the colon must be a number from 1 to 65535."),
+                                {"host": host.strip()}))
+    return _unique(problems)
+
+
+def _company_send_problems(company):
+    """validate_company's rules 3 and 4, the ones a Send or a test relies on. merge_plan and
+    plan_test check them again: company.json may be edited by hand (§4.1)."""
+    problems = []
     lo, hi = company.lot_min_digits, company.lot_max_digits
     if not (_is_int(lo) and _is_int(hi) and 1 <= lo <= hi <= 20):
         problems.append(Msg(N_("The lot rules must allow 1 to 20 digits, the minimum no more than the maximum.")))
@@ -865,7 +879,16 @@ def validate_company(company):
         problems.append(Msg(N_("The standard font list must have 6 fonts.")))
     if company.bag_counter not in ("PMCNT", "MSCNT", "none"):
         problems.append(Msg(N_("The bag counter must be PMCNT, MSCNT or none.")))
-    return _unique(problems)
+    return problems
+
+
+def _time_port_ok(host):
+    """A time server given as "name:port" (exactly one ":", send.md §9.2 rule 1) needs ASCII digits
+    1 to 65535 after it. Anything else there is asked as part of the name, which then fails."""
+    if not isinstance(host, str) or host.strip().count(":") != 1:
+        return True
+    port = host.strip().split(":")[1]
+    return port.isascii() and port.isdigit() and 1 <= int(port) <= 65535
 
 
 def origin_conflicts(data, company):
@@ -1126,7 +1149,11 @@ def validate_choice(choice, data, identity):
         if any(it.kind == "lot" for it in pt.items):
             lot = choice.lot.strip()
             lo, hi = company.lot_min_digits, company.lot_max_digits
-            if not lot:
+            if not (_is_int(lo) and _is_int(hi) and 1 <= lo <= hi <= 20):
+                # A hand-edited company.json (the admin screen refuses it): a problem, not re.error
+                problems.append(Msg(N_("The lot rules must allow 1 to 20 digits, the minimum no more than the "
+                                       "maximum.")))
+            elif not lot:
                 problems.append(Msg(N_("Enter the lot for {line}."), on_line))
             elif not re.fullmatch(f"[0-9]{{{lo},{hi}}}", lot):
                 problems.append(Msg(N_("The lot for {line} must be {min} to {max} digits."),
@@ -1322,6 +1349,7 @@ def merge_plan(request, data, identity):
             if first is not machine:
                 problems.append(Msg(N_("{machine} and {other} use the same printer."),
                                     {"machine": first.name, "other": machine.name}))
+    problems += _company_send_problems(company)
     for choice in request.lines:
         problems += validate_choice(choice, data, identity)
     problems = _unique(problems)
@@ -1871,7 +1899,9 @@ def resume_refusal(expected, machine):
         return Msg(N_("The last Send to {machine} was rejected. Send again instead."), on_machine)
     if expected.mode == "test_finished" or expected.stop_reason == "test":
         return Msg(N_("{machine} needs a Send after the test print."), on_machine)
-    if expected.resume_blocked or expected.failure is not None:
+    if (expected.resume_blocked or expected.failure is not None
+            or expected.mode not in ("running", "stopped_by_user", "stop_requested_at_printer")):
+        # An unknown mode (a hand-edited or damaged expected.json) fails closed
         return Msg(N_("{machine} needs a new Send before it can print again."), on_machine)
     if not expected.confirmed:
         return Msg(N_("The last Send to {machine} wasn't confirmed. Send again instead."), on_machine)
@@ -1934,6 +1964,7 @@ def plan_test(machine_id, film_id, ranges, data, identity, *, kind="test"):
         problems.append(Msg(N_("Choose a film for {line}."), {"line": line_name}))
     else:
         problems += validate_film(film, data)
+    problems += _company_send_problems(company)
     if machine is None or film is None:
         _raise(_unique(problems))
 

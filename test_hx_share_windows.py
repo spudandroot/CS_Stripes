@@ -1,7 +1,10 @@
 """Windows-only tests of the file behaviour hx_share relies on (storage.md §17.2): a reader holding
 a file open during a swap, readers never breaking a writer, open_for_read sharing delete, the
-create_exclusive race and add-only folders. They skip elsewhere. Run on Windows: python -m unittest -v"""
+create_exclusive race and add-only folders. They skip elsewhere. CRuntimeErrorTests fakes Windows' errors,
+so it runs everywhere. Run on Windows: python -m unittest -v"""
 
+import contextlib
+import errno
 import json
 import os
 import shutil
@@ -11,10 +14,15 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 import hx_share
 import hx_win
+from hx_core import Msg
+from hx_model import TIMINGS, Identity, ShareError, ShareUnavailable
 from hx_share import FileOps
+
+PRINTER_ID = "pr_9c8b7a6d5e"
 
 WINDOWS_ONLY = "Windows share behaviour"
 
@@ -199,6 +207,110 @@ class AddOnlyFolderTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.fs.rename(path, os.path.join(self.folder, "renamed.json"))
         self.assertEqual(self.fs.read_bytes(path), raw)
+
+
+class CRuntimeErrorTests(unittest.TestCase):
+    """storage.md §9.2. On Windows, create_exclusive's os.open and the temp file's open(..., "xb") go through
+    the C runtime, whose OSError has an errno and no winerror: a lost server reads as EINVAL (64, 1231 ...)
+    or ENOENT (53, 67), a folder error, so the share wasn't marked down and a Send's lock step went red
+    instead of amber "no lock". Windows' errors are faked here, so this runs on every platform."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="hx-share-crt-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        for rel in ("",) + hx_share._SHARE_FOLDERS:
+            os.makedirs(os.path.join(self.root, *rel.split("/")) if rel else self.root, exist_ok=True)
+
+    def store(self):
+        identity = Identity(user="EXAMPLE\\jsmith", computer="FLOOR01", sids=frozenset(), pid=4242)
+        return hx_share.ShareStore(self.root, identity=identity, fs=file_ops(), timings=TIMINGS.scaled(0.1),
+                                   version="test")
+
+    def windows(self, winerror):
+        """Patches in Windows' behaviour: the C runtime's opens fail with only an errno (as _dosmaperr maps
+        winerror), CreateFileW (open_for_read) with the winerror itself."""
+        crt_errno = errno.ENOENT if winerror in (2, 3, 53, 67) else errno.EINVAL
+
+        def crt(*args, **kw):
+            raise OSError(crt_errno, os.strerror(crt_errno))
+
+        def create_file(path):
+            e = OSError(crt_errno, "Windows error", path)
+            e.winerror = winerror           # as CPython builds it on Windows
+            raise e
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(hx_share.hx_win, "is_windows", return_value=True))
+        stack.enter_context(mock.patch.object(hx_share.hx_win, "open_for_read", side_effect=create_file))
+        stack.enter_context(mock.patch.object(hx_share.os, "open", side_effect=crt))
+        stack.enter_context(mock.patch.object(hx_share, "open", side_effect=crt, create=True))
+        return stack
+
+    def test_a_lost_server_on_the_c_runtime_paths_is_share_unavailable(self):
+        writes = [("create_once", lambda st: st.create_once(f"status/locks/{PRINTER_ID}.lock", b"x")),
+                  ("write_bytes", lambda st: st.write_bytes("status/lines/ln_1a2b3c4d5e.json", b"x")),
+                  ("lock", lambda st: st.lock(PRINTER_ID, purpose="send", run_id="sd_8a7b6c5d4e").acquire())]
+        for winerror in (53, 64, 1231):
+            for name, write in writes:
+                with self.subTest(winerror=winerror, call=name):
+                    st = self.store()
+                    with self.windows(winerror):
+                        if name == "lock":
+                            self.assertEqual(write(st), "local_only")       # amber "no lock", not red
+                        else:
+                            with self.assertRaises(ShareUnavailable):
+                                write(st)
+                    self.assertFalse(st.available)
+                    self.assertEqual(st.down_reason, Msg("Stripes can't reach the server."))
+
+    def test_a_lost_server_during_a_read_is_share_unavailable(self):
+        # CreateFileW opened the file, then the server went away: the C runtime's read (or seek) says only
+        # EINVAL. Before, that was a folder error (red), and the share wasn't marked down
+        rel = "status/lines/ln_1a2b3c4d5e.json"
+
+        class Handle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, *args):
+                raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+            seek = tell = read
+
+        calls = [("read_bytes", lambda st: st.read_bytes(rel)), ("size", lambda st: st._size(rel))]
+        for winerror, down in ((64, True), (1231, True), (87, False)):
+            for name, call in calls:
+                with self.subTest(winerror=winerror, call=name):
+                    st = self.store()
+                    st.write_bytes(rel, b"{}")
+                    opens = []
+
+                    def open_for_read(path):
+                        opens.append(path)
+                        if len(opens) == 1:
+                            return Handle()
+                        e = OSError(errno.EINVAL, "Windows error", path)
+                        e.winerror = winerror       # CreateFileW, asked again, has the winerror
+                        raise e
+                    with mock.patch.object(hx_share.hx_win, "is_windows", return_value=True), \
+                            mock.patch.object(hx_share.hx_win, "open_for_read", side_effect=open_for_read):
+                        with self.assertRaises(ShareError) as cm:
+                            call(st)
+                    self.assertEqual(isinstance(cm.exception, ShareUnavailable), down)
+                    self.assertEqual(st.available, not down)
+
+    def test_a_folder_error_on_the_c_runtime_paths_stays_one(self):
+        # A missing folder (winerror 3) or a refused parameter (87) is no reason to call the share down
+        for winerror in (3, 87):
+            with self.subTest(winerror=winerror):
+                st = self.store()
+                with self.windows(winerror):
+                    with self.assertRaises(ShareError) as cm:
+                        st.create_once(f"status/locks/{PRINTER_ID}.lock", b"x")
+                self.assertNotIsInstance(cm.exception, ShareUnavailable)
+                self.assertTrue(st.available)
 
 
 if __name__ == "__main__":

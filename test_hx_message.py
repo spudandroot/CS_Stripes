@@ -949,6 +949,46 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(hm.validate_choice(choice(), data, SENDER), [])
         self.assertEqual(hm.validate_choice(choice(line_id=L2, machine_ids=[M3]), data, NOBODY), [])
 
+    def test_hand_edited_lot_rule(self):
+        # The admin screen refuses these, but company.json may be edited in Notepad (deploy.md). The
+        # lot regex was built from them: min 9 > max 8 raised re.error from the Send window and merge_plan.
+        rule = "The lot rules must allow 1 to 20 digits, the minimum no more than the maximum."
+        for lo, hi in ((9, 8), (4, 21), (0, 8)):
+            with self.subTest(lo=lo, hi=hi):
+                data = seed()
+                data.company.lot_min_digits, data.company.lot_max_digits = lo, hi
+                self.assertEqual(texts(hm.validate_choice(choice(), data, SENDER)), [rule])
+                with self.assertRaises(PlanError) as cm:
+                    hm.merge_plan(request(), data, SENDER)
+                self.assertEqual(texts(cm.exception.problems), [rule])
+
+    def test_hand_edited_company_blocks_send_and_test(self):
+        # §4.1: merge_plan and plan_test check validate_company's rules 3 and 4 again, as company.json
+        # may be edited by hand. They used to plan a Send with a bag counter the printer can't be
+        # asked for (hx_protocol refuses it mid-Send), no free-text limit or a short font list.
+        ok = TestRanges(vary="position", start=150, stop=150, step=1)
+        for kw, rule in (({"bag_counter": "bogus"}, "The bag counter must be PMCNT, MSCNT or none."),
+                         ({"free_text_max": 0}, "The free-text limit must be 1 to 100 characters."),
+                         ({"free_text_max": 101}, "The free-text limit must be 1 to 100 characters."),
+                         ({"standard_fonts": ["Arial"] * 5}, "The standard font list must have 6 fonts."),
+                         ({"lot_min_digits": 9}, "The lot rules must allow 1 to 20 digits, the minimum no more "
+                                                 "than the maximum.")):
+            with self.subTest(**kw):
+                data = seed()
+                data.company = dataclasses.replace(data.company, **kw)
+                self.assertEqual(texts(hm.validate_company(data.company)), [rule])
+                self.assertIn(rule, problems_of(lambda: hm.merge_plan(request(), data, SENDER)))
+                self.assertIn(rule, problems_of(lambda: hm.plan_test(M2, FILM, ok, data, ADMIN)))
+                self.assertIn(rule, problems_of(lambda: hm.plan_test("mc_missing", FILM, ok, data, ADMIN)))
+        # Rule 5 is for the Company page only: a time server that can't be asked falls back to the
+        # PC's clock, with amber (§9.2), so it doesn't stop a Send
+        data = seed()
+        data.company = dataclasses.replace(data.company, time_server="time.example.local:0",
+                                           time_server_fallback="192.0.2.123:99999")
+        self.assertEqual(len(hm.validate_company(data.company)), 2)
+        self.assertTrue(hm.merge_plan(request(), data, SENDER).machines)
+        self.assertTrue(hm.plan_test(M2, FILM, ok, data, ADMIN).steps)
+
     def test_offers(self):
         data = seed()
         base = data.films[FILM]
@@ -1043,6 +1083,18 @@ class ValidationTests(unittest.TestCase):
         ]
         for kw, text in cases:
             self.assertIn(text, texts(hm.validate_company(dataclasses.replace(company, **kw))), kw)
+        # A time server's port (send.md §9.2 rule 1): ASCII digits 1 to 65535 after exactly one ":"
+        port_text = "Time server {host}: the port after the colon must be a number from 1 to 65535."
+        for field in ("time_server", "time_server_fallback"):
+            for good in ("", "time.example.local", "192.0.2.123", "127.0.0.1:4123", " 192.0.2.123:123 ",
+                         "time.example.local:65535", "time.example.local:1", "2001:db8::123"):
+                self.assertEqual(hm.validate_company(dataclasses.replace(company, **{field: good})), [],
+                                 (field, good))
+            for bad in ("time.example.local:", "time.example.local:0", "time.example.local:65536",
+                        "time.example.local:²", "127.0.0.1:①", "127.0.0.1:12³", "127.0.0.1:１２３",
+                        "127.0.0.1:١٢٣", "127.0.0.1:12a", "127.0.0.1:-1", "127.0.0.1: 123"):
+                self.assertEqual(hm.validate_company(dataclasses.replace(company, **{field: bad})),
+                                 [Msg(port_text, {"host": bad.strip()})], (field, bad))
         problems = hm.validate_company(dataclasses.replace(company, countries=company.countries + [
             Country(name="Peru", aliases=["us"])]))
         # Both countries' aliases are taken
@@ -1632,6 +1684,10 @@ class ResumeTests(unittest.TestCase):
             (dict(live, resume_blocked=True), "{machine} needs a new Send before it can print again."),
             (dict(live, failure=failure), "{machine} needs a new Send before it can print again."),
             (dict(live, confirmed=False), "The last Send to {machine} wasn't confirmed. Send again instead."),
+            # An unknown mode (hand-edited or damaged) fails closed
+            (dict(live, mode=""), "{machine} needs a new Send before it can print again."),
+            (dict(live, mode="paused"), "{machine} needs a new Send before it can print again."),
+            (dict(live, mode="RUNNING"), "{machine} needs a new Send before it can print again."),
         ]
         for fields, text in cases:
             expected = ExpectedState(**fields) if fields is not None else None

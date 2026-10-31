@@ -93,6 +93,11 @@ from the plan's wording or accept a risk:
 4. Every published release contains the printer-password key, and releases on this public
    repository can be downloaded by anyone (deploy.md §3.7, OPEN 1).
 
+Waiting for the owner: the named residual risks of the printer lock (storage.md §11.8, architecture
+§7.3 rule 8 and §12.1 item 4). A PC that freezes in the instant before a request leaves can send that
+one request late, and the leases rely on PCs that never sleep, hibernate or run as VMs that can be
+paused (the root README's power settings).
+
 ## Owner decisions, 31 Oct 2026
 
 The owner's goal: the printer's own web portal and panel are used rarely, only for maintenance and

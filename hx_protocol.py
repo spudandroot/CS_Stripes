@@ -87,6 +87,7 @@ EDITOR_PATH = "/simple_msg.html"                  # the 2.3 MB editor page: neve
 MAX_HEADER_BYTES = 16_384
 MAX_AUTOPILOT_REPLY = 4_096
 MAX_SME_REPLY = 262_144          # a Load reply is about 29.5 KB
+MAX_SME_DEPTH = 16               # elements open at once, SM included; a real Load reply goes 4 deep (§11.1)
 MAX_FILE_REPLY = 65_536
 MAX_LOGIN_REPLY = 1_048_576      # read and discarded; may be cut short
 
@@ -907,6 +908,8 @@ def _parse_tree(body):
             root = el
         if not empty:
             stack.append(el)
+            if len(stack) > MAX_SME_DEPTH:
+                raise _unrecognised()      # nesting no real reply has (and _leaves recurses per level)
     if stack or root is None or root.name != b"SM":
         raise _unrecognised()
     return root
@@ -1148,9 +1151,11 @@ class PrinterClient:
             raise _bad(self.label, tag, "")
         return text
 
-    def _read_locked(self, tag, check=True):
+    def _read_locked(self, tag, check=True, deadline=None):
         """At most two requests in all; a no-reply, a busy code or a failed check is asked once more
-        after read_retry_s, the gate still held. Then the last error is raised."""
+        after read_retry_s, the gate still held. Then the last error is raised. With a deadline the
+        second request is sent only if it can still end by it (checked before and after the gap); if
+        not, the first error is raised (§9 item 2)."""
         last = None
         for attempt in (1, 2):
             no_reply = False
@@ -1170,8 +1175,14 @@ class PrinterClient:
                 last, no_reply = e, True
             except (PrinterBusy, BadReply) as e:
                 last = e
-            if no_reply or attempt == 1:
-                self.clock.sleep(self.timings.read_retry_s)
+            if attempt == 1:
+                try:
+                    self._pause(deadline, no_reply=no_reply)
+                    self._check(deadline)
+                except _Late:
+                    raise last from None
+            elif no_reply:
+                self._hold_after_no_reply(deadline)
         raise last
 
     # ---- Autopilot
@@ -1182,7 +1193,7 @@ class PrinterClient:
         check_query(tag)
         self._take("query", deadline)
         try:
-            return self._read_locked(tag, check=False)
+            return self._read_locked(tag, check=False, deadline=deadline)
         finally:
             self._gate.release()
 
@@ -1191,15 +1202,16 @@ class PrinterClient:
         check_query(tag)
         self._take("read", deadline)
         try:
-            return self._read_locked(tag)
+            return self._read_locked(tag, deadline=deadline)
         finally:
             self._gate.release()
 
-    def read_twice(self, tag):
-        """Two reads second_reading_s apart that must agree (BadReply otherwise)."""
-        a = self.read(tag)
+    def read_twice(self, tag, *, deadline=None):
+        """Two reads second_reading_s apart that must agree (BadReply otherwise). The deadline applies to
+        each read (§9 item 2)."""
+        a = self.read(tag, deadline=deadline)
         self.clock.sleep(self.timings.second_reading_s)
-        b = self.read(tag)
+        b = self.read(tag, deadline=deadline)
         if a != b:
             self._add_nonsense()
             raise _two_answers(self.label, tag, a, b)
@@ -1210,13 +1222,13 @@ class PrinterClient:
                                 {"printer": self.label, "got": str(got), "expected": self.uid}),
                             expected=self.uid, got=str(got))
 
-    def check_uid(self):
-        """WrongPrinter when the printer twice answers another UID."""
-        a = self.read("HXUI")
+    def check_uid(self, *, deadline=None):
+        """WrongPrinter when the printer twice answers another UID. The deadline applies to each read."""
+        a = self.read("HXUI", deadline=deadline)
         if a == self.uid:
             return
         self.clock.sleep(self.timings.second_reading_s)
-        b = self.read("HXUI")
+        b = self.read("HXUI", deadline=deadline)
         if a == b:
             raise self._wrong_printer(a)
         self._add_nonsense()
@@ -1224,16 +1236,22 @@ class PrinterClient:
 
     def command(self, cmd, *, deadline=None):
         """One write, never repeated. After idle_warmup_s of quiet a checked HXUI read goes first.
-        "0" returns; another code is CommandRefused; no reply is NoReply (it may have been done)."""
+        "0" returns; another code is CommandRefused; no reply is NoReply (it may have been done). With a
+        deadline, the write is sent only if it can still end by it, also after the warm-up read: PrinterBusy
+        otherwise, nothing written (§9 item 2)."""
         check_write(cmd)
         self._take("command", deadline)
         try:
             quiet = self.last_request_at is None or \
                 self.clock.monotonic() - self.last_request_at >= self.timings.idle_warmup_s
             if quiet:
-                uid = self._read_locked("HXUI")
+                uid = self._read_locked("HXUI", deadline=deadline)
                 if uid != self.uid:
                     raise self._wrong_printer(uid)
+            try:
+                self._check(deadline)
+            except _Late:
+                raise _gate_busy(self.label) from None
             try:
                 text = self._ask(cmd.xml, cmd.tag)
             except NoReply:
@@ -1306,11 +1324,15 @@ class PrinterClient:
             self.relogins += 1
         self._logged_in = True
 
-    def login(self):
-        """The web login (it changes nothing on the printer). Raises AuthFailed."""
-        self._take("login", None)
+    def login(self, *, deadline=None):
+        """The web login (it changes nothing on the printer). Raises AuthFailed. With a deadline it never
+        waits for this PC's gate past the latest start that lets both attempts end by it, and sends nothing
+        that couldn't end by it: PrinterBusy instead (§9 item 2)."""
+        self._take("login", deadline)
         try:
-            self._login_locked()
+            self._login_locked(deadline)
+        except _Late:
+            raise _gate_busy(self.label) from None
         finally:
             self._gate.release()
 

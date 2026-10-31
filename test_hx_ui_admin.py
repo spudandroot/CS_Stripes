@@ -32,9 +32,9 @@ import hx_ui_common
 import i18n
 from hx_core import EventBus, Msg
 from hx_fake import FakeWorld
-from hx_model import (TIMINGS, Calibration, Company, Country, Film, HxData, Line, Machine, MachineFilmAdjustment,
-                      NotAllowed, PollStatus, Printer, PrintText, PrintTextItem, Product, TestFinished, TestResult,
-                      from_json)
+from hx_model import (TIMINGS, Calibration, Company, Country, DataUpdate, Film, HxData, Line, Machine,
+                      MachineFilmAdjustment, NotAllowed, PollStatus, Printer, PrintText, PrintTextItem, Product,
+                      ShareHealth, TestFinished, TestResult, from_json)
 from hx_protocol import ClientPool, GateRegistry, make_token, release_key, unscramble
 from hx_ui_admin import (AdjustmentDialog, AdminWindow, CalibrationWindow, FilmEditor, PrintTextEditor,
                          TestPrintWindow)
@@ -356,6 +356,18 @@ class PureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse("2.5", whole=True)
 
+    def test_num_reads_back_exactly(self):
+        # Forms are filled with _num and read back with parse_number on every Save, so a value
+        # nobody edited must come back the same (it used :g, 6 digits: 1480.125 came back 1480.12)
+        num = hx_ui_admin._num
+        self.assertEqual((num(None), num(150.0), num(152.5), num(2400), num(-0.0), num(0.0)),
+                         ("", "150", "152.5", "2400", "0", "0"))
+        for x in (1480.125, 12345.25, 100000.5, 150.4996, 99999.9, 0.1, -3.75, 1e-7, 1e20, 119999.999):
+            back = hx_ui_admin.parse_number(num(x))
+            self.assertEqual(back, x, (x, num(x)))
+            self.assertIsInstance(back, float)
+            self.assertNotIn("e", num(x), x)                # parse_number refuses an exponent
+
     def test_printer_problems(self):
         p1 = Printer(id="pr_0000000001", name="Printer 1", host="192.0.2.10", port=80, uid=1109)
         data = HxData(company=Company(id="company"), printers={p1.id: p1})
@@ -641,6 +653,100 @@ class AdminTests(UiCase):
         self.assertTrue(shown(w.role_label))
         self.assertEqual(w.role_label.cget("text"), "Only Stripes Administrators can change this.")
         self.assertFalse(enabled(page.save_button))
+
+    def test_adjustment_dialog_follows_the_save_rule(self):
+        # The dialog is the adjustments page's only editor, so its Save follows §11.1 items 9 and 10
+        # like every page's Save. It had none of it: Save stayed on with the share down or the role lost.
+        services, mid, film_id = self.services, self.mid(), self.world.ids["film"]
+        store = self.admin_store()
+        w = AdminWindow(self.root, services, page="adjustments")
+        dialog = AdjustmentDialog(w, services, machine_id=mid, film_id=film_id)
+        self.assertTrue(enabled(dialog.save_button))
+        data = services.data.current
+        # The data is this PC's copy: Save off, and the dialog says why
+        services.data.current = dataclasses.replace(data, source="local")
+        services.bus.post(DataUpdate(data=services.data.current))
+        self.settle()
+        self.assertFalse(enabled(dialog.save_button))
+        self.assertTrue(shown(dialog.state_label))
+        self.assertEqual(dialog.state_label.cget("text"), "The server can't be reached. Changes can't be saved now.")
+        dialog.value_var.set("20")
+        dialog._save()                                  # a call that gets past the button does nothing
+        self.assertIsNone(services.data.current.adjustment(mid, film_id))
+        # The share itself is down
+        services.data.current = data
+        with mock.patch.object(services.store, "available", False):
+            services.bus.post(ShareHealth(ok=False, last_reached=None))
+            self.settle()
+            self.assertFalse(enabled(dialog.save_button))
+            # A dialog opened now starts with Save off
+            other = AdjustmentDialog(w, services, machine_id=self.mid(), film_id="")
+            self.assertFalse(enabled(other.save_button))
+            other.destroy()
+        services.bus.post(ShareHealth(ok=True, last_reached=time.time()))
+        self.settle()
+        self.assertTrue(enabled(dialog.save_button))
+        self.assertFalse(shown(dialog.state_label))
+        # The role is lost while it is open (a real DataUpdate): Save off, with the admin window's text
+        company = from_json(Company, store.read_json(hx_share.record_rel_for(Company, "company")))
+        hx_share.write_record(store, dataclasses.replace(company, admin_group_sid="S-1-0"))
+        self.bump_changes(store)
+        self.reload()
+        self.assertFalse(hx_ui_common.roles(services).admin)
+        self.assertFalse(enabled(dialog.save_button))
+        self.assertEqual(dialog.state_label.cget("text"), "Only Stripes Administrators can change this.")
+        dialog.save_button.invoke()
+        self.reload()
+        self.assertIsNone(services.data.current.adjustment(mid, film_id))
+        self.assertTrue(alive(dialog))
+
+    def test_adjustment_dialog_save_off_while_saving(self):
+        services, mid, film_id = self.services, self.mid(), self.world.ids["film"]
+        later = services.bg = LaterBackground()
+        w = AdminWindow(self.root, services, page="adjustments")
+        dialog = AdjustmentDialog(w, services, machine_id=mid, film_id=film_id)
+        dialog.value_var.set("20")
+        dialog.save_button.invoke()
+        self.assertFalse(enabled(dialog.save_button))
+        services.bus.post(DataUpdate(data=services.data.current))      # doesn't turn it back on
+        self.settle()
+        self.assertFalse(enabled(dialog.save_button))
+        later.flush()
+        self.assertFalse(alive(dialog))
+        self.reload()
+        self.assertEqual(services.data.current.adjustment(mid, film_id).delay_ms, 20.0)
+
+    def test_unedited_numbers_survive_an_unrelated_save(self):
+        # _num showed 6 digits (:g), and Save reads every number field back: changing only the
+        # artwork revision moved a 1480.125 ms delay to 1480.12 ms (and 150.4996 mm to 150.5 mm)
+        services, film_id = self.services, self.world.ids["film"]
+        store = self.admin_store()
+        for field, value in (("delay_ms", 1480.125), ("delay_ms", 100000.5), ("position_mm", 150.4996)):
+            with self.subTest(field=field, value=value):
+                current = from_json(Film, store.read_json(hx_share.record_rel_for(Film, film_id)))
+                hx_share.write_record(store, dataclasses.replace(current, revision=current.revision + 1,
+                                                                 **{field: value}))
+                self.bump_changes(store)
+                self.reload()
+                w = AdminWindow(self.root, services, page="products", record_id=film_id)
+                page = w.pages["products"]
+                self.assertEqual(hx_ui_admin.parse_number(page.fields[field].get()), value)
+                page.fields["artwork_revision"].set(f"Rev C{value}")
+                page.save_button.invoke()
+                self.settle()
+                saved = from_json(Film, store.read_json(hx_share.record_rel_for(Film, film_id)))
+                self.assertEqual((saved.artwork_revision, getattr(saved, field)), (f"Rev C{value}", value))
+                w.destroy()
+        # The adjustment dialog's value too
+        mid = self.mid()
+        hx_share.write_record(store, MachineFilmAdjustment(id=hx_ui_admin.adjustment_id(mid, film_id), machine_id=mid,
+                                                           film_id=film_id, delay_ms=12.0625, position_mm=0.0))
+        self.bump_changes(store)
+        self.reload()
+        dialog = AdjustmentDialog(self.root, services, machine_id=mid, film_id=film_id)
+        self.assertEqual(dialog.value_var.get(), "12.0625")
+        self.assertEqual(dialog.adjustment().delay_ms, 12.0625)
+        dialog.destroy()
 
     def test_printer_password_once(self):
         services = self.services

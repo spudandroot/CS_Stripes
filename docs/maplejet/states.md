@@ -84,8 +84,8 @@ alerts (§4.5), never on the code.
 | `switch_pending` | BLUE | Switching to the new message: {user} on {computer} | a fresh `send` lock and E.mode `switch_pending` | as above | none |
 | `test_running` | BLUE | TEST by {user}, step {step} of {of} (or TEST by {user} before the first step) | a fresh lock with purpose `test` or `calibration` | released (normally then `test_finished`), or stale (§3.6) | none |
 | `action_in_progress` | BLUE | Stopping printing: {user} · Resuming printing: {user} · Setting the clock: {user} (by purpose `stop`, `resume`, `clock`) · Printer in use: {user} on {computer} (any other purpose, such as a damaged lock's `unknown` or a newer version's purpose) | a fresh lock with one of those purposes, or any purpose not listed in this table | released or stale | none |
-| `checking` | GREY | Checking... | no P has been read yet, and it hasn't been missing for `not_monitored_s`; or P's age isn't known (§7, a P first seen long after it was written); or P holds it (also a poller code: a worker starting after a long gap writes it until its first judgement, §6.3 step 1). The origin shows as unknown and `printing` is None | P is read, or 30 s pass (then `not_monitored`); the worker's first judgement | none |
-| `not_monitored` | GREY, or the last known RED or AMBER (§5.2) | NOT MONITORED | P's counter unchanged, or P missing, for `not_monitored_s` (30 s) on this PC's clock. Standalone: §6.12 | P's counter moves | Confirm |
+| `checking` | GREY | Checking... | no P has been read yet, and it hasn't been missing for `not_monitored_s`; or P's age isn't known (§7, a P first seen long after it was judged); or P holds it (also a poller code: a worker starting after a long gap writes it until its first judgement, §6.3 step 1; its age is P's counter's, §7 item 2). The origin shows as unknown and `printing` is None | P is read, or 30 s pass (then `not_monitored`); the worker's first judgement | none |
+| `not_monitored` | GREY, or the last known RED or AMBER (§5.2) | NOT MONITORED | P's judged counter (§6.14) unchanged, or P missing, for `not_monitored_s` (30 s) on this PC's clock; a P from an older Stripes, without the field, uses its counter. Standalone: §6.12 | P's judged counter moves | Confirm |
 | `update_stripes` | GREY | Update Stripes to see this machine | P or E is from a newer format | this PC runs the newer Stripes | none |
 | `not_set_up` | GREY | No printer set up | (board_view) the machine's printer record is missing, inactive, or has no password (`token == ""`) | an administrator fixes it | none |
 
@@ -118,6 +118,7 @@ alerts (§4.5), never on the code.
 | `test_finished` | RED | Stopped, needs a Send | E.mode `test_finished`, printing not on; or E.stop_reason `test` (a test whose end procedure couldn't confirm printing off, then stopped later) with E.mode `stopped_by_user`, or `stop_requested_at_printer` and printing read off | a Send | Send |
 | `off` | GREY | Printer off | the printer isn't answering and the machine isn't `unreachable_printing` | it answers | none |
 | `not_printing` | AMBER | Printing is off | E.mode `running`, printing read off, but printing wasn't read on since the printer last came back (it was off or restarted) | printing read on, a Stop or a Send | Resume |
+| `printing_unchecked` | AMBER | Can't read the printer's state | trusted, PRIN gave no good value for `PRIN_UNREAD_LIMIT` cycles in a row (§6.6), and the machine would otherwise be green `running_confirmed`, grey `stopped` or grey `idle`: printing is unknown, so it is never green or grey | a good PRIN, confirmed by a second reading | Stop, Send |
 | `message_unchecked` | AMBER | Can't read the message on this printer | E.mode `running` (or `switch_pending`), trusted, and R isn't known: no successful Load since the last lock or E change, or the poller's message check has failed for long (C11b) | a Load succeeds | Stop, Send (Confirm while unconfirmed) |
 | `unconfirmed` | AMBER | Send not confirmed | E.mode `running`, not confirmed, printing on or not yet read, R known | the sender confirms, or says something's wrong (`rejected`) | Stop, Confirm |
 | `confirmed_with_notes` | AMBER | Printing, not fully checked | E.mode `running`, confirmed, E.notes not empty (`pc_time`, `no_lock`, `local_copy`), R known | a Send without notes | Stop |
@@ -208,39 +209,42 @@ def matches_expected(running: RunningMessage | None, *, name: str, slot: int | N
 evaluates every condition below independently. Each true condition may give a **code** and an **alert
 need** (kind, ref, colour, message, recipients). The outcome's code is the highest-precedence code
 (§3.5). Its alerts are all the needs. Notation: F = facts, E = expected (a missing E is treated as mode
-`none` with every flag false), L = the stale lock, `on` = trusted and `F.printing is True`, `off_read` =
-trusted and `F.printing is False`, "carried" = §3.7.
+`none` with every flag false), L = the stale lock, `on` = trusted, not `F.printing_unchecked` and
+`F.printing is True`, `off_read` = trusted, not `F.printing_unchecked` and `F.printing is False`,
+"carried" = §3.7. "Printing unknown" = trusted and `F.printing_unchecked` (§6.6): `F.printing` is then
+only the last known value, so nothing that needs printing read starts or ends. Such an alert is "held":
+prev's stays, with its id and acks (also when acknowledged), and so does its code.
 
 | # | Condition | Code | Alert |
 |---|---|---|---|
 | C1 | `F.reachable` and `F.problem == "wrong_printer"` | `wrong_printer` | `setup_problem` |
 | C2 | `F.reachable` and `F.problem == "login_failed"` | `login_failed` | `setup_problem` |
-| C3 | not standalone, and (L.purpose in (`test`, `calibration`), or E.mode `test_running`): if `on`, or (not trusted and `prev.printing is True` and the `test_still_printing` alert isn't acknowledged) | `test_orphaned` | `test_still_printing`, ref = L.run_id, else `E.test["run_id"]` |
+| C3 | not standalone, and (L.purpose in (`test`, `calibration`), or E.mode `test_running`): if `on`, or (not trusted and `maybe_printing(prev)` and the `test_still_printing` alert isn't acknowledged), or (printing unknown and (that alert is active, or `maybe_printing(prev)`)). `maybe_printing(prev)`: `prev.printing is True`, or `prev.printing` is None with `prev.printing_unchecked` | `test_orphaned` | `test_still_printing`, ref = L.run_id, else `E.test["run_id"]` |
 | C3b | the same, otherwise | `test_interrupted` | none |
 | C4 | not standalone, and a Send was interrupted (§3.6) | `interrupted_*` | `send_interrupted`, ref = the interrupted send_id |
-| C5 | E.mode `stop_requested_at_printer`: `on` gives `stop_failed`; not trusted, or `F.printing is None`, gives `stop_requested`; `off_read` gives nothing here | `stop_failed` / `stop_requested` | `stop_failed` |
+| C5 | E.mode `stop_requested_at_printer`: `on` gives `stop_failed`; not trusted, printing unknown, or `F.printing is None`, gives `stop_requested`; `off_read` gives nothing here | `stop_failed` / `stop_requested` | `stop_failed` |
 | C6 | `E.failure` is set | `left_red` if `E.left_by`, else `failed_after_switch` or `failed_before_switch` by `E.failure.after_switch` | `send_failed`, ref = E.send_id |
 | C7 | E.rejected and E.mode `running` and no E.failure | `rejected` | `send_rejected`, ref = E.send_id |
 | C7b | E.rejected and no E.failure (any mode) | none | `send_rejected`, ref = E.send_id (the same need as C7; one alert) |
-| C8 | `on` and E.mode in (`stopped_by_user`, `test_finished`). Carried while not trusted | `printing_on_unexpected` | `printing_on` |
-| C9 | not `F.reachable`, and (prev's `went_silent` alert is active, or (`prev.reachable` and `was_printing(prev, data.company)`)), and that alert isn't acknowledged | `unreachable_printing` | `went_silent` |
-| C10 | `off_read` and E.mode `running` and not E.rejected and not (`E.failure` and `E.failure.after_switch`), and (prev's `printing_off` alert is active, or (`prev.reachable` and `prev.printing is True` and `prev.problem == ""`)). Carried while not trusted | `printing_off` | `printing_off` |
+| C8 | `on` and E.mode in (`stopped_by_user`, `test_finished`). Carried while not trusted, but only while E.mode is still one of those and E hasn't changed (`E.counter == prev.expected_counter`). Held, code too, while printing unknown, on the same E condition | `printing_on_unexpected` | `printing_on` |
+| C9 | not `F.reachable`, and (prev's `went_silent` alert is active, or (`prev.reachable` and `was_printing(prev, data.company)`: `maybe_printing(prev)` (C3) and bags in the window, §3.7)), and that alert isn't acknowledged | `unreachable_printing` | `went_silent` |
+| C10 | `off_read` and E.mode `running` and not E.rejected and not (`E.failure` and `E.failure.after_switch`), and (prev's `printing_off` alert is active, or (`prev.reachable` and `maybe_printing(prev)` (C3) and `prev.problem == ""`)). Carried while not trusted, but only while E.mode is `running`, not E.rejected and not after a switch failure. Held, code too, while printing unknown, on the same E condition | `printing_off` | `printing_off` |
 | C10b | `off_read` and E.mode `running` and not E.rejected and no E.failure, and not C10 | `not_printing` | none |
 | C11 | not standalone, trusted, R is not None, E.mode `running`, not E.rejected, not (`E.failure` and `after_switch`), E names a message (`E.message_name` or `E.fingerprint` not empty), and R doesn't match E. Carried while not trusted | `drift` | `drift` |
 | C11e | not standalone, trusted, R is None (a required Load failed, §6.4), prev knows a drift (as C11c), `E.counter == prev.expected_counter`, and E as in C11 (owner decision, 31 Oct, second review). R unknown reads nothing about the message, so only a Load and its second reading end a known drift | none (C11b gives `message_unchecked`; the red alert keeps the view red, §5.2 item 2) | `drift` (prev's, the same id and acks) |
 | C11c | standalone, prev knows a drift (`prev.state.code == "drift"` or an active `drift` alert in prev), `E.counter == prev.expected_counter`, E.mode `running`, not E.rejected, not (`E.failure` and `after_switch`), and E names a message (owner decision, 31 Oct). Not cleared in standalone, also while not trusted or acknowledged | when trusted: `drift`, or `unknown_while_down` when MSGNAM was read and names another message than R, or R is None | `drift` (prev's, the same id and acks) |
 | C11d | standalone and `F.running_unchecked` (share mode's message check had failed: carried from the seed, §6.12 item 3; standalone never computes it), owner decision, 31 Oct, second review | when trusted, E.mode `running` and not E.rejected: `unknown_while_down` | `message_unreadable` (prev's, while it is active) |
-| C11b | not standalone, trusted, E.mode `running` or `switch_pending`, not E.rejected, and (R is None, or `F.running_unchecked`). Carried while not trusted | `message_unchecked` | `message_unreadable` only while `F.running_unchecked` |
+| C11b | not standalone, trusted, E.mode `running` or `switch_pending`, not E.rejected, and (R is None, or `F.running_unchecked`). Carried while not trusted, but only while E.mode is `running` or `switch_pending` and not E.rejected | `message_unchecked` | `message_unreadable` only while `F.running_unchecked` |
 | C12 | standalone, E names a message, `reading.message_name` was read this cycle and `norm_name` differs from `E.message_name`; or standalone, trusted, E names a message and MSGNAM gave no name this check (`F.message_name` is None, §3.2); or standalone, trusted, E.mode `running`, no E.failure, not E.rejected and `F.printing` is None (PRIN not read since the outage began); or standalone and E.mode in (`switch_pending`, `test_running`) | `unknown_while_down` | none |
-| C13 | `on` and `F.ink_level == 4`. Carried while not trusted | `ink_out` | `ink_out` |
-| C14 | `on` and `F.ink_level == 0`. Carried while not trusted | `cartridge_error` | `cartridge_error` |
-| C15 | trusted and (`F.ink_level` in (2, 3), or (`F.ink_level` in (0, 4) and not `on`)). Carried while not trusted | none | `low_ink` (text by level, §10) |
+| C13 | `on` and `F.ink_level == 4`. Carried while not trusted. Held, code too, while printing unknown and `F.ink_level` is still 4 | `ink_out` | `ink_out` |
+| C14 | `on` and `F.ink_level == 0`. Carried while not trusted. Held, code too, while printing unknown and `F.ink_level` is still 0 | `cartridge_error` | `cartridge_error` |
+| C15 | trusted and (`F.ink_level` in (2, 3), or (`F.ink_level` in (0, 4) and neither C13 nor C14 holds)). Carried while not trusted | none | `low_ink` (text by level, §10) |
 | C16 | E.rejected and not `on` and (E.mode `stopped_by_user`, or (E.mode `stop_requested_at_printer` and `off_read`)) | `stopped_needs_send` | none (C7b's alert continues) |
 | C17 | not `on`, and (E.mode `test_finished`, or (E.stop_reason `test` and (E.mode `stopped_by_user`, or (E.mode `stop_requested_at_printer` and `off_read`)))) | `test_finished` | none |
 | C18 | not `F.reachable` and not C9 | `off` | none |
-| C19 | E.mode `running`, no E.failure, not E.rejected, not (`off_read`), and (R is not None or standalone) | `unconfirmed` if not E.confirmed; `confirmed_with_notes` if confirmed and E.notes; else `running_confirmed` | none |
-| C20 | not E.rejected and E.stop_reason isn't `test` and not `on` and (E.mode `stopped_by_user`, or (E.mode `stop_requested_at_printer` and `off_read`)) | `stopped` | none |
-| C21 | E.mode `none` (or no E): `on` gives `not_from_stripes`; otherwise `idle` | `not_from_stripes` / `idle` | `not_from_stripes` (no sound) when `on` and trusted. Carried while not trusted |
+| C19 | E.mode `running`, no E.failure, not E.rejected, not (`off_read`), and (R is not None or standalone) | `unconfirmed` if not E.confirmed; `confirmed_with_notes` if confirmed and E.notes; else `printing_unchecked` when trusted and `F.printing_unchecked`; else `running_confirmed` | none |
+| C20 | not E.rejected and E.stop_reason isn't `test` and not `on` and (E.mode `stopped_by_user`, or (E.mode `stop_requested_at_printer` and `off_read`)) | `stopped`; `printing_unchecked` while printing unknown (never grey) | none |
+| C21 | E.mode `none` (or no E): `on` gives `not_from_stripes`; printing unknown holds prev's `not_from_stripes` (code and alert), else gives `printing_unchecked` (never grey); otherwise `idle` | `not_from_stripes` / `printing_unchecked` / `idle` | `not_from_stripes` (no sound) when `on` and trusted. Carried while not trusted and E.mode is still `none` (the first Send ends it) |
 | C22 | trusted and `F.clock_offset_s` is not None and `abs(F.clock_offset_s) > timings.clock_warn_s`. Carried while not trusted | none | `clock_off` |
 | C23 | `F.foreign_client` | none | `foreign_client` |
 | C24 | `machine.placement == "encoder"` and the daily encoder values differ from the reference (§6.10) | none | `encoder_changed` |
@@ -296,7 +300,7 @@ PRECEDENCE = ("wrong_printer", "login_failed",
               "unreachable_printing", "printing_off", "drift", "unknown_while_down",
               "ink_out", "cartridge_error",
               "stopped_needs_send", "test_finished",
-              "off", "not_printing", "message_unchecked",
+              "off", "not_printing", "message_unchecked", "printing_unchecked",
               "unconfirmed", "confirmed_with_notes", "not_from_stripes",
               "stopped", "idle", "running_confirmed")
 ```
@@ -359,11 +363,15 @@ The facts aren't trusted when the printer isn't answering (`not F.reachable`), a
 1. Conditions that need a fresh printer reading (C8, C10, C11, C11b, C13, C14, C15, C21's alert, C22)
    aren't evaluated.
    Each alert they had raised stays active with the same id ("carried"), unless it has been
-   acknowledged, in which case it ends. When the printer is trusted again, the conditions are evaluated
-   afresh from new readings and raise new alerts if the problem is still there.
+   acknowledged, in which case it ends. It also ends when the part of its condition that needs no
+   reading no longer holds (§4.1 "Ends when"): `printing_on` once E changes, `printing_off` once E.mode
+   isn't `running`, `message_unreadable` once it isn't `running` or `switch_pending`, `not_from_stripes`
+   at the first Send. When the printer is trusted again, the conditions are evaluated afresh from new
+   readings and raise new alerts if the problem is still there.
 2. Conditions on E alone (C5 to C7, C16, C17, C19, C20) still apply with `F.printing` treated as
    unknown.
-3. `was_printing(prev, company)` is true when `prev.printing is True` and either
+3. `was_printing(prev, company)` is true when `maybe_printing(prev)` (`prev.printing is True`, or
+   `prev.printing` is None with `prev.printing_unchecked`, §6.6) and either
    `company.bag_counter == "none"` or `(prev.bags_recent or 0) > 0`. It decides between
    `unreachable_printing` (C9) and `off` (C18) at the moment the printer stops answering. Once raised,
    `went_silent` stays until the printer answers or the alert is acknowledged; then the machine shows
@@ -384,7 +392,8 @@ prev_key = (prev.state.code, frozenset(active alert keys in prev))      # ("", {
 1. key(out_new) == prev_key                      -> commit out_new
 2. out_old = classify(prev_facts(prev), ...same E, L, acks...)
    key(out_old) == key(out_new)                   -> commit out_new   (E, L or an ack caused it)
-3. only F.foreign_client or F.running_unchecked differ
+3. only F.foreign_client or F.running_unchecked differ, or F.printing_unchecked turned True
+   (F.printing keeps its last known value)
                                                   -> commit out_new   (each already sums many requests)
 4. not reading.second                             -> keep prev's state, alerts and judged facts;
                                                      recheck = evidence(prev_facts(prev), F_new);
@@ -413,7 +422,7 @@ from F_new.
 | `reachable` | `"reach"` | `read("PRIN")` |
 | `problem` `wrong_printer` | `"uid"` | `read("HXUI")`, compared with `printer.uid` |
 | `problem` `login_failed` | `"login"` | `login()` (a token that can't be unscrambled can't change; it commits at once) |
-| `printing` | `"PRIN"` | `read("PRIN")` |
+| `printing`, or `printing_unchecked` turning False | `"PRIN"` | `read("PRIN")` |
 | `running` | `"load"` | `load_slot(0)` |
 | `ink_level` | `"INKL"` | `read("INKL")` |
 | `clock_offset_s`, only when it crosses `clock_warn_s` | `"clock"` | `read("DATE")`, `read("TIME")` |
@@ -423,7 +432,10 @@ from F_new.
 The second reading is taken `second_reading_s` (1 s) after the first ends, with the lock checked again
 first. It is built from the first reading with only the rechecked items replaced, `second=True`,
 `at` = now, and `pending_code`/`pending_alerts` copied from the first judgement's candidate. If the
-list is empty (shouldn't happen), the change commits at once.
+list is empty (shouldn't happen), the change commits at once. A rechecked item that can't be read again
+(no reply, busy, nonsense, or this PC's gate busy until too late) takes prev's value, never the first
+reading's: it confirms nothing, so one stray value never commits on its own. For `uid` and `login`
+the problem is then prev's.
 
 Examples: a single stray PRIN `0` from a mixed-up reply makes a candidate `printing_off`; the second
 read gives `1`, so nothing changes. A confirm (E.confirmed becomes True) changes `unconfirmed` to
@@ -608,7 +620,11 @@ clock (`ShareStore.poll_age`, `lock_age`, or the watcher's own `CounterWatch` in
 
 ### 5.1 machine_view
 
-`machine_view(machine, poll, poll_age_s, expected, lock, lock_age_s, acks, timings) -> MachineView`:
+`machine_view(machine, poll, poll_age_s, expected, lock, lock_age_s, acks, timings) -> MachineView`.
+`poll_age_s` is P's judged age (§6.14): how long P's `judged` counter has stood still on this PC's
+clock, never less than its counter's age. Bookkeeping writes (a takeover's start, settle and yield)
+move the counter without reading the printer, so they never make an old judgement look fresh. A P
+without the field (an older Stripes) has its counter's age, and so does P's own `checking` (§7 item 2).
 
 1. `monitored = poll is not None and poll_age_s is not None and poll_age_s < timings.not_monitored_s`.
 2. The code is the first that applies:
@@ -681,12 +697,12 @@ def expected_code(e: ExpectedState) -> str | None:
 | `message_name` | R's name, else `poll.message_name`, else `""` |
 | `checked_age_s` | `poll_age_s` (None when never seen) |
 | `monitored` | §5.1 step 1 |
-| `printing` | `poll.printing` when monitored, else None |
+| `printing` | `poll.printing` when monitored, else None; None while `poll.printing_unchecked` (unknown, §6.6) |
 | `alerts` | P's active alerts, each with `acked_by`/`acked_at` filled from `acks` when P doesn't have them yet |
 | `unacked_sound` | any alert with sound and no `acked_by` |
-| `can_stop` | not BLUE, monitored, `poll.reachable`, `poll.printing is True` |
-| `can_resume` | not BLUE, monitored, `poll.reachable`, `poll.printing is False`, code in (`stopped`, `not_printing`, `printing_off`), and E has a `send_id`, is `confirmed`, isn't `rejected` or `resume_blocked`, and has no `failure`. send.md's `check_resume` then makes the real check against the printer |
-| `needs_send` | code in `NEEDS_SEND_CODES` = (`failed_before_switch`, `failed_after_switch`, `left_red`, `rejected`, `stopped_needs_send`, `test_finished`, `test_interrupted`, `test_orphaned`, `interrupted_old`, `interrupted_unknown`, `drift`, `printing_on_unexpected`, `not_from_stripes`, `idle`), or `interrupted_new` while E.mode is `switch_pending` |
+| `can_stop` | not BLUE, monitored, `poll.reachable`, and `poll.printing is True` or `poll.printing_unchecked` (it may be printing, §6.6) |
+| `can_resume` | not BLUE, monitored, `poll.reachable`, `poll.printing is False`, not `poll.printing_unchecked`, code in (`stopped`, `not_printing`, `printing_off`), and E has a `send_id`, is `confirmed`, isn't `rejected` or `resume_blocked`, and has no `failure`. send.md's `check_resume` then makes the real check against the printer |
+| `needs_send` | code in `NEEDS_SEND_CODES` = (`failed_before_switch`, `failed_after_switch`, `left_red`, `rejected`, `stopped_needs_send`, `test_finished`, `test_interrupted`, `test_orphaned`, `interrupted_old`, `interrupted_unknown`, `drift`, `printing_on_unexpected`, `not_from_stripes`, `idle`), or `interrupted_new` while E.mode is `switch_pending`, or `printing_unchecked` with no E or E.mode `none` (C21) |
 | `confirm_pending_by`, `confirm_send_id` | E.sender (E.written_by when it is `""`) and E.send_id when E.mode is `running`, not confirmed, not rejected, no failure and `send_id` set (the code is then `unconfirmed`, `interrupted_new`, `message_unchecked` or a red that an alert caused); else `""`. A clock set or Leave it by someone else never moves it, because they don't change `E.sender` |
 | `test` | `{"by": lock.user, "step": ..., "of": ...}` for `test_running`; `{"by": E.test["by"], ...}` for `test_orphaned`, `test_interrupted` and `test_finished` when `E.test` is set; else None |
 | `has_preview` | `poll.running` is set and its `preview_sha256` isn't empty |
@@ -836,8 +852,31 @@ Every `heartbeat_s` (5 s), waiting with `clock.sleep(heartbeat_s, cancel)`:
 2. Printers to poll: the active printers with a token of the active machines of active lines
    (`printer_ids`). A printer belongs to one machine (architecture decision 11).
 3. Share mode (`store.available` and share-mode polling isn't suspended by §6.13):
+   0. **The stuck-worker watchdog.** A printer this PC ranks first for, and has kept a worker for (one
+      running, or one started again after failed starts), with no good P write by this PC for
+      `not_monitored_s` (30 s): its worker is fenced (from then on it sends nothing and writes no P;
+      its next tick ends it), it leaves `polling`, `internal_error` is logged with
+      `error: "worker_stuck"` and the printer, and the printer goes in the heartbeat's `declined`.
+      `assign()` then leaves this PC out for that printer on every PC (storage.md §12.4), so the next PC
+      takes it over by the normal rules and nobody hands it back. No second worker is started for it
+      while it is declined. It stays declined until the fenced worker has ended (its thread, or in
+      `run_once` its tick) and the decline's time has passed: `lock_stale_s` (60 s), doubled for each
+      fence of that printer less than `DECLINE_MEMORY_S` (1 hour) after the last, up to
+      `DECLINE_MAX_S` (15 minutes): 60, 120, 240, 480, 900 s. Then the normal handover returns it, on
+      probation: when the first worker this PC starts for it after that ends without one good P write
+      (the fault is still there), the printer is declined again at once, with no new 30 s wait, and
+      the backup keeps it. The backup's own yield to a PC whose heartbeat declines the printer is void:
+      P is still the backup's write, so it starts again at once, without waiting for P to go stale. A
+      fault that stays therefore costs a gap of about 20 s (never NOT MONITORED) at each retry, and the
+      retries get rarer. A
+      worker that read P and stood aside on purpose (it waits for another PC's yield, yields itself, or
+      won't start over a newer write) counts as progress, unless its own last P write failed. The
+      first pass after this coordinator was itself paused for `stale_s` or more starts the 30 s again
+      (the whole PC slept, not one worker). Recovery: 30 s + a beat + a pass + 15 s of quiet P + the
+      settle + a cycle, under about 70 s; every board shows NOT MONITORED from about 30 s (§5.1). Each
+      fence logs `declined_s`, the decline's time.
    1. `store.heartbeat().beat(can_poll=reach.can_poll(), last_printer_reach=reach.last_printer_reach,
-      polling=<printers with a running worker>, monitor_open=..., floor_board=...)`.
+      polling=<printers with a running worker>, monitor_open=..., floor_board=..., declined=<step 0>)`.
    2. `live = store.live_heartbeats()`; `ranks = hx_share.assign(printer_ids, live)`.
    3. For every printer, `read_poll(machine_id)` (kept for `seen_polls()`, §7), and then:
       - a running worker whose PC is no longer rank 0 while rank 0's heartbeat is live: tell it to hand
@@ -845,7 +884,8 @@ Every `heartbeat_s` (5 s), waiting with `clock.sleep(heartbeat_s, cancel)`:
         key>`, stop);
       - no worker, this PC at rank 0: start one when P names this PC as `poller`, or names it in
         `yielded_to`, or `poll_age >= stale_s` (the counter unchanged, or the file missing, for
-        `stale_s`; storage.md §12.6 rule 2);
+        `stale_s`; storage.md §12.6 rule 2). P naming this PC as `poller` with a `yielded_to` whose
+        heartbeat declines the printer (step 0) counts as naming this PC;
       - no worker, this PC at rank r ≥ 1: start one when `poll_age >= hx_share.takeover_after_s(r)`
         (15 s, 20 s, 25 s, …);
       - never start when P is fresh and names another poller that hasn't yielded to this PC (the
@@ -876,9 +916,11 @@ Every `heartbeat_s` (5 s), waiting with `clock.sleep(heartbeat_s, cancel)`:
    `silent_window_s` or more (the old poller stopped long ago), `bags_recent` is written as 0, because
    those bags are long past and must not make a printer that is now off look as if it went silent while
    printing. Log `polling_started` with the reason (`assigned`, `takeover`, `handover`, `restart`).
-   Second exception (owner-approved divergence, 31 Oct): after a long gap, when `poll_age` is
-   `not_monitored_s` or more, or P's `written_at` is that old by this PC's clock (every PC closed
-   overnight, where this PC has never seen the counter), nobody has judged the printer for that long,
+   Second exception (owner-approved divergence, 31 Oct): after a long gap, when P's judged age (§6.14,
+   watched by this PC's coordinator) is `not_monitored_s` or more, or P's `judged_at` is that old by
+   this PC's clock (every PC closed overnight, where this PC has never seen the counter); for a P
+   without `judged` (an older Stripes), `poll_age` and `written_at`. Then nobody has judged the printer
+   for that long (a backup's start and yield writes don't count),
    and the copied state under a counter that moves again would show as just checked: a green
    "Printing" with the origin from before an outage while the printer prints another one. So unless
    P's state is RED or AMBER (kept as it is), the start writes the state `checking` (GREY, "Checking...",
@@ -886,6 +928,10 @@ Every `heartbeat_s` (5 s), waiting with `clock.sleep(heartbeat_s, cancel)`:
    or AMBER, that check's state snapshot (only share mode clears those). Alerts and facts are copied as
    usual, so judge still needs its evidence: unchanged facts commit at the first cycle (§3.8 step 2), a
    change needs its second reading.
+   Third exception: when this PC's last standalone check read a message name other than R's (something
+   else was selected at the printer while the share was down), R is written as unknown (None): it no
+   longer says what prints, so the origin shows as unknown until this worker's first Load, and a known
+   drift keeps its alert (C11e).
 2. Settle (storage.md §11.6): keep writing P every `poll_fast_s` (counter + 1, nothing else changed),
    and make the first request only after a lock read taken at least `hx_share.settle_s()` (6 s) after
    step 1's write still shows no lock. Then, right before the first request, the **rank check**: the
@@ -944,22 +990,37 @@ tick:
       (`load_slot`, `fonts`, `firmware`) fits when `now + http_timeout_s <= end`, because it gets
       `end` as its deadline. The worker never calls `check_uid()` or `read_twice()` (their worst case
       is longer); it reads `read("HXUI")` and lets the two-reading rule confirm a mismatch (§3.8).
-      When `now − p_ok >= stale_s / 2` (7.5 s) already as this step 7 starts (the PC slept or was
-      paused in the middle of the cycle), P hasn't proved this worker alive meanwhile, and another PC
-      may have taken the printer over. So before step 7.1 (whose paused write is a P write too) the
-      worker reads P: when another PC has written it since this worker's last write and hasn't
-      yielded to it, the worker makes no request and no P write, ends the cycle without judging,
-      continues from that PC's P, and polls again only once that PC yields to it (§6.2 item 3.3) or P
-      has been quiet for `stale_s` (a live PC that ranks above this one is handed over to at once, and
-      one this PC doesn't see as live is yielded to). The same check comes before the cycle's own
-      write (step 11) and before a clock set records its TD (§6.11 item 3.3). Otherwise, if
+      When `now − p_ok >= stale_s / 2` (7.5 s) after step 7.1 (the PC slept or was paused in the
+      middle of the cycle, the lock read included), P hasn't proved this worker alive meanwhile, and
+      another PC may have taken the printer over. So the worker reads P: when another PC has written
+      it since this worker's last write and hasn't yielded to it, the worker makes no request and no P
+      write, ends the cycle without judging, continues from that PC's P, and polls again only once that
+      PC yields to it (§6.2 item 3.3) or P has been quiet for `stale_s` (a live PC that ranks above this
+      one is handed over to at once, and one this PC doesn't see as live is yielded to). When that PC
+      polled and yielded back to this one, the worker continues from its newer P (its state, alerts and
+      their ids, its clock set), never from its own older copy, and this cycle ends unjudged: its
+      readings predate that P. The same check comes before the cycle's own write (step 11) and before a
+      clock set records its TD (§6.11 item 3.3). **Every P write is guarded the same way**: once the
+      last good write is `stale_s / 2` old, P is read first (unless such a check found P this worker's
+      own just now, within `stale_s / 4`), and a newer P by another PC, a yield to this one included,
+      is never written over. That covers the hand-over write, the paused write, the step-3 write, the
+      `internal_error` write and the write for a missing record: the write is skipped and the next
+      cycle's rival check adopts, waits or yields. A write that succeeds but took `stale_s / 2` or more
+      (the PC paused inside it) proves nothing about now and may have landed over another PC's P: share
+      mode stops (§6.13) and the rank and rival rules decide afresh. A P by a PC this one doesn't see as
+      live, with a counter not above this worker's last write (equal when it lands before this worker's
+      second write: both counted on from the same P) and `written_at` at least `stale_s / 2` old by
+      this PC's clock, is a late write by a superseded owner (an abandoned share write that landed, or a
+      PC that paused inside its write): it is neither adopted nor yielded to, `late_write_ignored` is
+      logged, and this worker's next write puts its own P back (storage.md §12.6 rule 9). Otherwise, if
       `now − p_ok >= poll_fast_s`, or the request doesn't fit, write P first (counter + 1, everything
       else as last written), which moves `p_ok` and `end` on. If it still doesn't fit (a failed or
       slow write), make no further request this cycle; and once `now − p_ok >= stale_s / 2`, apply §6.13:
       P can no longer prove this worker is alive, so another PC may soon start polling the printer.
       Nothing (no share operation, no sleep) runs between this check and the call.
    3. **Send it** at once. Every call gets `deadline=end`: `read(tag, deadline=end)`, `command(cmd,
-      deadline=end)`, `load_slot(0, deadline=end)`, `fonts(deadline=end)`, `firmware(deadline=end)`.
+      deadline=end)`, `load_slot(0, deadline=end)`, `fonts(deadline=end)`, `firmware(deadline=end)`,
+      and a second reading's `login(deadline=end)`.
       A call that has to wait for this PC's gate (a Stop, Resume or clock set on this PC took it
       between the lock check and the call) never waits past `end`, and one that gets the gate too
       late to finish by `end` sends nothing (protocol.md §9 item 2): `PrinterBusy`, which isn't a
@@ -975,7 +1036,10 @@ tick:
    rules (the lock checked, P kept fresh, the deadline), and judge again as a first reading. (The
    30 s limit keeps a printer whose MSGNAM and Load names disagree for good within the budget.)
 10. **Second reading**: if `judgement.recheck`, sleep `second_reading_s` (cancellable), re-read the
-    items (§3.8) by step 7's rules, and judge the second reading.
+    items (§3.8) by step 7's rules, and judge the second reading. An item that can't be read again
+    takes prev's value (§3.8). The `login` item: accepted clears `login_failed`; `AuthFailed`, or a
+    reply that can't be used (`BadReply`, `WebReadFailed`), is `login_failed`; `PrinterBusy` (this PC's
+    gate busy until too late, nothing sent) confirms nothing; no reply counts as one (§6.6).
 11. **Write**: if `running.preview_sha256` changed, `write_preview` first (storage.md §5.3), then
     `write_poll` with §6.14's fields.
 12. **Log** `state_changed` when the code changed, and `alert_started`, `alert_ended`,
@@ -1003,6 +1067,13 @@ retry is the next cycle's own Load.
 An exception that isn't an `HxError` (a bug) is caught at the top of the tick, printed with its
 traceback, logged as `internal_error`, and P is written with state code `internal_error` (RED), alerts
 unchanged. The worker carries on at the next tick (architecture §8.1). `Cancelled` ends the worker.
+When even that write fails, the worker makes no progress, and the coordinator's watchdog gives the
+printer away after `not_monitored_s` (§6.2 item 3.0).
+
+A worker that resumes mid-cycle after a stall shorter than the watchdog's 30 s, with P still its own,
+judges what it read before the stall (one cycle, about 5 s; the two-reading rule still applies). It
+isn't ended there, because a healthy cycle can be `stale_s / 2` past its last write after a slow Load
+(up to `stale_s / 2 + http_timeout_s`), and dropping those readings would leave a slow printer unjudged.
 
 ### 6.5 What is read when, and the request budget
 
@@ -1082,6 +1153,19 @@ than 15 requests. Multi-value queries are never used (protocol.md refuses them).
 | `AuthFailed` | `problem = "login_failed"`; the rest of the cycle is skipped |
 | `WrongPrinter` | `problem = "wrong_printer"`; the rest of the cycle is skipped |
 | `ShareUnavailable` while checking the lock | abandon the cycle (no request without a lock check), §6.13 |
+
+A busy or nonsense reply leaves its item None, so `facts_from` keeps prev's value. For PRIN that
+can't last: the worker counts the cycles in a row whose PRIN read got no good value, reset by a good
+one and carried over a takeover by `P.printing_unchecked`. At `PRIN_UNREAD_LIMIT` (3, about 15 s) the
+reading has `printing_unchecked = True`. `F.printing` and `P.printing` keep the last known value, but
+classify treats printing as unknown (§3.4): a machine that would be green `running_confirmed`, grey
+`stopped` or grey `idle` is amber `printing_unchecked` instead (C19 to C21). An alert that needs
+printing read (`printing_on`, `printing_off`, `ink_out`, `cartridge_error`, `test_still_printing`,
+`not_from_stripes`) is held with its code, the same id and acks, and none starts. A later silence or
+off reading counts from the last known value (`maybe_printing`, C9 and C10). The view offers Stop (it
+may be printing), not Resume, and shows `printing` as None (§5.1). That commits at once (§3.8 step 3);
+a good PRIN afterwards needs its second reading. One or two busy cycles change nothing. A cycle whose every reply
+was busy or nonsense also leaves P's judged counter alone (§6.14), so the board's age goes on growing.
 
 `reading.reachable = failures < timings.unreachable_after`. Because a failed request ends its cycle,
 each cycle adds at most one failure: a printer that stops answering is judged unreachable at the third
@@ -1290,8 +1374,9 @@ The share is down. Polling carries on only on PCs with the MapleJet monitor or t
 
 1. A worker whose P writes or lock reads have failed for `stale_s / 2` (7.5 s, on its monotonic clock)
    stops share-mode polling of that printer (storage.md §12.6 rule 7) and tells the coordinator, which
-   suspends share mode until `store.available` has been True again for `heartbeat_s` and a P write
-   succeeds. A lock read or P write that took longer than `stale_s / 4` (3.75 s) counts as failed for
+   suspends share mode until `store.available` has been True again for `heartbeat_s` and a heartbeat
+   write succeeds. A PC that can write its heartbeat but not one printer's P (a file only it can't
+   write) keeps failing there: the watchdog (§6.2 item 3.0) gives that printer away. A lock read or P write that took longer than `stale_s / 4` (3.75 s) counts as failed for
    this rule even when it succeeded, and §6.4 step 7 stops the cycle's requests as soon as the last
    good P write is `stale_s / 2` old.
 2. A worker never makes a printer request without a successful lock check in the same cycle.
@@ -1309,7 +1394,9 @@ commit (§3.8).
 | `counter` | + 1 at every tick |
 | `paused_for_lock` | the lock token while paused (`"local"` for a local lock without a file), else `""` |
 | `yielded_to` | `""`, or the heartbeat key when handing over |
-| `reachable`, `problem`, `printing`, `running`, `ink_level`, `clock_offset_s`, `daily`, `foreign_client`, `running_unchecked` | committed facts |
+| `reachable`, `problem`, `printing`, `running`, `ink_level`, `clock_offset_s`, `daily`, `foreign_client`, `running_unchecked`, `printing_unchecked` | committed facts |
+| `judged` | + 1 only by a write that judged a reading that learnt something (a good value, a finding, or no reply; a backoff tick and a client that can't be made count too), and by a paused write. Every other write (a start, a settle, a yield, a keep-fresh write, the step-3 write, `internal_error`, a missing record) copies it. It is what NOT MONITORED and "checked N s ago" measure (§5.1); takeover, handover and the sender handshake use `counter`. None in a P from an older Stripes |
+| `judged_at` | wall time of the write that last moved `judged`; display and first sight only (§6.3 step 1, §7) |
 | `running_ok_at` | wall time of the last successful running-message Load (§6.5); display only |
 | `failures`, `last_answer_at`, `message_name`, `bag_count`, `bags_recent`, `ink_name`, `head_temp_c` | the latest values |
 | `state` | the committed `MachineSnapshot` |
@@ -1369,7 +1456,10 @@ Example (a machine in drift, alert unacknowledged):
  "running_ok_at": 1793275238.9,
  "running_unchecked": false,
  "dst": {},
- "standalone": false
+ "standalone": false,
+ "judged": 18740,
+ "judged_at": 1793275240.2,
+ "printing_unchecked": false
 }
 ```
 
@@ -1389,15 +1479,18 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
 1. `data = DataService.current`. None: post `BoardUpdate(BoardView(lines=[], share_ok=store.available,
    generated_at=clock.time()))` and wait.
 2. **Share mode** (`store.available`): for every active machine of an active line,
-   - P: from `poller.seen_polls()` when the coordinator read it within the last `heartbeat_s`, else
-     `store.read_poll(machine_id)`. `FormatTooNew` gives a placeholder `PollStatus(machine_id=...,
+   - P: from `poller.seen_polls()` when the coordinator read it within the last `heartbeat_s` (or what
+     this PC's own worker wrote since, when its counter is higher: a worker's start right after the
+     share came back), else `store.read_poll(machine_id)`. `FormatTooNew` gives a placeholder `PollStatus(machine_id=...,
      printer_id=..., poller="", state=MachineSnapshot(code="update_stripes", colour=GREY,
      headline=Msg(STATE_TEXTS["update_stripes"]), since=0.0))`;
    - E: `store.read_expected(machine_id)`; `FormatTooNew` marks the machine `update_stripes` the same
      way;
    - L: `store.read_lock(printer_id)`;
-   - then `read_line_status` for every active line, and `poll_ages[mid] = store.poll_age(mid)`,
-     `lock_ages[pid] = store.lock_age(pid)`.
+   - then `read_line_status` for every active line, and `poll_ages[mid]` = P's judged age: how long
+     the watcher's own `CounterWatch` has seen `P.judged` at its value (key `judged:<mid>`), never less
+     than `store.poll_age(mid)`. A P without `judged` (an older Stripes), or whose state is the poller's
+     own `checking` (§6.3 step 1), has `store.poll_age(mid)`. `lock_ages[pid] = store.lock_age(pid)`.
    - acks: `store.read_ack(id)` for every active alert without `acked_by` (found acks are cached by the
      store), merged with this PC's own acks.
    - A `ShareUnavailable` part-way through: use the last good value of everything not yet read this
@@ -1420,12 +1513,13 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
    every own ack made during the pass applied first, so an `acknowledge()` while a pass reads the share
    is never undone by that pass's board, and a pass that ends during `acknowledge()` is never replaced
    by the older board (§4.5 item 2). The lock is never held across share I/O.
-6. Share mode, a P this watcher has not yet seen move whose `written_at` is `not_monitored_s` or more
-   old by this PC's clock while `poll_age` is still below `not_monitored_s` (storage.md §10 rule 1
-   counts a counter seen for the first time as fresh): its age is given as None, so it shows
-   `checking`, not last night's state as just checked, until it moves or becomes `not_monitored`
-   (owner-approved divergence, 31 Oct). Once seen moving, `written_at` is never used again, so a PC
-   whose clock is off never loses a P that is being written.
+6. Share mode, a P whose judged counter this watcher has not yet seen move, with `judged_at`
+   `not_monitored_s` or more old by this PC's clock while its age is still below `not_monitored_s`
+   (storage.md §10 rule 1 counts a counter seen for the first time as fresh; for a P without `judged`,
+   its counter and `written_at`): its age is given as None, so it shows `checking`, not last night's
+   state as just checked, until it moves or becomes `not_monitored` (owner-approved divergence,
+   31 Oct). Once seen moving, `judged_at` is never used again, so a PC whose clock is off never loses a
+   P that is being judged.
 
 `acknowledge(alert_ids: list[str]) -> None` (§11.3): records `Ack`s in memory at once, wakes the loop
 (the next board applies them), and queues the share writes, which the watcher thread makes after
@@ -1572,6 +1666,7 @@ needs the same words, it uses these.
 | `off` | Printer off | Impresora apagada |
 | `not_printing` | Printing is off | La impresión está apagada |
 | `message_unchecked` | Can't read the message on this printer | No se puede leer el mensaje de esta impresora |
+| `printing_unchecked` | Can't read the printer's state | No se puede leer el estado de la impresora |
 | `unconfirmed` | Send not confirmed | Envío no confirmado |
 | `confirmed_with_notes` | Printing, not fully checked | Imprimiendo, sin revisión completa |
 | `not_from_stripes` | Not sent from Stripes yet | Todavía no se envió desde Stripes |
@@ -1645,7 +1740,7 @@ Values: `machine` = `Machine.name`, `printer` = `Printer.name`, `computer`, `use
 Dataclass conventions are hx_model's (architecture §5): `= []` and `= {}` mean default factories.
 
 ```python
-STATE_CODES: dict[str, str]           # code -> colour, exactly the §2 tables (40 codes)
+STATE_CODES: dict[str, str]           # code -> colour, exactly the §2 tables (41 codes)
 STATE_TEXTS: dict[str, str]           # key -> N_ headline (§10.1): one key per code, except that
                                       #   action_in_progress has "action_in_progress:stop", ":resume",
                                       #   ":clock" and ":other" instead, and "test_running:nostep" is an
@@ -1713,6 +1808,7 @@ def expected_code(expected: ExpectedState) -> str | None                       #
 def norm_name(name: str | None) -> str                                         # §3.3
 def matches_expected(running: RunningMessage | None, *, name: str, slot: int | None,
                      fingerprint: str) -> bool                                 # §3.3
+def maybe_printing(prev: PollStatus | None) -> bool                             # §3.4 C3, §6.6
 def was_printing(prev: PollStatus | None, company: Company) -> bool             # §3.7
 def alert_id(machine_id: str, kind: str, *, ref: str = "", at: float = 0.0) -> str   # §4.2
 def resolve_recipients(roles: tuple[str, ...], *, sender: str, notify: str,
@@ -1755,7 +1851,12 @@ Optional fields added to `Judgement` (architecture §6.2):
 
 `PollStatus` (all optional): `problem: str = ""`, `expected_counter: int = 0`, `reread_seen: str = ""`,
 `unreachable_since: float | None = None`, `running_ok_at: float | None = None`, `running_unchecked: bool
-= False`, `dst: dict = {}`, `standalone: bool = False`.
+= False`, `dst: dict = {}`, `standalone: bool = False`, `judged: int | None = None`, `judged_at: float =
+0.0`, `printing_unchecked: bool = False` (§6.14).
+
+`HeartbeatInfo` (optional): `declined: list[str] = []` (§6.2 item 3.0, storage.md §5.7).
+
+`Reading` and `Facts`: `printing_unchecked` (§6.6; a Reading's None carries prev's).
 
 `Alert` (all optional): `colour: str = ""`, `ref: str = ""`, `acked_by: str = ""`,
 `acked_at: float | None = None`, `ended_at: float | None = None`, `waiting: list[str] = []`.
@@ -1770,6 +1871,8 @@ storage.md §5.2's field list.
 ```python
 FOREIGN_MIN, FOREIGN_WINDOW_S, FOREIGN_CLEAR_S, MAX_BAGS_PER_S, DAILY_S, DST_KEEP_S, ACK_RETRY_S  # §6.1
 UNCHECKED_LOADS, UNCHECKED_SLOW_SETS, UNCHECKED_CONFIRMS                                 # §6.5
+PRIN_UNREAD_LIMIT = 3                                                                    # §6.6
+DECLINE_MAX_S = 900.0; DECLINE_MEMORY_S = 3600.0                                         # §6.2 item 3.0
 def dst_change_id(at: float, new_offset_s: float, *, offset_fn) -> str                   # §6.11
 
 class Poller:                         # additions to architecture §6.8
@@ -1896,6 +1999,19 @@ message, and stale `LockInfo`s for every purpose.
     the same drift alert and ack, no alert ended, the view RED, quiet, origin `""`; a Load of R again
     gives `drift` with that alert, a confirmed Load of E's message green; not for a newer E. Carried into
     standalone with R None: `unknown_while_down`, the alert open, RED, sounding, origin `""`.
+20. **Carried alerts end with E** (§3.7 item 1): while unreachable, `not_from_stripes` ends at the first
+    Send (still carried with no E, or a first Send that failed before the switch), `printing_on` once E
+    changes (a Send, or a failed Send that keeps `stopped_by_user`), `printing_off` once E.mode isn't
+    `running` (a Stop, or a Stop at the printer that leaves only `stop_failed`), `message_unreadable`
+    once E.mode isn't `running` or `switch_pending`; each still carried while E allows it.
+21. **Printing that can't be read** (§6.6): `printing_unchecked` facts give amber `printing_unchecked`
+    where green or grey `stopped`/`idle` would be and keep `unconfirmed` as it is; `F.printing` keeps
+    the last known value. Each printing-dependent alert (`ink_out`, `cartridge_error`, `printing_on`,
+    `printing_off`, `test_still_printing`, `not_from_stripes`), acknowledged or not, stays with its code
+    and id; none starts. A silence or off reading afterwards counts from the last known on. The view
+    offers Stop, not Resume. It commits at once, and back needs a PRIN second reading (one that can't
+    read PRIN keeps it).
+22. **Natural order**: only ASCII digit runs sort as numbers; "Bagger 1²" sorts and doesn't raise.
 
 ### 12.2 test_hx_poller.py (FakeWorld, FakePrinter, scaled timings or FakeClock)
 
@@ -2037,6 +2153,39 @@ of real time.
     (from `board_view`, and with real threads during a slow lock read) leaves every later board quiet;
     a pass that ends inside `acknowledge()` leaves `latest` and the last `BoardUpdate` as the newer
     board, with the ack applied.
+27. **A stuck worker** (§6.2 item 3.0): rank 0's worker never ticks again while its PC heart-beats, and
+    the message is edited at the panel: rank 1 gets a printer reply within 70 s, rank 0 logs
+    `internal_error` `worker_stuck` naming the printer and lists it in its heartbeat's `declined`, the
+    board shows NOT MONITORED from about 35 s and never the old green, rank 1 commits red drift with a
+    sounding alert, and once the stuck tick returns the fenced worker makes no request and no P write.
+    The same recovery when every P write of rank 0's worker fails (a file only that PC can't write, or
+    a bug). The decline ends once the fenced worker has ended and `lock_stale_s` has passed. A whole PC
+    paused for a minute isn't a stuck worker. A P write fault that stays for ten minutes: after the
+    first recovery no 30 s gap without a printer request and never NOT MONITORED; the declines are
+    60, 120, 240 and 480 s; once the fault ends the printer comes back to rank 0 and stays. Fences more
+    than `DECLINE_MEMORY_S` apart start again at `lock_stale_s`.
+28. **Judged freshness** (§6.14): a backup's start and yield writes keep `judged`; a lock held 50 s shows
+    no NOT MONITORED after it; a P from an older Stripes (no `judged`) keeps its counter's age.
+29. **Superseded writes** (§6.4 step 7.2): a PC paused between ticks while a higher-ranked PC takes over
+    and commits a drift writes nothing over it and sends nothing; a PC paused after the lock check, or
+    inside the step-3 lock read, neither sends nor writes until the new poller yields back; a worker that
+    resumes after a yield to it continues from that P (no green, the drift alert keeps its id); a late
+    write by a superseded owner that isn't live is ignored (`late_write_ignored`), and the poller keeps
+    its drift, also when the late write carries the new poller's start counter (no yield, its first
+    request within the settle and a cycle); a PC frozen inside its cycle's own P write stops share mode
+    when it wakes.
+30. **Second readings** (§3.8): a stray PRIN `0` whose re-read gets no reply commits nothing; a re-read
+    that answers busy takes prev's value; the second reading's login keeps the cycle's deadline while
+    this PC's gate is held and sends nothing late; a login reply that can't be used (`BadReply`,
+    `WebReadFailed`) is `login_failed`; a login that couldn't be made (`PrinterBusy`) confirms nothing.
+31. **Printing that can't be read** (§6.6): every Autopilot read busy while Loads work: amber
+    `printing_unchecked` (or NOT MONITORED amber between the Loads), never green, `P.printing` the
+    last known value and the view's `printing` None; E then stopped and PRIN read on: red
+    `printing_on_unexpected`. One or two busy cycles keep green. Only PRIN busy after a red
+    `printing_on_unexpected`: red, the same alert id, all along. An acknowledged `ink_out` keeps its id
+    and ack through a PRIN busy spell.
+32. **The share back after another message was selected** (§6.3 step 1, third exception): the old
+    drift's origin is never shown again; red until share mode loads the new one.
 
 ### 12.3 test_hx_sim.py (shared with storage.md and protocol.md)
 
@@ -2051,6 +2200,9 @@ GREEN with an origin the fake isn't printing, in the views sampled until the pol
 
 Two cases from the review:
 
+0. **A stuck worker thread** (real threads): the polling PC's worker blocks while its coordinator
+   heart-beats: the other PC polls within 70 scaled seconds, the worker is fenced, and no board shows a
+   green older than `not_monitored_s`.
 1. **Slow everything**: one `FakePrinter(latency_s=1.9 × f)`, a share on `FlakyFileOps` with `slow_s =
    3 × f`, a silent `FakeSntp`, a rank-0 poller PC, a rank-1 PC and a sender on a third store sending
    twice, with `TIMINGS.scaled(f)`: `max_in_flight == 1` and no "two requests in flight" for the
@@ -2097,7 +2249,9 @@ don't register different Spanish for §10's texts.
 **protocol.md**: the poller uses `read(tag, deadline=...)` (HXUI included, never `check_uid` or
 `read_twice`), `command(cmd, deadline=...)` (the daylight-saving TD), `load_slot(0, deadline=...)`,
 `fonts(deadline=...)`, `firmware(deadline=...)`, `probe()` (None when the
-gate is busy), `login`, `worst_case_s`, `nonsense` and `busy_replies` as specified there.
+gate is busy), `login(deadline=...)` (PrinterBusy, nothing sent, when this PC's gate can't be had in
+time; protocol.md §9 item 2 should list it with the others), `worst_case_s`, `nonsense` and
+`busy_replies` as specified there.
 
 **storage.md**: the poller follows §11.6 and §12 there, probes only printers without a live poller
 (§12.3), and needs no poller memory file: daily checks are in P.daily and the daylight-saving clock
@@ -2242,3 +2396,24 @@ set in P.dst, under a change id every PC recomputes (§6.10, §6.11).
     shows a P it has never seen move, written long ago, as `checking`; and `checking` shows no origin.
     So the old origin is never green "Printing" after a gap, and a red or amber never turns green before
     a share-mode reading.
+40. **A stuck worker is replaced, and only judgements look fresh** (ChatGPT review, 31 Oct). The
+    coordinator watches each printer it ranks first for: no good P write for `not_monitored_s` (30 s)
+    fences the worker, logs `internal_error` `worker_stuck`, and declines the printer in the heartbeat,
+    so the next PC polls it (backup polling within about 70 s) and nobody hands it back; it comes back
+    once the fenced worker has ended and `lock_stale_s` has passed. Freshness on every board is P's
+    `judged` counter, moved only by judgements and paused writes, so a backup's bookkeeping never makes
+    an old green look checked: NOT MONITORED from about 30 s. A worker that resumes after a gap never
+    writes over a newer P by another PC, adopts a newer yield to it, and ignores a late write by a
+    superseded owner; a write that took `stale_s / 2` stops share mode. A second reading's login carries
+    the cycle's deadline. Residual risks: a printer can't refuse one late request from a PC that froze
+    after its last check (at most one mixed-up reply, which the two-reading rule turns into a false
+    alarm, never a false green); a share write can land late (a board shows the old P for at most one
+    tick); a stuck thread can't be killed and keeps this PC's gate for that printer. With no backup PC
+    the machine stays NOT MONITORED, which has no sound (decision 9 is unchanged).
+41. **Printing that can't be read for long isn't green**: PRIN without a good value for
+    `PRIN_UNREAD_LIMIT` (3) cycles in a row makes printing unknown and a green, `stopped` or `idle`
+    machine amber `printing_unchecked`; busy-only cycles don't move `judged`. P keeps the last known
+    value, and alerts that need printing read stay as they are (same ids and acks) until PRIN answers
+    (review 2). A rechecked item the second reading can't read takes prev's value, so it confirms nothing.
+42. **Carried alerts end with E** (§3.7 item 1): `printing_on`, `printing_off`, `message_unreadable` and
+    `not_from_stripes` end, also while the printer can't be trusted, once E no longer allows them.

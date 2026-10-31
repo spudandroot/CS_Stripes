@@ -58,6 +58,7 @@ MAX_AUTOPILOT_REPLY = 4_096
 MAX_SME_REPLY = 262_144          # a Load reply is about 29.5 KB
 MAX_FILE_REPLY = 65_536
 MAX_LOGIN_REPLY = 1_048_576      # read and discarded; may be cut short
+MAX_SME_DEPTH = 16               # elements open at once in an SME reply, SM included (§11.1 item 3)
 
 PREVIEW_PREFIX = "data:image/bmp;base64,"
 PREVIEW_BYTES = 20_542           # 62-byte header + 128 bytes x 160 rows
@@ -128,8 +129,9 @@ class PrinterClient:                      # additions to architecture §6.4
         # TCP connect and close under the gate, no request (§9 item 7); None when the gate was busy
     # load_slot(slot, *, deadline=None), fonts(*, deadline=None), firmware(*, deadline=None):
     # architecture §6.4; the deadline rule is §10.6 step 0
-    # query(tag, *, deadline=None), read(tag, *, deadline=None), command(cmd, *, deadline=None):
-    # architecture §6.4; with a deadline the gate wait is bounded and a late gate sends nothing (§9 item 2)
+    # query(tag, *, deadline=None), read(tag, *, deadline=None), command(cmd, *, deadline=None),
+    # read_twice(tag, *, deadline=None), check_uid(*, deadline=None): architecture §6.4; with a deadline the
+    # gate wait is bounded, and nothing is sent that couldn't end by it, after the gate too (§9 item 2)
 ```
 
 ### 1.2 hx_fake
@@ -392,15 +394,17 @@ The internal helper `_ask(xml) -> str` is always called with the gate held. It m
 `http_exchange` (`max_body=MAX_AUTOPILOT_REPLY`), sets `last_request_at = clock.monotonic()` when the
 exchange ends however it ends, then applies §2.4 and §4.2.
 
-`query(tag, *, deadline=None) -> str` (the deadline rule of §9 item 2 applies to `query`, `read` and
-`command`)
+`query(tag, *, deadline=None) -> str` (the deadline rule of §9 item 2 applies to `query`, `read`,
+`read_twice`, `check_uid` and `command`)
 
 1. `check_query(tag)`: `ForbiddenCommand` for any tag outside `QUERY_SPECS`. Every
    `FORBIDDEN_QUERY_TAGS` tag is outside it.
 2. Take the gate (§9).
 3. At most two attempts of `_ask(f"<{tag}/>")`. After a `NoReply`, or a `6` or `7` (`busy_replies` + 1),
    sleep `read_retry_s` still holding the gate, then make the second attempt. Any other answer is
-   returned as it is, without a spec check.
+   returned as it is, without a spec check. With a deadline, the second attempt is made only if it can
+   still end by it, checked before the sleep and again after it; otherwise the first error is raised
+   (after a `NoReply` the gate is still held as long as the deadline allows).
 4. After a second failure, raise the last `NoReply` or `PrinterBusy`.
 
 `read(tag, *, deadline=None) -> int | str | None`
@@ -412,14 +416,15 @@ exchange ends however it ends, then applies §2.4 and §4.2.
 3. After two failures, raise the last error: `NoReply`, `PrinterBusy` or `BadReply`.
 4. `AuthFailed` is raised at once.
 
-`read_twice(tag)`
+`read_twice(tag, *, deadline=None)`
 
-1. `a = read(tag)`, release the gate, `clock.sleep(second_reading_s)`, `b = read(tag)`.
+1. `a = read(tag)`, release the gate, `clock.sleep(second_reading_s)`, `b = read(tag)`; each read with the
+   deadline.
 2. If `a != b`: nonsense + 1 and `BadReply(tag=tag, reply=f"{a} / {b}")`. Otherwise return `a`.
 
-`check_uid()`
+`check_uid(*, deadline=None)`
 
-1. `read("HXUI")` equal to `uid`: return.
+1. `read("HXUI")` equal to `uid`: return. Each read here is made with the deadline.
 2. Otherwise sleep `second_reading_s` with the gate released and read again. The same other UID twice
    raises `WrongPrinter(expected=uid, got=str(value))`. Two different answers: nonsense + 1 and
    `BadReply`.
@@ -429,9 +434,11 @@ exchange ends however it ends, then applies §2.4 and §4.2.
 1. `check_write(cmd)` before anything else (`ForbiddenCommand`).
 2. Take the gate (with a deadline, §9 item 2).
 3. Warm-up: if `last_request_at is None`, or `clock.monotonic() - last_request_at >= idle_warmup_s`,
-   run the `read("HXUI")` algorithm with the gate held. A different UID raises `WrongPrinter`, and any
-   failure is raised as it is. In both cases the write is not sent.
-4. Send the write once: `_ask(cmd.xml)`.
+   run the `read("HXUI")` algorithm with the gate held (and the deadline). A different UID raises
+   `WrongPrinter`, and any failure is raised as it is. In both cases the write is not sent.
+4. With a deadline: `clock.monotonic() + http_timeout_s > deadline` raises `PrinterBusy` "{printer} is
+   busy with another request from this PC.", the write not sent (the warm-up read, or a frozen PC,
+   used the time up). Otherwise send the write once: `_ask(cmd.xml)`.
 5. `NoReply`: sleep `read_retry_s` holding the gate, then raise `NoReply` "No reply from {printer} to
    {command}. It may or may not have been done."
 6. First token `0`: return. An integer: `CommandRefused(tag=cmd.tag, code=n)`. Anything else:
@@ -641,8 +648,9 @@ These are `hx_model.Timings` fields (architecture §5.1); nothing here adds or c
 
 Any other name raises `ValueError`. For the three web calls (`load_slot`, `fonts`, `firmware`) the
 value is the budget a caller gives the call as a deadline: lock holders call them with `deadline =
-clock.monotonic() + worst_case_s(call)` (the poller with its own, earlier deadline, states.md §6.4),
-so a web call can never run longer. A web call cut short by its deadline raises `WebReadFailed`
+clock.monotonic() + worst_case_s(call)`, or the lock's lease end when that is earlier (send.md §10.5;
+the poller with its own, earlier deadline, states.md §6.4), so a web call can never run longer. Lock
+holders give every Autopilot call the lease end as its deadline too. A web call cut short by its deadline raises `WebReadFailed`
 (`load_slot`) or `BadReply` (`fonts`, `firmware`, "didn't send its font list"), which is a failed read:
 the machine goes red in a Send, and the poller's message check counts a failed Load (states.md §6.5).
 
@@ -656,14 +664,18 @@ One PC can poll 12 printers on separate threads because each printer still sees 
    own `GateRegistry()`.
 2. Every public `PrinterClient` method takes the gate with `lock.acquire(timeout=gate_wait_s)` (real
    time). A timeout raises `PrinterBusy` "{printer} is busy with another request from this PC."
-   `query`, `read` and `command` take an optional `deadline` (a `clock.monotonic()` time), as the web
-   calls do (§10.6 step 0). With one, the call may start no later than `latest = deadline −
-   worst_case_s(call)` (for the web calls, `deadline − http_timeout_s`): the gate is taken with
+   `query`, `read`, `read_twice`, `check_uid`, `command` and `login` take an optional `deadline` (a
+   `clock.monotonic()` time), as the web calls do (§10.6 step 0). With one, the call may start no later
+   than `latest = deadline − worst_case_s(call)` (for `load_slot`, `fonts` and `firmware`, `deadline −
+   http_timeout_s`; `read_twice` and `check_uid` apply it to each of their reads): the gate is taken with
    `timeout=min(gate_wait_s, max(0.0, latest − clock.monotonic()))`, and a gate acquired when
-   `clock.monotonic() > latest` is released at once. Either way nothing is sent; `query`, `read` and
-   `command` raise `PrinterBusy` "{printer} is busy with another request from this PC.", the web calls
-   their §10.6 step 0 error. So a caller with a deadline never waits for the gate past it, and never
-   sends a request that could still be running after it (the poller, states.md §6.4 step 7).
+   `clock.monotonic() > latest` is released at once. Either way nothing is sent; `query`, `read`,
+   `command` and `login` raise `PrinterBusy` "{printer} is busy with another request from this PC.", the
+   other web calls their §10.6 step 0 error. After the gate, the deadline is checked again before every exchange, as
+   web calls do: the write after a command's warm-up read, a read's second attempt (§4.4). So a caller
+   with a deadline never waits for the gate past it, and never sends a request that could still be
+   running after it, even when its PC froze in between (the poller, states.md §6.4 step 7; lock
+   holders, whose deadline is the lock's lease end, send.md §10.5).
 3. What one acquisition covers:
    - `query`, `read`: both attempts and the wait between them.
    - `command`: the warm-up read and the write.
@@ -845,19 +857,22 @@ check), never by anything else. The fake's "web file requested <path>" violation
 2. Tokens: tags matching `<(/?)([A-Za-z][A-Za-z0-9_]*)\s*(/?)>` and the bytes between them. A `<` that
    doesn't start such a tag raises `WebReadFailed`, except one leading `<?xml …?>` declaration, which is
    skipped.
-3. An element whose next token (skipping whitespace-only text) is an opening tag is a container.
+3. At most `MAX_SME_DEPTH` (16) elements are open at once, SM included; one more raises
+   `WebReadFailed`. A real Load reply goes 4 deep (SM, FCDOC, an item, a leaf). Before this limit a
+   reply nested 1,000 levels deep (36 KB) raised `RecursionError` instead.
+4. An element whose next token (skipping whitespace-only text) is an opening tag is a container.
    Otherwise it is a leaf, and its value is **every byte between its opening and closing tags,
    unchanged**: spaces are kept, so `<PREF>Packed: </PREF>` is `"Packed: "`. `<X/>` is a leaf with the
    value `""`. A closing tag that doesn't match raises `WebReadFailed`, and so does text other than
    whitespace between the tags of a container.
-4. Whitespace between tags is ignored: CRLF (seen), LF, and blank lines (seen inside CTDAT and CLOT).
-5. Each leaf value is decoded with `decode_text`: strict UTF-8, else latin-1. So AMPM's single byte
+5. Whitespace between tags is ignored: CRLF (seen), LF, and blank lines (seen inside CTDAT and CLOT).
+6. Each leaf value is decoded with `decode_text`: strict UTF-8, else latin-1. So AMPM's single byte
    0xFF (seen) becomes `"\xff"`, and a UTF-8 `ñ` stays `ñ`. **No XML entity is decoded** (§12.2 says
    why).
-6. SM-level leaves: TYPE (required, else `WebReadFailed`), TN and XID (`""` when missing), MSNO (`None`
+7. SM-level leaves: TYPE (required, else `WebReadFailed`), TN and XID (`""` when missing), MSNO (`None`
    when missing or empty, otherwise it must be an integer). Other SM-level leaves are ignored. The
    containers are FCDOC and PRV, each at most once.
-7. The result is `SmeReply(type, tn, xid, msno, design)`. The design is built (§11.3) only when TYPE is
+8. The result is `SmeReply(type, tn, xid, msno, design)`. The design is built (§11.3) only when TYPE is
    `Load`; otherwise it is `None`, and PRV isn't checked.
 
 ### 11.2 The two FCDOC forms
@@ -1713,6 +1728,7 @@ exactly 29,482 bytes.
 | ParserTests | each fixture | the §11.5 table and details, field by field |
 | | robustness | the slot 9 fixture with CRLF turned into LF parses to an equal `MessageDesign`; the data URI without its space parses; `hx_fake.bmp_1bit([(10, 10, 651, 14)])` equals the fixture's decoded BMP |
 | | failures | the fixture cut in half, an 800 × 160 BMP, a 4-bit BMP, a Load without PRV, different FCDOC and PRV names, stray text inside CTEXT, and `<MSNO>x</MSNO>` all raise `WebReadFailed` |
+| | nesting depth | the slot 9 fixture with A nested inside CTEXT: 4 levels give the pair `("A.A.A.A.B", "1")`, 12 levels (B at depth 16) still parse, 13 and 1,500 levels (40 KB) raise `WebReadFailed` |
 | | classify | with `tn="326548"`: the slot 9 fixture at xid 4 is `match`, at xid 5 `stale`; the Save fixture `stale`; the other-client fixture `foreign`; the thumbnail at xid 3 `odd`; `b"7"` `busy`; `b"<html>"` `odd`. `is_stripes_tn(new_tn())` 100 times; `is_stripes_tn("326548")` and `is_stripes_tn("834854")` are False |
 | RequestTests | golden | each §17.3 builder call equals its file, byte for byte |
 | | on the wire | the fake's recorded `raw` for `read("PRIN")` equals `autopilot_request(...)`, and for a Load equals `sme_request("127.0.0.1", fake.port, ...)` |
@@ -1727,6 +1743,7 @@ exactly 29,482 bytes.
 | | echo | with `write_echo = True`, `command(PRINT 1)` succeeds |
 | | read_twice, check_uid | an override alternating "0" and "1" makes `read_twice("PRIN")` raise `BadReply` with nonsense + 1; fake UID 1110 makes `check_uid()` raise `WrongPrinter(expected=1109, got="1110")` after two reads |
 | | silent | `go_silent()` with `TIMINGS.scaled(0.05)`: `NoReply` after two attempts; `max_in_flight <= 1` |
+| | deadline before every exchange | `FakeClock`: an HXUI warm-up answer that moves the clock 6 s makes `command(PRINT 0, deadline=now + 7.5)` raise `PrinterBusy` with only the HXUI sent; a first answer "7" that moves the clock 3 s makes `read`, `query` and `check_uid` with `deadline=now + 5` raise `PrinterBusy` after one request, and so does a 3 s jump in the gap before the retry; `read_twice` and `check_uid` work with an 11 s deadline, and `read_twice` with 5.5 s sends only its first read |
 | GateTests | one in flight | `latency_s=0.005`; 8 threads, each doing 5 mixed reads and one `load_slot(0)`, through one `ClientPool`: every result right, `max_in_flight == 1`, `violations == []`. Again with two `PrinterClient`s sharing one `GateRegistry` |
 | | gate timeout | `Timings(gate_wait_s=0.1)`; another thread holds the gate: `PrinterBusy` |
 | | probe | `probe()` on a running fake is True, the fake's `requests` stay empty, `max_in_flight` stays 0 and there is no violation; while another thread holds the gate it returns None at once; on a stopped fake it is False |
@@ -1740,6 +1757,7 @@ exactly 29,482 bytes.
 | | logging in again | after `expire_web_session()` the next load gets 401, logs in and succeeds, `relogins == 1`; after `set_password("other")` it raises `AuthFailed` after one login attempt |
 | | dropped Load | after one `load_slot`, `drop_after_idle_s=3.0` and `clock.advance(5)`: the next `load_slot`'s first Load is dropped, a second Load with the next XID succeeds |
 | | wrong slot | a `web_reply_hook` changing `<MSNO>9</MSNO>` to `<MSNO>10</MSNO>`: `WebReadFailed`, nonsense 1 |
+| | nested too deep | a `web_reply_hook` nesting 1,500 levels inside slot 1's CTDAT: `load_slot(0)` raises `WebReadFailed` with the label, nonsense 1, and the next `load_slot(0)` works |
 | | slot 0 | `load_slot(0).slot == 1` on a fresh fake |
 | | fonts, firmware | `fonts() == list(STANDARD_FONTS)`, also with `gzip_files`; `files["/sfl.xml"] = None` raises `BadReply`; `firmware() == "69.75.10"`; `files["/idn.xml"] = None` gives `None` |
 | FakePrinterTests | verbose fidelity | replay the five writes of §17.6 G (with CLOT) as raw requests to a delay fake on `FakeClock()` (29 Oct 2026), then a raw Load with TN 326548, XID 4, MSNO 9 and a raw repeat: the repeat's body equals `sme_load_slot9.bin` once both have their BPIX value and BMP payload replaced by placeholders; `violations == ["write not whitelisted CLOT"]` |
@@ -1848,4 +1866,9 @@ test_hx_time covers SNTP against `FakeSntp`, and test_hx_send covers `compare` a
     and the poller can prove a request ends before another PC may judge their lock or `poll.json`
     stale (architecture §7.3 rule 8). `query`, `read` and `command` take one too, and with a deadline
     the wait for this PC's gate is bounded by it (§9 item 2), so the poller never sits behind a local
-    lock holder past its bound and then sends late.
+    lock holder past its bound and then sends late. `read_twice` and `check_uid` take one as well, and
+    after the gate it is checked before every exchange (the write after the warm-up, a read's retry), so
+    a lock holder that passes its lease end as the deadline sends nothing once the lease is over, even
+    after its PC froze mid-call (send.md §10.5).
+32. **SME nesting is capped at `MAX_SME_DEPTH` (16)**, four times what a real reply uses, so a broken
+    or hostile reply is `WebReadFailed` (nonsense) like any other, never a `RecursionError`.

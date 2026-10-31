@@ -126,6 +126,53 @@ def wait_until(condition, timeout_s=0.5):
     return condition()
 
 
+QUICK = dataclasses.replace(TIMINGS, share_timeout_s=0.1)    # only the real-time share wait is short
+
+
+def stuck_write(test, view, suffix, *, after_temp):
+    """view's next whole-file write to a path ending in suffix hangs like an SMB call on a lost connection
+    (before anything reaches the share, or once its temp file is written: after_temp), until the returned
+    event go is set; then the OS call carries on. done is set once it has returned or raised."""
+    go, done = threading.Event(), threading.Event()
+    test.addCleanup(go.set)
+    real_write, real_open = view.write_whole, view._do_open_temp
+    first, stalled = [], []
+
+    class Stalling:
+        """The temp file, written: it hangs at the flush that starts the commit."""
+        def __init__(self, f):
+            self.f = f
+
+        def flush(self):
+            go.wait(5.0)
+            self.f.flush()
+
+        def __getattr__(self, name):
+            return getattr(self.f, name)
+
+    def open_temp(path):
+        handle = real_open(path)
+        if first == [path] and not stalled:
+            stalled.append(path)
+            handle.f = Stalling(handle.f)
+        return handle
+
+    def write_whole(path, data):
+        if not path.endswith(suffix) or first:
+            return real_write(path, data)
+        first.append(path)
+        try:
+            if not after_temp:
+                go.wait(5.0)
+            return real_write(path, data)
+        finally:
+            done.set()
+    view.write_whole = write_whole
+    if after_temp:
+        view._do_open_temp = open_temp
+    return go, done
+
+
 class ShareCase(unittest.TestCase):
     """A temp share (with the folder script's folders), a FakeClock and a FlakyFileOps."""
 
@@ -1152,6 +1199,102 @@ class TimeoutTests(ShareCase):
         e.winerror = 87                                         # ERROR_INVALID_PARAMETER: still a folder error
         self.assertFalse(hx_share._network_error(e))
 
+    def test_an_abandoned_write_never_lands(self):
+        # §9.1 item 3: a write the caller gave up on (ShareUnavailable) never commits, wherever it hung
+        # before the replace. Before, the hx-io thread finished it later, over a newer writer's file
+        for after_temp in (False, True):
+            with self.subTest(after_temp=after_temp):
+                view = self.fs.view()
+                a = self.store(view=view, timings=QUICK)
+                b = self.store(identity("akim", "FLOOR02"))
+                rel = f"status/lines/{LINE_ID}.json"
+                a.write_bytes(rel, b"first")
+                go, done = stuck_write(self, view, f"{LINE_ID}.json", after_temp=after_temp)
+                with self.assertRaises(ShareUnavailable):
+                    a.write_bytes(rel, b"from A, given up")
+                b.write_bytes(rel, b"from B")
+                go.set()
+                self.assertTrue(done.wait(5.0))
+                self.assertEqual(self.read(rel), b"from B")
+                self.assertEqual([n for n in self.listing("status/lines") if n.endswith(".tmp")], [])
+        # Called directly, not through the pool, FileOps writes as before
+        ops = FileOps()
+        ops.write_whole(self.path(rel), b"direct")
+        self.assertEqual(self.read(rel), b"direct")
+
+    def test_abandoned_status_writes_never_replace_a_newer_owners(self):
+        # poll.json and expected.json: a stuck write of the superseded owner A must not land over B's
+        # newer file (a red drift or a failure record shown as A's old green)
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01"), view=view, timings=QUICK)
+        b = self.store(identity("akim", "FLOOR02"))
+        a.write_poll(self.poll(100))
+        go, done = stuck_write(self, view, f"{MACHINE_ID}.poll.json", after_temp=False)
+        with self.assertRaises(ShareUnavailable):
+            a.write_poll(self.poll(101))
+        for counter in (101, 102):
+            b.write_poll(self.poll(counter, problem="drift"))
+        go.set()
+        self.assertTrue(done.wait(5.0))
+        p = self.store(identity("observer", "OFFICE01")).read_poll(MACHINE_ID)
+        self.assertEqual((p.counter, p.poller, p.problem), (102, b.identity.key, "drift"))
+
+        view2 = self.fs.view()
+        a2 = self.store(identity("jsmith", "FLOOR01"), view=view2, timings=QUICK)
+        a2.write_expected(ExpectedState(machine_id=MACHINE_ID, mode="switch_pending", send_id="sd_aaaaaaaaaa"))
+        go, done = stuck_write(self, view2, f"{MACHINE_ID}.expected.json", after_temp=True)
+        with self.assertRaises(ShareUnavailable):
+            a2.write_expected(ExpectedState(machine_id=MACHINE_ID, mode="running", send_id="sd_aaaaaaaaaa"))
+        b.write_expected(ExpectedState(machine_id=MACHINE_ID, mode="switch_pending", send_id="sd_bbbbbbbbbb",
+                                       result="red"))
+        go.set()
+        self.assertTrue(done.wait(5.0))
+        e = self.store(identity("observer", "OFFICE01")).read_expected(MACHINE_ID)
+        self.assertEqual((e.send_id, e.result), ("sd_bbbbbbbbbb", "red"))
+
+    def test_an_abandoned_lock_create_takes_its_file_back(self):
+        # §8.1: a create the caller gave up on leaves no file. acquire() said "local_only" (no lock on the
+        # share), but before, the hx-io thread finished the create later: a lock no one knew it held, which
+        # kept every other PC's Send out and their pollers aside until it went stale
+        lock_path = self.path(f"status/locks/{PRINTER_ID}.lock")
+        for late in (False, True):
+            with self.subTest(late=late):
+                view = self.fs.view()
+                a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view, timings=QUICK)
+                b = self.store(identity("akim", "FLOOR02", sender=True))
+                if late:
+                    view.undo_create_s = 0.0        # it hung past lock_stale_s / 2: another PC may have it now
+                go, stuck = threading.Event(), []
+                self.addCleanup(go.set)
+                real_fsync = os.fsync
+
+                def fsync(fd):
+                    if threading.current_thread().name.startswith("hx-io") and not stuck:
+                        stuck.append(threading.current_thread())   # made and written; the flush hangs
+                        go.wait(5.0)
+                    return real_fsync(fd)
+                held = a.lock(PRINTER_ID, purpose="send", run_id="sd_8a7b6c5d4e", line_id=LINE_ID,
+                              machine_id=MACHINE_ID)
+                with mock.patch.object(os, "fsync", fsync):
+                    self.assertEqual(held.acquire(), "local_only")
+                    go.set()
+                    stuck[0].join(5.0)
+                self.assertFalse(stuck[0].is_alive())
+                held.release()                      # local_only: the file isn't touched
+                self.assertEqual(os.path.exists(lock_path), late)
+                if late:
+                    # Left to go stale (liveness only), never removed once a takeover may have happened
+                    with self.assertRaises(LockHeld):
+                        b.lock(PRINTER_ID, purpose="send", run_id="sd_bbbbbbbbbb").acquire()
+                    os.remove(lock_path)
+                    continue
+                taker = b.lock(PRINTER_ID, purpose="send", run_id="sd_bbbbbbbbbb")
+                self.assertEqual(taker.acquire(), "held")
+                taker.release()
+        # Called directly, not through the pool, FileOps creates as before
+        self.assertTrue(FileOps().create_exclusive(lock_path, b"direct"))
+        self.assertEqual(self.read(f"status/locks/{PRINTER_ID}.lock"), b"direct")
+
     def test_never_more_than_pool_max_threads(self):
         self.fs.hang = True
         timings = TIMINGS.scaled(0.06)
@@ -1728,6 +1871,204 @@ class LockTests(ShareCase):
             held.check()
         taker.check(budget_s=7.5)
 
+    # A PC that freezes (sleep, hibernate, a paused VM) inside a share call. The freeze is the FakeClock
+    # moving on while other PCs work, from inside the frozen PC's own FileOps call (storage.md §11.3)
+
+    def frozen_inside(self, view, op, during, *, landed, path=None):
+        """The next `op` of view on the lock file (or path) freezes its PC: during() runs before the call
+        reaches the share, or after it landed (landed=True). Returns a list that holds True once it ran."""
+        path = os.path.normpath(path or self.path(f"status/locks/{PRINTER_ID}.lock"))
+        real, fired = getattr(view, op), []
+
+        def frozen(p, *args):
+            if os.path.normpath(p) != path or fired:
+                return real(p, *args)
+            fired.append(True)
+            if landed:
+                result = real(p, *args)
+                during()
+                return result
+            during()
+            return real(p, *args)
+        setattr(view, op, frozen)
+        return fired
+
+    def passes(self, lk, budget_s=7.5):
+        """Would this holder send a command now (send.md's guard: check with the call's worst case)?"""
+        try:
+            lk.check(budget_s=budget_s)
+            return True
+        except LockLost:
+            return False
+
+    def test_a_refresh_that_froze_proves_nothing(self):
+        # last_ok is the time before the write, and a write that came back lock_stale_s / 2 or more after
+        # it started makes the lock lost. Before, last_ok was taken after the write: a PC frozen 65 s in
+        # it woke with a fresh lease while B, which had seen no change for 60 s, held the printer too
+        for landed in (False, True):
+            with self.subTest(landed=landed):
+                for name in os.listdir(self.path("status/locks")):
+                    os.remove(self.path(f"status/locks/{name}"))
+                view = self.fs.view()
+                a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+                b = self.store(identity("akim", "FLOOR02", sender=True))
+                held, taker = self.lock(a), self.lock(b)
+                held.acquire()
+                self.clock.advance(5)
+                self.assertTrue(held._keep_once())
+                b.read_lock(PRINTER_ID)
+                self.clock.advance(5)
+
+                def b_takes_over():
+                    self.watch_until_stale(b, 65)
+                    self.assertEqual(taker.acquire(), "held")
+                fired = self.frozen_inside(view, "write_whole", b_takes_over, landed=landed)
+                self.assertFalse(held._keep_once())
+                self.assertEqual((fired, held.state), ([True], "lost"))
+                self.assertFalse(self.passes(held))
+                writes = len(view.calls)
+                self.clock.advance(5)
+                self.assertFalse(held._keep_once())                 # and it never writes again
+                self.assertEqual(view.calls[writes:], [])
+                # A write that landed after the takeover put A's dead token over B's file: B stops at its
+                # next refresh too (both stop, the named residual of §11.3). One that landed first: B keeps
+                self.assertEqual(taker._keep_once(), landed)
+                self.assertFalse(self.passes(held) and self.passes(taker))
+                held.release()
+                taker.release()
+
+    def test_a_refresh_that_froze_with_a_poller_polling_past_it(self):
+        # No taker: a poller PC saw the counter unchanged for 60 s and polls past the lock (§11.6 rule 3).
+        # The woken holder must not carry on sending with no new handshake
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+        held = self.lock(a)
+        held.acquire()
+        self.clock.advance(5)
+        self.frozen_inside(view, "write_whole", lambda: self.watch_until_stale(self.b, 65), landed=False)
+        self.assertFalse(held._keep_once())
+        self.assertGreaterEqual(self.b.lock_age(PRINTER_ID), TIMINGS.lock_stale_s)
+        self.assertFalse(self.passes(held))
+
+    def test_a_slow_refresh_keeps_its_start_as_last_ok(self):
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+        held = self.lock(a)
+        held.acquire()
+        self.clock.advance(5)
+        started = self.clock.monotonic()
+        self.frozen_inside(view, "write_whole", lambda: self.clock.advance(4.9), landed=True)
+        self.assertTrue(held._keep_once())
+        self.assertEqual(held._last_ok, started)            # not 4.9 s later
+
+    def test_a_pc_frozen_right_after_its_create_landed(self):
+        # §11.2 step 4 and §11.4 step 5: last_ok is the time just before the create that made the file,
+        # not after it returned, nor after the takeover's remove and log
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+        held, taker = self.lock(a), self.lock(self.b)
+
+        def b_takes_over():
+            self.watch_until_stale(self.b, 65)
+            self.assertEqual(taker.acquire(), "held")
+        self.frozen_inside(view, "create_exclusive", b_takes_over, landed=True)
+        self.assertEqual(held.acquire(), "held")
+        self.assertEqual(self.lock_file()["token"], taker.token)
+        self.assertFalse(self.passes(held))
+        self.assertTrue(self.passes(taker))
+        held.release()                                          # lost: B's file is left alone
+        self.assertEqual(self.lock_file()["token"], taker.token)
+
+    def test_a_pc_frozen_in_its_takeover_log(self):
+        c = self.store(identity("bwong", "FLOOR03", sender=True))
+        self.lock(self.a).acquire()
+        self.watch_until_stale(self.b, 65)
+        b_lock, c_lock = self.lock(self.b), self.lock(c)
+
+        def c_takes_over():
+            self.watch_until_stale(c, 65)
+            self.assertEqual(c_lock.acquire(), "held")
+        real_put = self.b.put_log_bytes
+
+        def put_log_bytes(kind, name, raw):
+            if c_lock.state == "unheld":
+                c_takes_over()                                  # B froze 65 s in its lock_taken_over entry
+            return real_put(kind, name, raw)
+        with mock.patch.object(self.b, "put_log_bytes", put_log_bytes):
+            self.assertEqual(b_lock.acquire(), "held")
+        self.assertEqual(self.lock_file()["token"], c_lock.token)
+        self.assertFalse(self.passes(b_lock) and self.passes(c_lock))
+        self.assertFalse(self.passes(b_lock))
+
+    def test_a_slow_takeover_log_keeps_the_create_time(self):
+        self.lock(self.a).acquire()
+        self.watch_until_stale(self.b, 65)
+        taker = self.lock(self.b)
+        created = []
+        real_create, real_put = self.b.create_once, self.b.put_log_bytes
+
+        def create_once(rel, data):
+            if rel == f"status/locks/{PRINTER_ID}.lock":
+                created.append(self.clock.monotonic())
+            return real_create(rel, data)
+
+        def put_log_bytes(kind, name, raw):
+            self.clock.advance(4.9)                             # a slow share, an awake PC
+            return real_put(kind, name, raw)
+        with mock.patch.object(self.b, "create_once", create_once), \
+                mock.patch.object(self.b, "put_log_bytes", put_log_bytes):
+            self.assertEqual(taker.acquire(), "held")
+        self.assertEqual(taker._last_ok, created[-1])       # not after the 4.9 s log append
+
+    def test_an_abandoned_refresh_never_replaces_a_takeover(self):
+        # A's refresh hangs on the share and is given up (ShareUnavailable); A goes lost by its own lease,
+        # B takes over 60 s later, then A's stuck OS call finishes. It must not put A's dead token over
+        # B's file: before, B was evicted and the printer looked locked, unpolled, for 60 s more
+        for after_temp in (False, True):
+            with self.subTest(after_temp=after_temp):
+                for name in os.listdir(self.path("status/locks")):
+                    os.remove(self.path(f"status/locks/{name}"))
+                view = self.fs.view()
+                a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view, timings=QUICK)
+                b = self.store(identity("akim", "FLOOR02", sender=True))
+                held = self.lock(a)
+                held.acquire()
+                b.read_lock(PRINTER_ID)
+                go, done = stuck_write(self, view, f"{PRINTER_ID}.lock", after_temp=after_temp)
+                self.clock.advance(5)
+                self.assertTrue(held._keep_once())              # given up: under 30 s, still held
+                self.watch_until_stale(b, 60)
+                self.assertFalse(self.passes(held, 0))
+                taker = self.lock(b)
+                self.assertEqual(taker.acquire(), "held")
+                go.set()
+                self.assertTrue(done.wait(5.0))
+                self.assertEqual(self.lock_file()["token"], taker.token)
+                self.clock.advance(5)
+                self.assertTrue(taker._keep_once())
+                taker.release()
+                held.release()
+
+    def test_lease_end(self):
+        view = self.fs.view()
+        st = self.store(identity(sender=True), view=view)
+        lk = self.lock(st)
+        self.assertIsNone(lk.lease_end())                        # unheld
+        lk.acquire()
+        self.assertEqual(lk.lease_end(), self.clock.monotonic() + TIMINGS.lock_stale_s / 2)
+        self.clock.advance(5)
+        self.assertTrue(lk._keep_once())
+        self.assertEqual(lk.lease_end(), self.clock.monotonic() + TIMINGS.lock_stale_s / 2)
+        self.clock.advance(31)
+        with self.assertRaises(LockLost):
+            lk.check()
+        with self.assertRaises(LockLost):
+            lk.lease_end()
+        local = self.lock(self.store(identity("akim", "FLOOR02", sender=True), view=self.fs.view(down=True)),
+                          PRINTER2_ID)
+        self.assertEqual(local.acquire(), "local_only")
+        self.assertIsNone(local.lease_end())
+
     def test_check_with_a_budget(self):
         view = self.fs.view()
         st = self.store(identity(sender=True), view=view)
@@ -1796,6 +2137,132 @@ class LockTests(ShareCase):
         view.down = False
         st.probe_now()                                  # the next good operation removes it
         self.assertTrue(wait_until(lambda: not os.path.exists(self.path(f"status/locks/{PRINTER_ID}.lock"))))
+
+    def test_a_pending_release_never_removes_a_new_holders_lock(self):
+        # §11.5 step 2: a removal that failed is retried only before last_ok + lock_stale_s / 2. Before, it
+        # was retried for 10 minutes by read-then-remove, so a takeover between the read and the remove
+        # (the share back just as B took the stale file over) lost B's new lock, and pollers polled with B
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+        held = self.lock(a)
+        held.acquire()
+        view.down = True
+        held.release()                                          # the removal is left pending
+        view.down = False
+        self.watch_until_stale(self.b, 65)
+        taker = self.lock(self.b)
+        real_read = a.read_bytes
+
+        def read_then_takeover(rel):
+            raw = real_read(rel)
+            if rel == a._lock_rel(PRINTER_ID) and taker.state == "unheld":
+                self.assertEqual(taker.acquire(), "held")       # between A's read and A's remove
+            return raw
+        with a._lock:
+            a.available = True                                  # A's probe found the share back
+        with mock.patch.object(a, "read_bytes", read_then_takeover):
+            a._retry_releases()                                 # what _reached() runs then
+        if taker.state == "unheld":
+            self.assertEqual(taker.acquire(), "held")
+        self.assertEqual(self.lock_file()["token"], taker.token)
+        self.assertEqual(self.store(identity("bwong", "FLOOR03")).read_lock(PRINTER_ID).token, taker.token)
+        self.assertEqual(a._pending_releases, {})
+        self.assertTrue(taker._keep_once())
+
+    def test_a_pending_release_ends_with_its_lease(self):
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+        held = self.lock(a)
+        held.acquire()
+        token = held.token
+        self.clock.advance(20)
+        view.down = True
+        held.release()                                          # pending until last_ok + 30 s
+        view.down = False
+        self.clock.advance(11)
+        with a._lock:
+            a.available = True
+        calls = len(view.calls)
+        a._retry_releases()
+        self.assertEqual([op for op, _ in view.calls[calls:]], [])      # dropped, not retried
+        self.assertEqual(a._pending_releases, {})
+        # Forgotten: the file is an ordinary lock now, here too, taken over once stale (§11.4)
+        self.assertEqual(a.read_lock(PRINTER_ID).token, token)
+        self.watch_until_stale(a, 60)
+        self.assertEqual(self.lock(a).acquire(), "held")
+
+    def test_a_pending_release_never_removes_this_pcs_new_lock(self):
+        # §11.5: the retry (run by _reached() on whatever thread just had a good share call) read the
+        # released file and was about to remove it, while a new Send on another thread removed that file
+        # itself and made its own lock. The retry's remove then deleted the new lock: other PCs saw no lock
+        # and polled while the Send sent. Now the retry and acquire() take turns on the printer
+        view = self.fs.view()
+        a = self.store(identity("jsmith", "FLOOR01", sender=True), view=view)
+        first = self.lock(a)
+        first.acquire()
+        view.down = True
+        first.release()                                         # the removal is left pending
+        view.down = False
+        with a._lock:
+            a.available = True                                  # A's probe found the share back
+        self.assertTrue(a._pending_releases)
+        h_read, s_waits = threading.Event(), threading.Event()
+        real_remove, real_mutex = a.remove, getattr(a, "_printer_mutex", None)
+
+        def remove(rel):
+            if threading.current_thread().name == "H":
+                h_read.set()                                    # H read the old token and removes it now
+                s_waits.wait(5.0)
+            return real_remove(rel)
+
+        def printer_mutex(printer_id):
+            if threading.current_thread().name == "S":
+                s_waits.set()                                   # S is about to wait for H to finish
+            return real_mutex(printer_id)
+        a.remove = remove
+        if real_mutex is not None:
+            a._printer_mutex = printer_mutex
+        second, result = self.lock(a), []
+
+        def send():
+            result.append(second.acquire())
+            s_waits.set()
+        h = threading.Thread(target=a._retry_releases, name="H")
+        h.start()
+        self.assertTrue(h_read.wait(5.0))
+        s = threading.Thread(target=send, name="S")
+        s.start()
+        h.join(5.0)
+        s.join(5.0)
+        self.assertEqual(result, ["held"])
+        self.assertTrue(os.path.exists(self.path(f"status/locks/{PRINTER_ID}.lock")), "the retry removed the new lock")
+        self.assertEqual(self.lock_file()["token"], second.token)
+        self.assertEqual(self.b.read_lock(PRINTER_ID).token, second.token)
+        self.assertTrue(second._keep_once())
+        second.release()
+        self.assertFalse(os.path.exists(self.path(f"status/locks/{PRINTER_ID}.lock")))
+
+    def test_a_stalled_release_leaves_a_takers_file_alone(self):
+        # The holder's PC froze 65 s: its release must not read-then-remove a file another PC may take
+        # over between the two calls. It is lost instead, and leaves the file to go stale
+        held = self.lock(self.a)
+        held.acquire()
+        self.watch_until_stale(self.b, 65)
+        taker = self.lock(self.b)
+        real_read = self.a.read_bytes
+
+        def read_then_takeover(rel):
+            raw = real_read(rel)
+            if rel == self.a._lock_rel(PRINTER_ID) and taker.state == "unheld":
+                self.assertEqual(taker.acquire(), "held")
+            return raw
+        with mock.patch.object(self.a, "read_bytes", read_then_takeover):
+            held.release()
+        if taker.state == "unheld":
+            self.assertEqual(taker.acquire(), "held")
+        self.assertEqual((held.state, self.a.local_locks), ("unheld", {}))
+        self.assertEqual(self.lock_file()["token"], taker.token)
+        self.assertTrue(taker._keep_once())
 
     def test_a_released_token_is_no_lock_here(self):
         lk = self.lock(self.a)
@@ -1873,6 +2340,10 @@ class HeartbeatTests(ShareCase):
         self.beat(st, polling=[])
         d = self.hb_file(st)
         self.assertEqual((d["counter"], d["written_at"], d["polling"]), (2, T0 + 5, []))
+        self.assertEqual(d["declined"], [])
+        self.beat(st, declined=[PRINTER_ID])
+        self.assertEqual(self.hb_file(st)["declined"], [PRINTER_ID])
+        self.assertEqual(st.live_heartbeats()[0].declined, [PRINTER_ID])
 
     def test_the_live_set(self):
         a, b = self.store(identity("jsmith", "FLOOR01")), self.store(identity("akim", "FLOOR02"))
@@ -1983,6 +2454,18 @@ class AssignmentTests(unittest.TestCase):
         a, b = hb("FLOOR01", "jsmith", 2), hb("FLOOR01", "akim", 9)
         ranks = assign(["pr_0000000001"], [a, b, hb("FLOOR03")])["pr_0000000001"]
         self.assertEqual(ranks, ["FLOOR03_EXAMPLE_jsmith_1", b.key, a.key])    # side by side, by key
+
+    def test_a_declined_printer_skips_that_pc(self):
+        # states.md §6.2 item 3.0: a PC whose worker for a printer is stuck declines it in its heartbeat, so
+        # every PC ranks the next one first for that printer only
+        a, b = hb("FLOOR01"), hb("FLOOR03")
+        both = assign(["pr_0000000001", "pr_0000000002"], [a, b])
+        first = both["pr_0000000001"][0]
+        declining = dataclasses.replace(a if first == a.key else b, declined=["pr_0000000001"])
+        other = b if first == a.key else a
+        ranks = assign(["pr_0000000001", "pr_0000000002"], [declining, other])
+        self.assertEqual(ranks["pr_0000000001"], [other.key])
+        self.assertEqual(ranks["pr_0000000002"], both["pr_0000000002"])
 
     def test_who_is_left_out(self):
         self.assertEqual(assign(["pr_0000000001"], [hb("FLOOR01", can_poll=False)]), {"pr_0000000001": []})

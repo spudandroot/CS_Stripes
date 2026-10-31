@@ -830,6 +830,7 @@ class HeartbeatInfo:             # status\pollers\<key>.json
     polling: list[str] = []      # printer ids this PC is polling now
     monitor_open: bool = False
     floor_board: bool = False
+    declined: list[str] = []     # printer ids this PC won't poll for now: a stuck worker (states.md §6.2 item 3.0)
 
 @dataclass(kw_only=True)
 class RunningMessage:
@@ -908,6 +909,9 @@ class PollStatus:                # status\machines\<machine_id>.poll.json; one w
     running_unchecked: bool = False          # committed fact: the running message can't be read (states.md §6.5)
     dst: dict = {}               # the daylight-saving clock set of the current change (states.md §6.11)
     standalone: bool = False     # True only in Poller.local_statuses() in standalone mode
+    judged: int | None = None    # +1 only by a write that judged a reading, or a paused write; None: older file
+    judged_at: float = 0.0       # wall time of that write (display and first sight only; states.md §6.14)
+    printing_unchecked: bool = False   # committed fact: PRIN unread for PRIN_UNREAD_LIMIT cycles (states.md §6.6)
 
 @dataclass(kw_only=True)
 class FailureInfo:
@@ -1357,15 +1361,16 @@ class PrinterClient:
     def read(self, tag: str, *, deadline: float | None = None) -> int | str | None: ...
         # query + QUERY_SPECS check; a failed check is thrown away and asked once more; then BadReply;
         # deadline as query
-    def read_twice(self, tag: str) -> int | str | None: ...
-        # two reads second_reading_s apart that must agree (BadReply otherwise)
+    def read_twice(self, tag: str, *, deadline: float | None = None) -> int | str | None: ...
+        # two reads second_reading_s apart that must agree (BadReply otherwise); deadline as query, for each read
     def command(self, cmd: Command, *, deadline: float | None = None) -> None: ...
         # deadline as query; one write, never repeated.
         # Raises ForbiddenCommand unless cmd.tag in ALLOWED_WRITE_TAGS.
         # After idle_warmup_s of quiet, sends a warm-up read (HXUI, checked) first. "0" -> returns;
         # another code -> CommandRefused; no reply -> NoReply (the write may or may not have happened)
-    def check_uid(self) -> None: ...                # raises WrongPrinter
-    def login(self) -> None: ...                    # web login; raises AuthFailed
+    def check_uid(self, *, deadline: float | None = None) -> None: ...   # raises WrongPrinter; deadline as read_twice
+    def login(self, *, deadline: float | None = None) -> None: ...
+        # web login; raises AuthFailed. deadline as query: the gate wait never passes it (PrinterBusy)
     def load_slot(self, slot: int, *, deadline: float | None = None) -> MessageDesign: ...
         # slot 0..10 (0 = printing now). Logs in when needed, Load then sme_repeat until the reply
         # carries this request's TN and XID; raises WebReadFailed after web_repeat_max or web_repeat_window_s.
@@ -1525,19 +1530,24 @@ class PrinterLock:
     def check(self, budget_s: float = 0.0) -> None: ...
         # before every printer request: raises LockLost when the lock is lost, or when the next call
         # (lasting up to budget_s) could still run when another PC may judge the lock stale (storage.md §11.3)
-    def release(self) -> None: ...         # idempotent; stops the keeper, removes the file and the local entry
+    def lease_end(self) -> float | None: ...
+        # last_ok + lock_stale_s / 2, the deadline of every printer call under this lock; None when
+        # local_only or unheld; raises LockLost when lost (storage.md §11.3)
+    def release(self) -> None: ...
+        # idempotent; stops the keeper, removes the file while the lease still runs, and the local entry
     def __enter__(self) -> "PrinterLock": ...
     def __exit__(self, *exc) -> None: ...
 
 class Heartbeat:
     key: str
     def beat(self, *, can_poll: bool, last_printer_reach: float | None, polling: list[str],
-             monitor_open: bool, floor_board: bool) -> None: ...
+             monitor_open: bool, floor_board: bool, declined: tuple[str, ...] = ()) -> None: ...
     def remove(self) -> None: ...          # on a clean exit
 
 def assign(printer_ids: list[str], heartbeats: list[HeartbeatInfo]) -> dict[str, list[str]]
     # pure: printer_id -> heartbeat keys of pollers able to poll, in rank order (rank 0 polls).
-    # Every PC computes the same answer from the same inputs.
+    # A heartbeat that declines a printer is left out for it. Every PC computes the same answer
+    # from the same inputs.
 
 class LocalStore:
     """This user's and this PC's v2 folders: settings, local copy, previews, send-log queue."""
@@ -1907,7 +1917,10 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
    heartbeats (counter moved within `stale_s`, same `FORMAT`, `can_poll`) and the active printers.
    Rank 0 polls. A PC at rank 1 starts polling a printer only when that printer's `poll.json` counter
    has been unchanged for `takeover_s[0]` (15 s) on its own clock; rank 2 after `takeover_s[1]` (20 s);
-   rank n > 2 after 20 + 5 × (n − 2) s. A poller re-checks its rank before every cycle.
+   rank n > 2 after 20 + 5 × (n − 2) s. A poller re-checks its rank before every cycle. A PC is left
+   out of `assign()` for the printers its heartbeat lists in `declined`, as `can_poll` leaves out a whole
+   PC: its own worker for that printer is stuck (states.md §6.2 item 3.0), so the next PC polls it and
+   nobody hands it back.
 2. **Handover.** A poller that is polling a printer but is no longer rank 0, while rank 0 is live,
    finishes its current request, writes `yielded_to = <rank 0 key>` and stops. Rank 0 starts only when
    `poll.json` names itself as writer, names it in `yielded_to`, is missing, or has been stale for
@@ -1917,7 +1930,12 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
    (storage.md §12.6 rule 3, states.md §6.3 step 2).
    The invariant behind rules 1 and 2: **no PC starts polling a printer whose `poll.json` is fresh and
    written by another PC, unless that writer has yielded to it.** So two pollers never overlap, even
-   while PCs briefly disagree about who is live.
+   while PCs briefly disagree about who is live. A worker whose last good `poll.json` write is
+   `stale_s / 2` or more old (its PC slept, or it was stuck) reads `poll.json` before any write: it never
+   writes over a newer one by another PC, and it adopts a newer one yielded to it. A `poll.json` whose
+   counter isn't above the poller's own last write (equal when it lands before the new poller's second
+   write), written long ago by a PC that isn't live, is a late write by a superseded owner and is
+   ignored (states.md §6.4 step 7.2). A write that took `stale_s / 2` or more stops share mode.
 3. **Printer lock.** Sends, test prints, calibration, Stop, Resume and Set clocks take the printer's
    lock (`O_CREAT | O_EXCL` on the share). The holder bumps its counter every `lock_refresh_s`.
    Another PC treats a lock as abandoned only after its counter has been unchanged for `lock_stale_s`
@@ -1945,11 +1963,46 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
    turn a result red (a false alarm), never pass a wrong message.
 8. **Holding a lock is bounded in time.** A holder never starts a printer call that could still be
    running when another PC may judge its lock stale: `PrinterLock.check(budget_s)` before every call,
-   with the call's worst case from `hx_protocol.worst_case_s` (storage.md §11.3, protocol.md §8.3).
-   The same applies to the poller and its own `poll.json`: it never starts a request that could still
+   with the call's worst case from `hx_protocol.worst_case_s` (storage.md §11.3, protocol.md §8.3), and
+   every call made under the lock carries the lock's lease end (`PrinterLock.lease_end()`: last good
+   refresh + `lock_stale_s / 2`) as its deadline (send.md §10.5). The client checks that deadline after
+   the gate and before every exchange, so a call that passed its check and then waited (this PC's gate,
+   a frozen PC) is refused, nothing sent. The lease is counted from the time taken just before the share
+   write that made or refreshed the lock file, never from when it returned, and a write that took
+   `lock_stale_s / 2` or more makes the lock lost (storage.md §11.2, §11.3); a share write the caller gave
+   up on never commits, and a lock create it gave up on removes its file while that is still safe
+   (storage.md §8.1); and a release only removes the file while the lease still runs, and never this
+   PC's own new lock on the printer (storage.md §11.5). The same applies to the poller and its own `poll.json`: it never starts a request that could still
    be running `stale_s / 2 + http_timeout_s` (9.5 s) after the start of its last successful `poll.json`
-   write (states.md §6.4 step 7), and every poller request carries that time as its deadline, so it
-   never waits for this PC's gate past it either (protocol.md §9 item 2).
+   write (states.md §6.4 step 7), and every poller request, a second reading's login included, carries
+   that time as its deadline, so it never waits for this PC's gate past it either (protocol.md §9
+   item 2).
+
+Residual risks of rule 8 and the invariant: a printer can't refuse an old owner, so a PC that freezes
+in the microseconds after its last deadline check can still send one late request (at most one mixed-up
+reply, which TN/XID, the per-tag checks and the two-reading rule turn into a false alarm, never a false
+green); a share write can land late (SMB has no compare-and-swap; the new poller ignores it and rewrites
+`poll.json` at its next tick, so a board shows the old one for at most one tick); and a stuck thread
+can't be killed: it keeps this PC's gate for that printer, so this PC's own Sends to it get
+`PrinterBusy` (fails safe).
+
+Named residual risks of the printer lock (storage.md §11.8 lists all six; they need the owner's
+sign-off):
+
+- **One late request after a freeze.** A PC that freezes in the instant between the client's last
+  deadline check and the request leaving sends that one request when it wakes, maybe after another PC
+  took the printer over. The freeze must last about 25-30 s. Bound: one exchange per frozen thread, then
+  `LockLost`; the new holder's read-backs and the poller's drift rule turn it red (a message switch in
+  about 7-12 s, a same-name content edit at the slow Load, about 60-65 s).
+- **Platform assumption: `time.monotonic()` counts sleep.** On Windows, Python 3.12's monotonic clock is
+  `GetTickCount64`, which counts sleep and hibernation, so a woken holder fails its check. A VM pause the
+  guest's clock doesn't see would let it pass until its keeper's next read (5 s plus one read of
+  overlap). Check it on the test PC (`time.get_clock_info("monotonic")`, a sleep and resume with a lock
+  held).
+- **Plant rule: floor PCs never sleep or hibernate while Stripes runs** (power policy), and aren't VMs
+  that can be paused. The first two items depend on it.
+- **A share call already issued can still land** (a replace, rename or remove under way when the caller
+  gave up): for the lock, liveness only (the new holder stops, the printer looks locked for 60 s).
 
 Sequence of a Send's first request to a printer:
 
@@ -1964,7 +2017,11 @@ Sequence of a Send's first request to a printer:
 
 1. Every staleness rule (15 s status and heartbeats, 15/20 s takeover, 30 s NOT MONITORED, 60 s lock)
    is judged by watching a counter change on the reader's own `clock.monotonic()` (`CounterWatch`).
-   Other PCs' timestamps are never compared with this PC's clock.
+   Other PCs' timestamps are never compared with this PC's clock (except the long-gap and first-sight
+   rules for `checking`, states.md §6.3 step 1 and §7 item 6). NOT MONITORED and "checked N s ago" use
+   `poll.json`'s `judged` counter, which only judgements and paused writes move (states.md §6.14), so a
+   takeover's bookkeeping never makes an old judgement look fresh; an older file without it uses its
+   counter. Takeover, handover and the sender handshake use the `poll.json` counter.
 2. A counter seen for the first time is fresh (age 0). So a PC that starts while a holder has crashed
    waits the full 60 s before taking over its lock.
 3. Wall-clock times (`clock.time()`, `TimeReading`) are for display, logs and the printers' clocks only.
@@ -1973,7 +2030,13 @@ Sequence of a Send's first request to a printer:
 
 1. A `CancelToken` is checked between steps and before each request, and is passed to every
    `clock.sleep`. No thread is ever killed; blocking calls are bounded (printer requests by
-   `http_timeout_s`, share operations by `share_timeout_s`, SNTP by its timeout).
+   `http_timeout_s`, share operations by `share_timeout_s`, SNTP by its timeout), except local-disk I/O
+   and a bug. So the poller's coordinator watches each printer it ranks first for: a worker with no good
+   `poll.json` write for `not_monitored_s` (30 s) is fenced (it never sends or writes again), logged as
+   `internal_error` `worker_stuck`, and its printer declined in the heartbeat (§7.3 rule 1) until the
+   thread has ended and the decline's time has passed: `lock_stale_s`, doubled for each fence in a row,
+   up to 15 minutes. A printer whose first worker after a decline fails again is declined again at once
+   (states.md §6.2 item 3.0).
 2. Send: cancel works only until the first printer write (the countdown). Then the UI removes Cancel
    and the pipeline ignores the token, because stopping halfway leaves the printer in an unknown state.
 3. Test print: cancel (Stop test) stops after the current request, then always runs the end procedure.
@@ -1986,6 +2049,8 @@ Sequence of a Send's first request to a printer:
 1. Expected failures are `HxError` subclasses (§5.2). Anything else is a bug: it is caught at the top
    of each worker thread, printed with its traceback, logged to `hx-events` as "internal error", and
    the machine it was working on becomes red at the current step. A worker thread never dies silently.
+   A poller worker that can't make progress (stuck in a call, or every `poll.json` write failing) is
+   noticed by the coordinator's watchdog and its printer handed to the next PC (§7.5 item 1).
 2. Non-UI code never shows text. It raises an `HxError` or returns a `Msg`; the UI calls
    `tr(msg.text, **msg.values)`. Logs store `msg.english()` and the `Msg` itself.
 3. Reads may be retried once automatically (`read_retry_s`) after `NoReply`, `PrinterBusy` or a
@@ -2172,7 +2237,16 @@ Changes in `stripes.py`:
    uses it; `App.config_folder` stays `configured_folder()`.
 4. `status_folder()`: `os.path.join(v2_root, "status", "deployment")` unless `STRIPES_STATUS`.
    `DeploymentWindow` lists `read_deployment()` of that folder plus today's
-   `<parent of ConfigPath>\status`, keeping the newest record per computer and user.
+   `<parent of ConfigPath>\status`, keeping the newest record per computer and user. `App.__init__`
+   builds `DeploymentLog(folder, old_folder=old_status_folder())`. `started()` decides, under the
+   lock, from the one read of this PC and user's record that its write uses. When there is no record
+   in the new folder yet, or only one with no `version` (the heartbeat or the config write made it
+   because the share wasn't there at the start), it reads their record in today's folder (same file
+   name), so the upgrade is logged as "Updated v1.4.0 -> v2.0.0" with `last_update`, and the new record
+   keeps `first_seen` and the events. Without this, every upgraded PC showed as a fresh install. A
+   record that can't be read (an `OSError` other than "no such file") isn't written at all, by any
+   write, so a share hiccup never logs a false update or loses the history. A damaged record starts
+   again without today's file. Today's folder is never written.
 5. Today's version reads none of the new places, so old and new copies can run side by side during
    rollout without seeing each other's files.
 
@@ -2321,3 +2395,7 @@ owner's yes before release; the README of this spec folder lists them with the O
 3. **A Send made while the share is down is recorded only by the PC that made it, in the same
    session** (send.md §14.1). If that PC restarts before the share comes back, the machine shows red
    `drift` until the next Send instead of amber.
+4. **Named residual risks of the printer lock** (§7.3 rule 8, storage.md §11.8), waiting for the
+   owner: a PC that freezes in the instant before a request leaves can send that one request late;
+   leases assume `time.monotonic()` counts sleep; and the plant rule that these PCs never sleep,
+   hibernate or run as VMs that can be paused (the root README's power settings).

@@ -139,7 +139,6 @@ _LOCAL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\.json$")
 _REF_KEYS = ("send_id", "run_id", "action_id", "record_id", "film_id", "machine_id", "printer_id", "line_id")
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_PENDING_RELEASE_S = 600.0     # a release whose removal failed is retried this long
 _RELEASED_KEEP = 200           # released tokens remembered, so this PC never mistakes one for a live lock
 _IDLE_WORKER_S = 10.0          # an idle hx-io thread exits after this (real seconds)
 _HANG_MAX_S = 30.0             # FlakyFileOps.hang gives up after this (real seconds)
@@ -482,12 +481,15 @@ def score(printer_id, computer):
 
 def assign(printer_ids, heartbeats):
     """printer_id -> keys of the live pollers able to poll, in rank order (rank 0 polls).
-    Every PC gets the same answer from the same inputs."""
+    Every PC gets the same answer from the same inputs. A PC is left out for the printers its heartbeat
+    lists in `declined` (its worker for that printer is stuck, states.md §6.2 item 3.0), as can_poll leaves
+    out a whole PC."""
     pollers = {}
     for hb in heartbeats:
         if hb.can_poll:
             pollers.setdefault(hb.key, hb)            # one entry per key
-    return {pid: [hb.key for hb in sorted(pollers.values(), key=lambda hb: (-score(pid, hb.computer), hb.key))]
+    return {pid: [hb.key for hb in sorted((hb for hb in pollers.values() if pid not in (hb.declined or ())),
+                                          key=lambda hb: (-score(pid, hb.computer), hb.key))]
             for pid in printer_ids}
 
 
@@ -560,22 +562,57 @@ class _TempFile:
         self.tmp = tmp
 
 
+def _network_cause(e, path):
+    """storage.md §8.2 note 9: on Windows, os.open, open(), their writes and every read and seek go through the
+    C runtime, whose OSError carries only an errno, so a lost server (winerror 53, 64, 1231, ...) reads as
+    ENOENT or EINVAL, a folder error. The server is then asked once more through CreateFileW
+    (hx_win.open_for_read), whose error has the winerror: that error when it is a network one, else None (the
+    first error stands)."""
+    if not hx_win.is_windows() or getattr(e, "winerror", None) is not None \
+            or isinstance(e, (FileExistsError, PermissionError)):
+        return None
+    try:
+        with hx_win.open_for_read(path):
+            pass
+    except OSError as again:
+        if getattr(again, "winerror", None) in NETWORK_WINERRORS:
+            return again
+    return None
+
+
+def _crt_call(path, fn, *args):
+    """fn(*args), a FileOps step that goes through the C runtime on Windows, with _network_cause."""
+    try:
+        return fn(*args)
+    except OSError as e:
+        cause = _network_cause(e, path)
+        if cause is None:
+            raise
+        raise cause from e
+
+
+def _end_offset(f):
+    f.seek(0, os.SEEK_END)
+    return f.tell()
+
+
 class FileOps:
     """The raw file operations ShareStore uses; replaced in tests to fake a slow or dead share.
-    Holds no state apart from tmp_tag (and the retry delays, which ShareStore scales with its
-    timings). Paths are absolute."""
+    Holds no state apart from tmp_tag (and the retry delays and undo_create_s, which ShareStore sets from
+    its timings). Paths are absolute."""
 
     tmp_tag: str = ""
     read_retry_s = READ_RETRY_S
     create_retry_s = READ_RETRY_S
     replace_retry_s = REPLACE_RETRY_S
+    undo_create_s = TIMINGS.lock_stale_s / 2
 
     def read_bytes(self, path):
         delays = list(self.read_retry_s)
         while True:
             try:
                 with hx_win.open_for_read(path) as f:
-                    return f.read()
+                    return _crt_call(path, f.read)      # CreateFileW opens, the C runtime reads
             except FileNotFoundError:
                 raise
             except PermissionError:
@@ -585,6 +622,9 @@ class FileOps:
                 time.sleep(delays.pop(0))
 
     def write_whole(self, path, data):
+        _crt_call(path, self._write_whole, path, data)
+
+    def _write_whole(self, path, data):
         handle = self._do_open_temp(path)
         try:
             handle.f.write(data)
@@ -594,9 +634,13 @@ class FileOps:
         self._do_commit(handle, path)
 
     def create_exclusive(self, path, data):
+        return _crt_call(path, self._create_exclusive, path, data)
+
+    def _create_exclusive(self, path, data):
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         delays = list(self.create_retry_s)
         while True:
+            opened = time.monotonic()           # no one can see the file before this
             try:
                 fd = os.open(path, flags, 0o666)
                 break
@@ -614,6 +658,18 @@ class FileOps:
             os.fsync(fd)
         finally:
             os.close(fd)
+        try:
+            _not_abandoned()
+        except _Abandoned:
+            # The caller gave up (the share timeout) and was told the share is down: a lock it doesn't know
+            # it holds would keep every other PC out. Take the file back while no other PC can have judged it
+            # stale and taken it over (storage.md §8.1); after that it is left to go stale
+            if time.monotonic() - opened < self.undo_create_s:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise
         return True
 
     def rename(self, src, dst):
@@ -670,17 +726,16 @@ class FileOps:
 
     def _size(self, path):
         with hx_win.open_for_read(path) as f:
-            f.seek(0, os.SEEK_END)
-            return f.tell()
+            return _crt_call(path, _end_offset, f)
 
     def _open_temp(self, path):
-        return self._do_open_temp(path)
+        return _crt_call(path, self._do_open_temp, path)
 
     def _write_chunk(self, handle, data):
-        handle.f.write(data)
+        _crt_call(handle.tmp, handle.f.write, data)
 
     def _commit_temp(self, handle, path):
-        self._do_commit(handle, path)
+        _crt_call(path, self._do_commit, handle, path)
 
     def _discard_temp(self, handle):
         self._do_discard(handle)
@@ -699,6 +754,9 @@ class FileOps:
             handle.f.close()
             delays = list(self.replace_retry_s)
             while True:
+                # A write whose caller gave up (the share timeout) never commits (storage.md §8.1): the
+                # file stays as the caller was told, and can't land over a newer owner's file later
+                _not_abandoned()
                 try:
                     self._replace(handle.tmp, path)
                     return
@@ -1000,6 +1058,23 @@ class _TimedOut(Exception):
     pass
 
 
+class _Abandoned(Exception):
+    """Raised inside an hx-io job whose caller has given up: the write it was making never commits."""
+
+
+_CURRENT = threading.local()       # .job: the _Job this hx-io thread is running, if any
+
+
+def _not_abandoned():
+    """In FileOps, right before a write commits: _Abandoned when the hx-io job running it was given up.
+    Outside the pool (FileOps called directly) it does nothing."""
+    job = getattr(_CURRENT, "job", None)
+    if job is not None:
+        with job.lock:
+            if job.abandoned:
+                raise _Abandoned()
+
+
 class _Job:
     __slots__ = ("fn", "args", "result", "error", "done", "lock", "finished", "abandoned")
 
@@ -1084,7 +1159,12 @@ class _IoPool:
     def _work(self, job):
         worker = _Worker()
         while job is not None:
-            if job.run():
+            _CURRENT.job = job              # so FileOps can see that its caller gave up (_not_abandoned)
+            try:
+                abandoned = job.run()
+            finally:
+                _CURRENT.job = None
+            if abandoned:
                 break
             job = self._next(worker)
             if job is None:
@@ -1222,6 +1302,7 @@ class ShareStore:
         scale = timings.share_timeout_s / TIMINGS.share_timeout_s
         self.fs.read_retry_s = self.fs.create_retry_s = tuple(d * scale for d in READ_RETRY_S)
         self.fs.replace_retry_s = tuple(d * scale for d in REPLACE_RETRY_S)
+        self.fs.undo_create_s = timings.lock_stale_s / 2
         self.watch = CounterWatch(clock)
         self.local_locks: dict[str, str] = {}
         self.available = self.root is not None
@@ -1234,8 +1315,13 @@ class ShareStore:
         self._cleaned = False
         self._housekeeping = False
         self._local_lock_infos = {}
-        self._pending_releases = {}          # token -> (printer_id, clock.monotonic() to give up at)
-        self._released = collections.OrderedDict()   # token -> printer_id of locks this store released
+        self._pending_releases = {}          # token -> (printer_id, until): removals still to retry
+        # token -> (printer_id, until) of locks this store released; until = that lock's last_ok +
+        # lock_stale_s / 2, the end of the time its file may be removed by name (storage.md §11.5)
+        self._released = collections.OrderedDict()
+        # printer_id -> threading.Lock, held by acquire() while it works on the share and by a pending
+        # release's read-then-remove, so that remove can't land on this PC's own new lock (§11.5)
+        self._printer_mutexes = {}
         self._expected = {}                  # machine_id -> the last ExpectedState read or written
         self._max_poll = {}                  # machine_id -> the highest poll counter written or read
         self._polls = {}                     # machine_id -> the newest PollStatus read (any reader)
@@ -1753,7 +1839,7 @@ class ShareStore:
         info = self._parse_lock(printer_id, raw) if raw is not None else None
         if info is not None:
             with self._lock:
-                if info.token in self._released:
+                if self._released_live(info.token):
                     info = None         # ours, released; its removal is still pending
         if info is None:
             self.watch.missing(f"lock:{printer_id}")
@@ -1786,42 +1872,68 @@ class ShareStore:
                 return None
             return copy.deepcopy(self._local_lock_infos.get(printer_id))
 
-    def _note_released(self, printer_id, token, *, pending):
+    def _note_released(self, printer_id, token, until, *, pending):
+        """until: the token's last_ok + lock_stale_s / 2. Before it no other PC can take the lock over, so
+        a read-then-remove of its file is safe; after it the token is forgotten (storage.md §11.5)."""
         with self._lock:
-            self._released[token] = printer_id
+            self._released[token] = (printer_id, until)
             while len(self._released) > _RELEASED_KEEP:
                 self._released.popitem(last=False)
             if pending:
-                self._pending_releases[token] = (printer_id, self.clock.monotonic() + _PENDING_RELEASE_S)
+                self._pending_releases[token] = (printer_id, until)
+
+    def _released_live(self, token):
+        """Lock held. True while token is one this store released and its file may still be removed;
+        once that time has passed the token is forgotten, and its file is an ordinary lock (§11.5)."""
+        entry = self._released.get(token)
+        if entry is None:
+            return False
+        if self.clock.monotonic() < entry[1]:
+            return True
+        self._released.pop(token, None)
+        self._pending_releases.pop(token, None)
+        return False
+
+    def _remove_released(self, rel, printer_id, raw):
+        """Removes the lock file read as raw when it holds a released token that may still be removed."""
+        token = self._parse_lock(printer_id, raw).token
+        with self._lock:
+            if not self._released_live(token):
+                return
+        self.remove(rel)
+        with self._lock:
+            self._pending_releases.pop(token, None)
+
+    def _printer_mutex(self, printer_id):
+        with self._lock:
+            return self._printer_mutexes.setdefault(printer_id, threading.Lock())
 
     def _retry_releases(self):
         with self._lock:
             pending = list(self._pending_releases.items())
-        for token, (printer_id, give_up_at) in pending:
-            if self.clock.monotonic() >= give_up_at:
+        for token, (printer_id, _until) in pending:
+            mutex = self._printer_mutex(printer_id)
+            if not mutex.acquire(blocking=False):
+                continue                # this PC's acquire() on that printer is running: it clears the file itself
+            try:
+                with self._lock:
+                    if not self._released_live(token):
+                        continue        # too late to remove it safely: forgotten
+                rel = self._lock_rel(printer_id)
+                raw = self.read_bytes(rel)
+                if raw is not None and self._parse_lock(printer_id, raw).token == token:
+                    self._remove_released(rel, printer_id, raw)
                 with self._lock:
                     self._pending_releases.pop(token, None)
-                continue
-            rel = self._lock_rel(printer_id)
-            raw = self.read_bytes(rel)
-            if raw is not None and self._parse_lock(printer_id, raw).token == token:
-                self.remove(rel)
-            with self._lock:
-                self._pending_releases.pop(token, None)
+            finally:
+                mutex.release()
 
     def _remove_if_released(self, printer_id):
-        """Removes the printer's lock file if it holds a token this store released."""
+        """Removes the printer's lock file if it holds a token this store released, while that is safe."""
         rel = self._lock_rel(printer_id)
         raw = self.read_bytes(rel)
-        if raw is None:
-            return
-        token = self._parse_lock(printer_id, raw).token
-        with self._lock:
-            released = token in self._released
-        if released:
-            self.remove(rel)
-            with self._lock:
-                self._pending_releases.pop(token, None)
+        if raw is not None:
+            self._remove_released(rel, printer_id, raw)
 
     # heartbeats
 
@@ -2024,7 +2136,10 @@ class PrinterLock:
             self.state = "unheld"
             self._note = {}
         try:
-            return self._acquire_on_share(info)
+            # Waits for a pending release's read-then-remove on this printer to finish, so it never
+            # removes the file made here (storage.md §11.5)
+            with store._printer_mutex(self.printer_id):
+                return self._acquire_on_share(info)
         except ShareUnavailable:
             with self._lock:
                 self.state = "local_only"
@@ -2038,8 +2153,11 @@ class PrinterLock:
         raw = encode_json("lock", to_json(info))
         last_seen = None
         for _ in range(3):
+            # last_ok is the time just before the create (storage.md §11.2 step 4): other PCs can't see
+            # the file earlier, so a PC frozen after it landed wakes with an expired lease, never a fresh one
+            t0 = store.clock.monotonic()
             if store.create_once(rel, raw):
-                return self._held()
+                return self._held(t0)
             current = store.read_lock(self.printer_id)
             if current is None:
                 # Gone meanwhile, or a lock of ours whose removal is pending: clear that and try again
@@ -2049,17 +2167,19 @@ class PrinterLock:
             age = store.lock_age(self.printer_id) or 0.0
             if age < store.timings.lock_stale_s:
                 raise LockHeld(_held_msg(current), info=current)
-            if self._take_over(current, age, raw):
-                return self._held()
+            t0 = self._take_over(current, age, raw)
+            if t0 is not None:
+                return self._held(t0)
         holder = last_seen or _unknown_holder(self.printer_id)
         raise LockHeld(_held_msg(holder), info=holder)
 
     def _take_over(self, stale, age, raw):
-        """storage.md §11.4. True when held; False when the file moved meanwhile (try again)."""
+        """storage.md §11.4. The clock.monotonic() taken just before the create that made our file when
+        held; None when the file moved meanwhile (try again)."""
         store, rel = self.store, self._rel()
         aside = f"{rel}.stale-{self.info.token}"
         if not store._rename(rel, aside):
-            return False
+            return None
         moved_raw = store.read_bytes(aside)
         moved = store._parse_lock(self.printer_id, moved_raw) if moved_raw is not None else None
         if moved is None or moved.token != stale.token:
@@ -2070,6 +2190,7 @@ class PrinterLock:
                 pass
             holder = moved or stale
             raise LockHeld(_held_msg(holder), info=holder)
+        t0 = store.clock.monotonic()
         if not store.create_once(rel, raw):
             try:
                 store.remove(aside)
@@ -2092,12 +2213,14 @@ class PrinterLock:
                 "unchanged_s": round(age, 1)})
         except (ShareError, ValueError) as e:
             print(f"Could not log the lock takeover of {self.printer_id}: {e}", file=sys.stderr)
-        return True
+        return t0
 
-    def _held(self):
+    def _held(self, t0):
+        # t0: taken just before the create that made the file, never after the share calls that follow
+        # it (the takeover's remove and log), so a slow or frozen one can only shorten the lease
         with self._lock:
             self.state = "held"
-            self._last_ok = self.store.clock.monotonic()
+            self._last_ok = t0
         return "held"
 
     def start_keeping(self):
@@ -2139,8 +2262,12 @@ class PrinterLock:
                 return False
             info.counter += 1
             info.note.update(note)
+            half = store.timings.lock_stale_s / 2
             with self._lock:
-                if self.state == "held" and store.clock.monotonic() - self._last_ok >= store.timings.lock_stale_s / 2:
+                # t0, the time just before the write, is what a good write proves (as the poller's p_ok):
+                # other PCs can't see the new counter earlier
+                t0 = store.clock.monotonic()
+                if self.state == "held" and t0 - self._last_ok >= half:
                     # We stalled (PC asleep, process suspended): another PC may judge the lock stale or
                     # have taken it over, so never write again, as for a failing share below
                     self.state = "lost"
@@ -2157,11 +2284,16 @@ class PrinterLock:
         with self._lock:
             if self.state != "held":
                 return False
+            if store.clock.monotonic() - t0 >= half:
+                # The write came back lock_stale_s / 2 or more after it started (the PC froze inside it):
+                # it proves nothing, and it may have landed over a new holder's file
+                self.state = "lost"
+                return False
             self.info = info
             for key, value in note.items():
                 if self._note.get(key) is value:
                     del self._note[key]
-            self._last_ok = store.clock.monotonic()
+            self._last_ok = t0
         return True
 
     def check(self, budget_s=0.0):
@@ -2173,6 +2305,19 @@ class PrinterLock:
                 self.state = "lost"
             if self.state == "lost":
                 raise LockLost(Msg(N_("Another PC took over this printer's lock.")))
+
+    def lease_end(self):
+        """The clock.monotonic() time by which every printer call made under this lock must have ended:
+        last_ok + lock_stale_s / 2, the bound check() uses (storage.md §11.3). Holders pass it as the
+        deadline of each call, so a call that passed its check() and then waited (the gate, a frozen PC)
+        is refused instead of sent late. None when the lock isn't held on the share (local_only, unheld).
+        LockLost when it is lost."""
+        with self._lock:
+            if self.state == "lost":
+                raise LockLost(Msg(N_("Another PC took over this printer's lock.")))
+            if self.state != "held":
+                return None
+            return self._last_ok + self.store.timings.lock_stale_s / 2
 
     def update(self, **note):
         """e.g. update(step=12, of=40); written at the next refresh."""
@@ -2197,23 +2342,31 @@ class PrinterLock:
             if keeper is not None and keeper is not threading.current_thread():
                 keeper.join(self.store.timings.lock_refresh_s)
             with self._lock:
+                until = self._last_ok + self.store.timings.lock_stale_s / 2
+                if self.state == "held" and self.store.clock.monotonic() >= until:
+                    # Stalled past the lease: another PC may take the file over any moment, so a
+                    # read-then-remove could delete its new lock. Leave it to go stale (§11.5)
+                    self.state = "lost"
                 state, info = self.state, self.info
             if state == "held" and info is not None:
-                self._remove_file(info.token)
+                self._remove_file(info.token, until)
             self._unregister()
             with self._lock:
                 self.state = "unheld"
 
-    def _remove_file(self, token):
+    def _remove_file(self, token, until):
+        """Removes our file, only while monotonic() < until (last_ok + lock_stale_s / 2): before then no
+        other PC can have taken it over, so the file read is still the one removed."""
         store, rel = self.store, self._rel()
         try:
             raw = store.read_bytes(rel)
-            if raw is not None and store._parse_lock(self.printer_id, raw).token == token:
+            if raw is not None and store._parse_lock(self.printer_id, raw).token == token \
+                    and store.clock.monotonic() < until:
                 store.remove(rel)
         except ShareError:
-            store._note_released(self.printer_id, token, pending=True)
+            store._note_released(self.printer_id, token, until, pending=True)
             return
-        store._note_released(self.printer_id, token, pending=False)
+        store._note_released(self.printer_id, token, until, pending=False)
 
     def _unregister(self):
         store = self.store
@@ -2248,7 +2401,7 @@ class Heartbeat:
         self._counter = 0
         self._lock = threading.Lock()
 
-    def beat(self, *, can_poll, last_printer_reach, polling, monitor_open, floor_board):
+    def beat(self, *, can_poll, last_printer_reach, polling, monitor_open, floor_board, declined=()):
         if not _KEY_RE.match(self.key):
             raise ValueError(f"bad heartbeat key {self.key!r}")
         store = self.store
@@ -2258,7 +2411,8 @@ class Heartbeat:
                                  pid=store.identity.pid, version=store.version, counter=self._counter,
                                  written_at=store.clock.time(), can_poll=bool(can_poll),
                                  last_printer_reach=last_printer_reach, polling=list(polling),
-                                 monitor_open=bool(monitor_open), floor_board=bool(floor_board))
+                                 monitor_open=bool(monitor_open), floor_board=bool(floor_board),
+                                 declined=sorted(declined))
             self.last = info
         store.write_json(f"status/pollers/{self.key}.json", {"file_type": "heartbeat", **to_json(info)})
         store.watch.see("hb:" + self.key, info.counter)

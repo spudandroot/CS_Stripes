@@ -97,6 +97,19 @@ by remote address and port, not by program path. The `--self-check` uses loopbac
 only. On the printers' side, the rule above still applies: their segment accepts port 80 only
 from the floor PCs.
 
+**Power settings (Group Policy).** The PCs that run the MapleJet monitor or the floor board, and
+every PC used to send, stop, resume, set clocks or run test prints, must never sleep or hibernate
+while Stripes runs, and must not be virtual machines that can be paused: a PC that wakes up can act
+on a printer that another PC has taken over in the meantime. In a GPO for those PCs (Computer
+Configuration > Policies > Administrative Templates > System > Power Management > Sleep Settings),
+set:
+
+| Setting | Value |
+|---|---|
+| Specify the system sleep timeout (plugged in) | Enabled, 0 seconds |
+| Specify the system hibernate timeout (plugged in) | Enabled, 0 seconds |
+| Allow standby states (S1-S3) when sleeping (plugged in) | Disabled |
+
 **Groups.** Create two AD groups: `Stripes Administrators` (set up products, films, print texts,
 lines, machines and printers; run test prints) and `Stripes MapleJet Senders` (send, stop,
 resume, set clocks). Someone who does both goes in both. Changes take effect at the person's
@@ -187,8 +200,10 @@ Each copy of Stripes keeps one small file (`COMPUTER_user.json`) with its versio
 installed, its last update and a heartbeat every 15 minutes while open. **Manage printers >
 Deployment status...** shows them all in one table. The MapleJet version writes it to
 `v2\status\deployment` (the folder script creates it, with Modify for Domain Users), and the
-window also shows the older copies that still write to `\\SERVER\Share\Stripes\status`.
-Without the folder, nothing is written.
+window also shows the older copies that still write to `\\SERVER\Share\Stripes\status`. On its
+first start on a PC, the new version copies that PC's install date and history from the old file,
+and logs the update (it never changes the old file). This also works when the share wasn't there
+at that first start: it happens at the next start. Without the folder, nothing is written.
 
 ### Trying a new version on one PC first
 

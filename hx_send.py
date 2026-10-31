@@ -25,6 +25,7 @@ import base64
 import copy
 import dataclasses
 import hashlib
+import math
 import secrets
 import sys
 import threading
@@ -137,6 +138,7 @@ NOTE_ORDER = ("pc_time", "no_lock", "local_copy", "ink_mismatch", "film_stop", "
 READBACK_STEPS = (STEP_VERIFY_IDLE, STEP_CONFIRM_1, STEP_CONFIRM_2)
 LOG_SEARCH_S = 400 * 86_400.0                     # how far back the send_switch entries are looked for
 TRACEBACK_MAX = 4_000                             # internal_error keeps this much of the traceback
+_WEB_CALLS = ("load_slot", "fonts", "firmware")   # their deadline is also their own worst case (protocol.md §8.3)
 
 _ONLY_SENDERS = N_("Only Stripes MapleJet Senders can send.")                      # hx_message's text
 _ONLY_ACTIONS = N_("Only Stripes MapleJet Senders can stop, resume or set clocks.")
@@ -218,8 +220,8 @@ def design_to_log(design: MessageDesign) -> dict:
 
 
 def design_from_log(d: dict) -> MessageDesign:
-    d = dict(d)
-    picture = d.pop("preview_b64", "") or ""
+    d = dict(_log_shape(d, dict, "readback"))
+    picture = _log_shape(d.pop("preview_b64", "") or "", str, "preview_b64")
     d.pop("preview_bmp", None)
     design = from_json(MessageDesign, d)
     design.preview_bmp = base64.b64decode(picture)
@@ -235,9 +237,9 @@ def _result_to_log(r: MachineResult) -> dict:
 
 
 def _result_from_log(d: dict) -> MachineResult:
-    d = dict(d)
-    readbacks = [design_from_log(x) for x in d.pop("readbacks", None) or []]
-    picture = d.pop("previous_preview_b64", "") or ""
+    d = dict(_log_shape(d, dict, "result"))
+    readbacks = [design_from_log(x) for x in _log_shape(d.pop("readbacks", None) or [], list, "readbacks")]
+    picture = _log_shape(d.pop("previous_preview_b64", "") or "", str, "previous_preview_b64")
     d.pop("previous_preview", None)
     r = from_json(MachineResult, d)
     r.readbacks = readbacks
@@ -245,15 +247,40 @@ def _result_from_log(d: dict) -> MachineResult:
     return r
 
 
+def _log_shape(value, kind, where):
+    """A list, object or text read back from a log entry: ValueError when it is anything else (a damaged
+    entry), never the TypeError iterating or indexing it would raise."""
+    if not isinstance(value, kind):
+        raise ValueError(f"{where}: expected {kind.__name__}, got {type(value).__name__}")
+    return value
+
+
+def _log_number(value, where):
+    """A time read back from a log entry. Anything but a finite number is a damaged entry: ValueError, as
+    hx_model.from_json treats a damaged file, never OverflowError (a 400-digit int) or TypeError."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{where}: not a number")
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(f"{where}: number out of range") from None
+    if not math.isfinite(number):
+        raise ValueError(f"{where}: not a finite number")
+    return number
+
+
 def result_from_log(entry: dict) -> SendResult:
-    """The "send" log entry back into a SendResult, pictures included (§17.2)."""
+    """The "send" log entry back into a SendResult, pictures included (§17.2). ValueError (or KeyError)
+    for a damaged entry."""
     data_as_of = entry.get("data_as_of")
     return SendResult(
         send_id=entry["send_id"], sender=entry.get("sender", ""), computer=entry.get("computer", ""),
-        started_at=float(entry.get("started_at") or 0.0), finished_at=float(entry.get("finished_at") or 0.0),
-        machines=[_result_from_log(m["result"]) for m in entry.get("machines", [])],
+        started_at=_log_number(entry.get("started_at") or 0.0, "started_at"),
+        finished_at=_log_number(entry.get("finished_at") or 0.0, "finished_at"),
+        machines=[_result_from_log(_log_shape(m, dict, "machine")["result"])
+                  for m in _log_shape(entry.get("machines", []), list, "machines")],
         time_source=entry.get("time_source", "pc"), from_local_copy=bool(entry.get("from_local_copy", False)),
-        data_as_of=float(data_as_of) if data_as_of is not None else None,
+        data_as_of=_log_number(data_as_of, "data_as_of") if data_as_of is not None else None,
         log_name=entry.get("log_name", ""), log_queued=False)
 
 
@@ -387,37 +414,30 @@ def _ink_problem(machine, film, ink_name, inks):
     return None
 
 
-def _check_printer(client, plan, company, guard, deadline, on_ink, on_uid=None):
+def _check_printer(client, plan, company, guard, on_ink, on_uid=None):
     """send.md §10.5 items 2 to 7 on one printer: (printing, the message printing now). guard(call) runs
-    before every request; on_ink(msg, mismatch) decides what an ink problem does; on_uid() is called
-    once the UID has been checked."""
+    before every request and gives its deadline; on_ink(msg, mismatch) decides what an ink problem does;
+    on_uid() is called once the UID has been checked."""
     machine, film = plan.machine, plan.film
-    guard("check_uid")
-    client.check_uid()
+    client.check_uid(deadline=guard("check_uid"))
     if on_uid is not None:
         on_uid()
     if machine.placement == "encoder" and machine.encoder_wheel_mm is not None and machine.encoder_ppr is not None:
-        guard("read")
-        wheel = client.read("ENWHD")
-        guard("read")
-        ppr = client.read("ENPPR")
+        wheel = client.read("ENWHD", deadline=guard("read"))
+        ppr = client.read("ENPPR", deadline=guard("read"))
         if wheel != round(machine.encoder_wheel_mm) or ppr != machine.encoder_ppr:
             raise _Failed(Msg(N_("{machine}'s encoder settings changed: wheel {wheel} mm, {ppr} pulses per turn. "
                                  "Every print would move. Ask an administrator."),
                               {"machine": machine.name, "wheel": wheel, "ppr": ppr}))
-    guard("fonts")
-    fonts = client.fonts(deadline=deadline("fonts"))
+    fonts = client.fonts(deadline=guard("fonts"))
     if list(fonts) != list(company.standard_fonts):
         raise _Failed(Msg(N_("{machine}'s printer has fonts that differ from Stripes' standard list."),
                           {"machine": machine.name}))
-    guard("read")
-    problem = _ink_problem(machine, film, client.read("INKT"), company.inks)
+    problem = _ink_problem(machine, film, client.read("INKT", deadline=guard("read")), company.inks)
     if problem is not None:
         on_ink(*problem)
-    guard("read")
-    printing = client.read("PRIN") == 1
-    guard("load_slot")
-    current = client.load_slot(0, deadline=deadline("load_slot"))
+    printing = client.read("PRIN", deadline=guard("read")) == 1
+    current = client.load_slot(0, deadline=guard("load_slot"))
     return printing, current
 
 
@@ -426,25 +446,22 @@ def _clock_set(client, guard, time, reading, machine_name, record, *, before):
     re-read for a pair read across midnight). Fills record for the log; raises on any failure."""
     if before:
         try:
-            guard("read")
-            d0 = client.read("DATE")
-            guard("read")
-            t0 = client.read("TIME")
+            d0 = client.read("DATE", deadline=guard("read"))
+            t0 = client.read("TIME", deadline=guard("read"))
             record["before"] = clock_from(d0, t0).strftime("%Y-%m-%d %H:%M:%S")
         except PrinterError:
             record["before"] = None     # only for the log
+    # The guard first, then the time: a wait in the guard never makes the TD late
+    deadline = guard("command")
     local = time.now_from(reading).local
     cmd = clock_command(local)
     sent = (local + timedelta(seconds=30)).replace(second=0, microsecond=0)
     record.update({"sent": sent.strftime("%Y-%m-%d %H:%M"), "source": reading.source, "server": reading.server,
                    "offset_s": round(reading.offset_s, 3)})
-    guard("command")
-    client.command(cmd)
+    client.command(cmd, deadline=deadline)
     for attempt in (1, 2):
-        guard("read")
-        d = client.read("DATE")
-        guard("read")
-        t = client.read("TIME")
+        d = client.read("DATE", deadline=guard("read"))
+        t = client.read("TIME", deadline=guard("read"))
         printer = clock_from(d, t)
         expected = time.now_from(reading).local
         difference = (printer - expected).total_seconds()
@@ -508,16 +525,35 @@ class _Worker:
         except Exception:
             return self.clock.time()
 
-    def _deadline(self, call):
-        return self.clock.monotonic() + worst_case_s(call, self.timings)
-
     def _guard(self, lock, *, cancel=None):
-        """The check before every printer request: the lock (with the call's worst case) and the cancel."""
+        """The check before every printer request: the lock (with the call's worst case) and the cancel.
+        guard(call) returns the deadline to give that call (send.md §10.5): the lock's lease end, so a
+        call that passed this check and then waited (the gate, a frozen PC) is refused instead of sent
+        after another PC may have taken the printer; for a web call, also no later than its own worst
+        case from now. None for an Autopilot call without a lock on the share (local_only)."""
         def guard(call):
             if cancel is not None and cancel.cancelled:
                 raise _Stop()
-            lock.check(budget_s=worst_case_s(call, self.timings))
+            budget = worst_case_s(call, self.timings)
+            lock.check(budget_s=budget)
+            lease = lock.lease_end()
+            if call in _WEB_CALLS:
+                own = self.clock.monotonic() + budget
+                return own if lease is None else min(lease, own)
+            return lease
         return guard
+
+    @staticmethod
+    def _lease_ran_out(lock, error):
+        """After a printer call failed: the LockLost to report instead, when the lock ran out meanwhile (a
+        call refused at its lease deadline says only "busy"); else None."""
+        if lock is None or not isinstance(error, PrinterError):
+            return None
+        try:
+            lock.check()
+        except LockLost as lost:
+            return lost
+        return None
 
     def _handshake(self, lock, machine_id, deadline, abort=None):
         """send.md §10.4 step 2: "ready", "share_down", "timeout" or "cancelled". Raises LockLost, or a
@@ -902,6 +938,10 @@ class SendPipeline(_Worker):
             except ForbiddenCommand:
                 raise
             except HxError as e:
+                lost = self._lease_ran_out(m.lock, e)
+                if lost is not None:
+                    self._fail(run, m, step, lost.msg, write=False)
+                    return
                 if isinstance(e, _Failed) and e.note:
                     m.note(e.note)
                 self._fail(run, m, step, e.msg, differences=getattr(e, "differences", None))
@@ -941,7 +981,7 @@ class SendPipeline(_Worker):
 
         def on_ink(msg, mismatch):
             raise _Failed(msg, note="ink_mismatch" if mismatch else "")
-        printing, current = _check_printer(m.client, plan, run.company, self._guard_for(m), self._deadline, on_ink)
+        printing, current = _check_printer(m.client, plan, run.company, self._guard_for(m), on_ink)
         r = m.result
         r.slot = idle_slot(printing, current.slot)
         origin = origin_from_design(current)
@@ -953,9 +993,9 @@ class SendPipeline(_Worker):
         r.previous_confirmed = _was_confirmed(m.before, r.previous)
         counter = run.company.bag_counter
         if counter != "none":
-            self._guard_for(m)("read")
+            deadline = self._guard_for(m)("read")
             try:
-                r.counts_before = m.client.read(counter)
+                r.counts_before = m.client.read(counter, deadline=deadline)
             except PrinterError:
                 r.counts_before = None      # only for the log
         self._event(run, m.id, step, "ok", design=current)
@@ -974,16 +1014,14 @@ class SendPipeline(_Worker):
         m.result.message_name, m.result.content_code = built.name, built.content_code
         guard = self._guard_for(m)
         for cmd in built.commands:
-            guard("command")
-            m.client.command(cmd)
+            m.client.command(cmd, deadline=guard("command"))
         self._event(run, m.id, step, "ok")
 
     def _read_local(self, run, design):
         return to_local(design.read_at + run.reading.offset_s, offset_fn=self.time.offset_fn)
 
     def _verify_idle(self, run, m, step):
-        self._guard_for(m)("load_slot")
-        d = m.client.load_slot(m.result.slot, deadline=self._deadline("load_slot"))
+        d = m.client.load_slot(m.result.slot, deadline=self._guard_for(m)("load_slot"))
         m.result.readbacks.append(d)
         problem = _readback_problem(m.built, d, self._read_local(run, d), m.name)
         if problem is not None:
@@ -1020,18 +1058,16 @@ class SendPipeline(_Worker):
             "previous_message_name": previous.name if previous else "",
             "previous_fingerprint": previous.fingerprint if previous else "", "at": self._at(run)})
         guard = self._guard_for(m)
-        guard("command")
+        deadline = guard("command")
         r.after_switch = True       # from here the machine may be printing the new message
-        m.client.command(Command.set("PRINTMSG", r.slot))
-        guard("command")
-        m.client.command(Command.set("PRINT", 1))
+        m.client.command(Command.set("PRINTMSG", r.slot), deadline=deadline)
+        m.client.command(Command.set("PRINT", 1), deadline=guard("command"))
         self._event(run, m.id, step, "ok")
 
     def _confirm(self, run, m, step):
         r = m.result
         guard = self._guard_for(m)
-        guard("load_slot")
-        d = m.client.load_slot(0, deadline=self._deadline("load_slot"))
+        d = m.client.load_slot(0, deadline=guard("load_slot"))
         r.readbacks.append(d)
         if d.slot != r.slot:
             raise _Failed(Msg(N_("{machine} is printing slot {got}, not slot {slot}."),
@@ -1040,8 +1076,7 @@ class SendPipeline(_Worker):
         problem = _readback_problem(m.built, d, self._read_local(run, d), m.name)
         if problem is not None:
             raise problem
-        guard("read")
-        if m.client.read("PRIN") != 1:
+        if m.client.read("PRIN", deadline=guard("read")) != 1:
             raise _Failed(Msg(N_("{machine} didn't turn printing on."), {"machine": m.name}))
         self._event(run, m.id, step, "ok", design=d)
 
@@ -1053,8 +1088,7 @@ class SendPipeline(_Worker):
         counter = run.company.bag_counter
         if counter != "none":
             try:
-                self._guard_for(m)("read")
-                r.counts_after = m.client.read(counter)
+                r.counts_after = m.client.read(counter, deadline=self._guard_for(m)("read"))
             except (PrinterError, LockLost):
                 r.counts_after = None       # only for the log
         r.ok, r.colour, r.step, r.msg = True, AMBER, STEP_CONFIRM_2, None
@@ -1612,13 +1646,10 @@ class PrinterActions(_Worker):
             try:
                 a.result.step = STEP_CHECK_MACHINE
                 client = self.clients.client(a.printer)
-                guard("check_uid")
-                client.check_uid()
+                client.check_uid(deadline=guard("check_uid"))
                 a.result.step = ACTION_STOP
-                guard("command")
-                client.command(Command.set("PRINT", 0))
-                guard("read_twice")
-                after = client.read_twice("PRIN")
+                client.command(Command.set("PRINT", 0), deadline=guard("command"))
+                after = client.read_twice("PRIN", deadline=guard("read_twice"))
                 a.extra["printing_after"] = after
                 if after != 0:
                     raise _Failed(_stop_failed_msg(a.machine.name))
@@ -1686,13 +1717,12 @@ class PrinterActions(_Worker):
             guard = self._guard(a.lock)
             try:
                 client = self.clients.client(a.printer)
-                guard("check_uid")
-                client.check_uid()
-                guard("load_slot")
-                design = client.load_slot(0, deadline=self._deadline("load_slot"))
+                client.check_uid(deadline=guard("check_uid"))
+                design = client.load_slot(0, deadline=guard("load_slot"))
             except ForbiddenCommand:
                 raise
             except HxError as e:
+                e = self._lease_ran_out(a.lock, e) or e
                 return ResumeCheck(machine_id=machine_id, design=None, origin_line="", allowed=False, msg=e.msg)
         finally:
             if a.lock is not None:
@@ -1727,10 +1757,8 @@ class PrinterActions(_Worker):
             guard = self._guard(a.lock)
             try:
                 client = self.clients.client(a.printer)
-                guard("check_uid")
-                client.check_uid()
-                guard("load_slot")
-                design = client.load_slot(0, deadline=self._deadline("load_slot"))
+                client.check_uid(deadline=guard("check_uid"))
+                design = client.load_slot(0, deadline=guard("load_slot"))
                 a.extra["design"] = design
                 r = a.result
                 r.readbacks, r.slot, r.message_name, r.fingerprint = [design], design.slot, design.name, \
@@ -1741,15 +1769,13 @@ class PrinterActions(_Worker):
                     a.fail(STEP_CHECK_MACHINE, mismatch)
                     return
                 a.result.step = ACTION_RESUME
-                guard("command")
-                client.command(Command.set("PRINT", 1))
-                guard("read_twice")
-                if client.read_twice("PRIN") != 1:
+                client.command(Command.set("PRINT", 1), deadline=guard("command"))
+                if client.read_twice("PRIN", deadline=guard("read_twice")) != 1:
                     raise _Failed(Msg(N_("{machine} didn't turn printing on."), {"machine": a.machine.name}))
             except ForbiddenCommand:
                 raise
             except HxError as e:
-                a.fail(a.result.step, e.msg)
+                a.fail(a.result.step, (self._lease_ran_out(a.lock, e) or e).msg)
                 return
             notes = list(expected.notes)
             a.done(ACTION_RESUME)
@@ -1791,14 +1817,13 @@ class PrinterActions(_Worker):
             try:
                 a.result.step = STEP_CHECK_MACHINE
                 client = self.clients.client(a.printer)
-                guard("check_uid")
-                client.check_uid()
+                client.check_uid(deadline=guard("check_uid"))
                 a.result.step = STEP_SET_CLOCK
                 _clock_set(client, guard, self.time, reading, a.machine.name, record, before=True)
             except ForbiddenCommand:
                 raise
             except HxError as e:
-                a.fail(a.result.step, e.msg)
+                a.fail(a.result.step, (self._lease_ran_out(a.lock, e) or e).msg)
                 return
             a.done(STEP_SET_CLOCK)
             if reading.source != "server":
@@ -1975,8 +2000,7 @@ class TestPrintRun(_Worker):
                 # Empty film: only a warning
                 self._post("warning", 0, Msg(N_("{machine}'s ink doesn't match the film: the marks may not show."),
                                              {"machine": machine.name}))
-            printing, current = _check_printer(client, base, company, guard, self._deadline, on_ink,
-                                               on_uid=self._uid_checked)
+            printing, current = _check_printer(client, base, company, guard, on_ink, on_uid=self._uid_checked)
             before = self._read_expected(machine.id)
         except _Stop:
             return self._end(client, lock, "cancelled", stopped)
@@ -1986,6 +2010,9 @@ class TestPrintRun(_Worker):
         except ForbiddenCommand:
             raise
         except HxError as e:
+            lost = self._lease_ran_out(lock, e)
+            if lost is not None:
+                return self._untouched("failed", lost.msg)
             self._post("failed", 0, e.msg)
             return self._end(client, lock, "failed", e.msg)
         previous = _running_message(current, origin_from_design(current))
@@ -2025,6 +2052,9 @@ class TestPrintRun(_Worker):
         except ForbiddenCommand:
             raise
         except HxError as e:
+            lost = self._lease_ran_out(lock, e)
+            if lost is not None:
+                return self._lost(lock, lost)
             self._post("failed", self._index, e.msg)
             return self._end(client, lock, "failed", e.msg)
         except Exception as e:
@@ -2049,8 +2079,7 @@ class TestPrintRun(_Worker):
             switched = self.clock.monotonic()
             count_start = None
             if not plan.timed:
-                guard("read")
-                count_start = client.read(company.bag_counter)
+                count_start = client.read(company.bag_counter, deadline=guard("read"))
             step_started_wall = self._now()
             step_started = self.clock.monotonic()
             test = dict(self._expected.test or {}, step=k)
@@ -2096,10 +2125,8 @@ class TestPrintRun(_Worker):
             self._step_plans = [test_step_plan(self.plan.base, s) for s in self.plan.steps]
         built = build_message(self._step_plans[step.index - 1], slot)
         for cmd in built.commands:
-            guard("command")
-            client.command(cmd)
-        guard("load_slot")
-        d = client.load_slot(slot, deadline=self._deadline("load_slot"))
+            client.command(cmd, deadline=guard("command"))
+        d = client.load_slot(slot, deadline=guard("load_slot"))
         self._check_readback(built, d)
         return built
 
@@ -2113,22 +2140,18 @@ class TestPrintRun(_Worker):
     def _switch(self, client, guard, cancel, built):
         """PRINTMSG, PRINT 1 and the two running checks of a Send (§10.10); the second read-back."""
         name = self.plan.base.machine.name
-        guard("command")
-        client.command(Command.set("PRINTMSG", built.slot))
-        guard("command")
-        client.command(Command.set("PRINT", 1))
+        client.command(Command.set("PRINTMSG", built.slot), deadline=guard("command"))
+        client.command(Command.set("PRINT", 1), deadline=guard("command"))
         last = None
         for check in (1, 2):
             if check == 2 and not self.clock.sleep(self.timings.confirm_gap_s, cancel):
                 raise _Stop()
-            guard("load_slot")
-            d = client.load_slot(0, deadline=self._deadline("load_slot"))
+            d = client.load_slot(0, deadline=guard("load_slot"))
             if d.slot != built.slot:
                 raise _Failed(Msg(N_("{machine} is printing slot {got}, not slot {slot}."),
                                   {"machine": name, "got": d.slot, "slot": built.slot}))
             self._check_readback(built, d)
-            guard("read")
-            if client.read("PRIN") != 1:
+            if client.read("PRIN", deadline=guard("read")) != 1:
                 raise _Failed(Msg(N_("{machine} didn't turn printing on."), {"machine": name}))
             last = d
         return last
@@ -2142,8 +2165,7 @@ class TestPrintRun(_Worker):
         while bags < need:
             if not self.clock.sleep(self.timings.second_reading_s, cancel):
                 raise _Stop()
-            guard("read")
-            value = client.read(counter)
+            value = client.read(counter, deadline=guard("read"))
             if value < start:
                 start = value       # the counter was reset: a new start
             n = value - start
@@ -2198,42 +2220,42 @@ class TestPrintRun(_Worker):
             try:
                 if client is None:
                     client = self.clients.client(self.plan.base.printer)
-                guard("check_uid")
-                client.check_uid()
+                client.check_uid(deadline=guard("check_uid"))
                 self._uid_ok = True
             except ForbiddenCommand:
                 raise
             except HxError as e:
-                return self._untouched(reason, e.msg)
+                return self._untouched(reason, (self._lease_ran_out(lock, e) or e).msg)
         self._post("stopping", self._index)
         printing_off, lost = False, False
         slots = {"9": False, "10": False}
         try:
-            guard("command")
-            client.command(Command.set("PRINT", 0))
-            guard("read_twice")
-            printing_off = client.read_twice("PRIN") == 0
+            client.command(Command.set("PRINT", 0), deadline=guard("command"))
+            printing_off = client.read_twice("PRIN", deadline=guard("read_twice")) == 0
         except LockLost:
             lost = True
         except ForbiddenCommand:
             raise
-        except HxError:
+        except HxError as e:
+            # A call refused at its lease deadline: the printer may be another PC's now (send.md §10.5)
+            lost = self._lease_ran_out(lock, e) is not None
             printing_off = False
         if printing_off and not lost:
             for slot in SLOTS:
                 try:
                     for cmd in empty_message_commands(slot):
-                        guard("command")
-                        client.command(cmd)
-                    guard("load_slot")
-                    slots[str(slot)] = cleared(client.load_slot(slot, deadline=self._deadline("load_slot")))
+                        client.command(cmd, deadline=guard("command"))
+                    slots[str(slot)] = cleared(client.load_slot(slot, deadline=guard("load_slot")))
                 except LockLost:
                     lost = True
                     break
                 except ForbiddenCommand:
                     raise
-                except HxError:
+                except HxError as e:
                     slots[str(slot)] = False
+                    if self._lease_ran_out(lock, e) is not None:
+                        lost = True
+                        break
         both = all(slots.values())
         if not lost:
             self._finish_rows(lock, printing_off=printing_off)
@@ -2265,6 +2287,12 @@ class TestPrintRun(_Worker):
                 stopped_by=user, stopped_at=at, test=test))
         except ShareError as e:
             print(f"Could not record the end of test {self.plan.run_id}: {e}", file=sys.stderr)
+            if isinstance(e, LockLost):
+                return          # the printer may be another PC's now: write nothing more (send.md §10.5)
+        try:
+            lock.check()
+        except LockLost:
+            return
         _write_line_flag(self.store, base.line.id, "", stopped_needs_send=True)
 
     def _log_end(self, reason, ok, msg, printing_off, slots, *, cleared_=False):
@@ -2301,8 +2329,7 @@ class TestPrintRun(_Worker):
                                                           {"machine": base.machine.name}))
                 self._expected = state
                 client = self.clients.client(base.printer)
-                self._guard(lock)("check_uid")
-                client.check_uid()
+                client.check_uid(deadline=self._guard(lock)("check_uid"))
                 self._uid_ok = True
             except ForbiddenCommand:
                 raise

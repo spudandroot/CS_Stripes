@@ -11,14 +11,17 @@ timings and sleep at most a fraction of a second at a time. Run: python -m unitt
 import calendar
 import dataclasses
 import random
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest import mock
 
 import hx_fake
 import hx_message
+import hx_model
 import hx_poller
 import hx_protocol
 import hx_share
@@ -1933,6 +1936,44 @@ class StandaloneTests(Base):
         self.assertIn("checking", [s[1] for s in samples])
         self.assertEqual([s for s in samples if s[0] == "share" and s[3] == ORIGIN], [])
 
+    def test_share_back_after_another_message_never_shows_the_old_drifts_origin(self):
+        # A drift to Mexico is carried into standalone; another message is selected at the printer meanwhile,
+        # so standalone shows the origin unknown. When the share is back the worker starts from the share's
+        # P (red drift, R = Mexico): R no longer says what prints, so it starts unknown until its first Load
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        for _ in range(int(LOGIC.heartbeat_s + LOGIC.watch_s)):
+            sim.run(1)
+            a.watcher.run_once()
+        a.poller.set_monitor_open(True, True)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        install(sim.fake, 10, "SOMETHING-ELSE", "Product of Peru")
+        sim.run(2 * LOGIC.standalone_poll_s + 1)
+        a.watcher.run_once()
+        self.assertEqual(machine_on_board(a, sim.mid).origin_line, "")
+        sim.world.fs.down = False
+        a.store.probe_now()
+        deadline = time.monotonic() + 5
+        while not a.store.available and time.monotonic() < deadline:
+            time.sleep(0.01)
+        samples = []
+        for _ in range(40):
+            sim.run(1)
+            a.watcher.run_once()
+            mv = machine_on_board(a, sim.mid)
+            row = next(r for r in hx_state.floor_board_rows(a.watcher.latest) if r.machine_id == sim.mid)
+            samples.append((a.poller.mode, mv.code, mv.colour, mv.origin_line, row.origin_line))
+        self.assertEqual([s for s in samples if "Mexico" in s[3] or "Mexico" in s[4]], [])
+        self.assertEqual({s[2] for s in samples if s[0] == "share"} - {RED, AMBER, GREY}, set())
+        self.assertEqual(samples[-1][1:4], ("drift", RED, "Product of Peru"))
+
     def test_share_back_with_the_printer_silent(self):
         def silent(sim):
             sim.fake.go_silent()
@@ -2050,9 +2091,10 @@ class CoordinationTests(Base):
         # rank 1 takes the printer over meanwhile. When rank 0 wakes, its last P write is stale_s / 2
         # old: it reads P first, finds rank 1's, and neither sends nor writes P until rank 1 has handed
         # the printer back. Frozen right after a reply; after the last request, before the cycle's own
-        # write at the end; and in a daylight-saving clock set, before it records the TD in P
+        # write at the end; inside that write (it lands late, over rank 1's P, and proves nothing: share
+        # mode stops, §6.4 step 7.2); and in a daylight-saving clock set, before it records the TD in P
         real_judge = hx_state.judge
-        for where in ("PRIN", "judge", "clock set"):
+        for where in ("PRIN", "judge", "P write", "clock set"):
             with self.subTest(freeze=where):
                 if where == "clock set":
                     sim = self.sim(clock=FakeClock(CHANGE - 120), printers=[{"offset_fn": DST}])
@@ -2096,6 +2138,14 @@ class CoordinationTests(Base):
                     if freeze.get("at") == "judge" and prev is not None and prev.poller == r0.key:
                         frozen()
                     return out
+                real_write_poll = r0.store.write_poll
+
+                def write_poll(status, real_write_poll=real_write_poll):
+                    callers = [f.name for f in traceback.extract_stack()]
+                    if freeze.get("at") == "P write" and "_write_judgement" in callers:
+                        frozen()            # its clock reading before the write is already taken
+                    return real_write_poll(status)
+                r0.store.write_poll = write_poll
                 self.steady(sim, 60)
                 self.assertEqual((sim.p().poller, r1.worker()), (r0.key, None))
                 if where == "clock set":
@@ -2109,11 +2159,18 @@ class CoordinationTests(Base):
                 self.assertTrue(took is not None and took.rank_checked and not took.done)
                 self.assertEqual(r1.entries("polling_started")[-1]["reason"], "takeover")
                 self.assertEqual([t for t in sent[r0.key] if t >= woke], [])
-                self.assertEqual(sim.p().poller, r1.key)
+                self.assertEqual(r0.poller._fenced, {})     # a paused PC isn't a stuck worker
+                if where == "P write":
+                    # Its late write landed over rank 1's P (a share can't refuse it), and stopped share mode
+                    self.assertEqual(sim.p().poller, r0.key)
+                    self.assertEqual(r0.entries("polling_stopped")[-1]["reason"], "share")
+                else:
+                    self.assertEqual(sim.p().poller, r1.key)
                 # Both PCs run again: rank 1 sees rank 0's heartbeat and hands back; rank 0 polls on only then
                 self.assertTrue(sim.run(30, until=lambda: r1.worker() is None and sim.p().poller == r0.key))
                 last = r1.entries("polling_stopped")[-1]
-                self.assertEqual((last["reason"], last["yielded_to"]), ("handover", r0.key))
+                self.assertEqual(last["yielded_to"], r0.key)
+                self.assertIn(last["reason"], ("handover", "rank") if where == "P write" else ("handover",))
                 self.assertTrue(sim.run(10, until=lambda: any(t >= woke for t in sent[r0.key])))
                 self.assertLess(max(sent[r1.key]), min(t for t in sent[r0.key] if t >= woke))
                 self.assertTrue(sim.run(30, until=lambda: sim.code() == "running_confirmed"))
@@ -2819,6 +2876,686 @@ class FreshnessTests(Base):
         self.assertEqual(sim.requests(since=t3 + 0.5), [])
         self.assertEqual(sim.p().yielded_to, r1.key)
         self.no_violations(sim)
+
+
+def ranked_names(sim, names):
+    """names in rank order for the sim's printer (rank 0 first), as assign() gives it."""
+    return sorted(names, key=lambda n: (-hx_share.score(sim.pid, f"PC-{n.upper()}"), sim.world.identity(n).key))
+
+
+def record_calls(sim, pcs):
+    """{PC key: [(clock.monotonic(), call, tag)]} of every printer call each PC's client makes."""
+    sent = {pc.key: [] for pc in pcs}
+    for pc in pcs:
+        real_client = pc.clients.client
+
+        def client(printer, real_client=real_client, pc=pc):
+            c = real_client(printer)
+            if not getattr(c, "_calls_recorded", False):
+                for name in ("read", "command", "load_slot", "fonts", "firmware", "login"):
+                    def call(*args, _fn=getattr(c, name), _name=name, **kw):
+                        sent[pc.key].append((sim.clock.monotonic(), _name, args[0] if args else ""))
+                        return _fn(*args, **kw)
+                    setattr(c, name, call)
+                c._calls_recorded = True
+            return c
+        pc.clients.client = client
+    return sent
+
+
+def record_writes(sim, pc):
+    """[(clock.monotonic(), PollStatus)] of every P write by the PC."""
+    writes = []
+    real = pc.store.write_poll
+
+    def write_poll(status):
+        real(status)
+        writes.append((sim.clock.monotonic(), status))
+    pc.store.write_poll = write_poll
+    return writes
+
+
+def stall(sim, w):
+    """The worker's thread is stuck in some call for good: its tick never runs again. Returns un-stall."""
+    def stuck():
+        w.next_wake = sim.clock.monotonic() + 1.0
+    w.tick = stuck
+
+    def restore():
+        del w.tick
+        w.next_wake = sim.clock.monotonic()
+    return restore
+
+
+# --------------------------------------------------------------------------
+# A stuck worker (§6.2 item 3.0) and judged freshness (§6.14)
+# --------------------------------------------------------------------------
+
+class StuckWorkerTests(Base):
+    RECOVERY_S = 70.0           # 30 s to notice + a beat + a pass + 15 s quiet P + settle + a cycle (§6.2 item 3.0)
+
+    def two(self, sim):
+        n0, n1 = ranked_names(sim, ["akim", "bob"])
+        return sim.pc(n0), sim.pc(n1)
+
+    def test_a_stuck_worker_is_fenced_and_its_printer_declined(self):
+        # Rank 0's worker is stuck while its PC heart-beats. Without the watchdog the backup took over and
+        # handed straight back, forever, and its bookkeeping writes kept the old green looking fresh
+        sim = self.sim()
+        sim.expect()
+        r0, r1 = self.two(sim)
+        sent = record_calls(sim, [r0, r1])
+        self.steady(sim, 60)
+        self.assertEqual(sim.p().poller, r0.key)
+        w = r0.worker()
+        writes = record_writes(sim, r0)
+        restore = stall(sim, w)
+        t0 = sim.clock.monotonic()
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")    # edited at the panel meanwhile
+        board = PC(sim, "carol")                                        # a PC that only watches
+        views = []
+
+        def look():
+            board.watcher.run_once()
+            m = machine_on_board(board, sim.mid)
+            views.append((sim.clock.monotonic() - t0, m.code, m.colour, m.monitored, m.checked_age_s, m.origin_line))
+            return False
+        for _ in range(int(self.RECOVERY_S)):
+            sim.run(1)
+            look()
+        replies = [c for c in sent[r1.key] if c[0] >= t0]
+        self.assertTrue(replies and replies[0][0] - t0 <= self.RECOVERY_S, replies[:3])
+        (stuck,) = [e for e in r0.entries("internal_error") if e.get("error") == "worker_stuck"]
+        self.assertEqual((stuck["printer_id"], stuck["machine_id"]), (sim.pid, sim.mid))
+        self.assertIn(sim.pid, next(h for h in sim.observer.live_heartbeats() if h.key == r0.key).declined)
+        self.assertNotIn(sim.pid, r0.poller._running_printers())
+        self.assertTrue(w.fenced)
+        # The board said NOT MONITORED from not_monitored_s after the last judgement, never the old green
+        late = [v for v in views if v[0] >= LOGIC.not_monitored_s + LOGIC.watch_s]
+        self.assertTrue(late and late[0][1] in ("not_monitored", "checking"), views[:40])
+        self.assertEqual([v for v in late if v[2] == "green" and v[3]], [])
+        # The stuck call returns (before the decline ends): the fenced worker makes no request and no P write
+        before = len(sent[r0.key])
+        n_writes = len([x for x in writes if x[1].machine_id == sim.mid])
+        restore()
+        sim.run(10)
+        self.assertTrue(w.done)
+        self.assertEqual(sent[r0.key][before:], [])
+        self.assertEqual(len([x for x in writes if x[1].machine_id == sim.mid]), n_writes)
+        self.assertIn(sim.pid, r0.poller._fenced)
+        # Rank 1 finds the drift: red, with a sounding alert
+        self.assertTrue(sim.run(60, until=lambda: sim.code() == "drift"))
+        self.assertTrue(any(a.kind == "drift" and a.sound for a in sim.p().alerts))
+        self.no_violations(sim)
+
+    def test_a_declined_printer_comes_back_once_its_worker_has_ended(self):
+        # The decline lasts until the fenced worker has ended and lock_stale_s has passed: then the normal
+        # handover gives the printer back to rank 0
+        sim = self.sim()
+        sim.expect()
+        r0, r1 = self.two(sim)
+        self.steady(sim, 60)
+        # Fences more than DECLINE_MEMORY_S apart don't add up: this one declines for lock_stale_s again
+        r0.poller._strikes[sim.pid] = (4, sim.clock.monotonic() - hx_poller.DECLINE_MEMORY_S - 1)
+        restore = stall(sim, r0.worker())
+        self.assertTrue(sim.run(60, until=lambda: sim.pid in r0.poller._fenced))
+        self.assertEqual(r0.poller._strikes[sim.pid][0], 1)
+        restore()
+        self.assertTrue(sim.run(LOGIC.lock_stale_s + 60, until=lambda: sim.p().poller == r0.key
+                                and r0.worker() is not None and r0.worker().rank_checked))
+        self.assertEqual(r0.poller._fenced, {})
+        self.assertTrue(sim.run(30, until=lambda: sim.code() == "running_confirmed"))
+        self.no_violations(sim)
+
+    def test_a_pc_that_cant_write_p_gives_the_printer_away(self):
+        # No hang at all: every P write of rank 0's worker fails while its heartbeat works, because of a file
+        # only that PC can't write, or a bug
+        for fault in ("permission", "bug"):
+            with self.subTest(fault=fault):
+                sim = self.sim()
+                sim.expect()
+                r0, r1 = self.two(sim)
+                sent = record_calls(sim, [r0, r1])
+                self.steady(sim, 60)
+                if fault == "permission":
+                    real = r0.store.fs.write_whole
+
+                    def write_whole(path, data, real=real):
+                        if path.endswith(f"{sim.mid}.poll.json"):
+                            raise PermissionError(13, "access denied (test)", path)
+                        return real(path, data)
+                    r0.store.fs.write_whole = write_whole
+                else:
+                    def broken(status):
+                        raise RuntimeError("test: a bug in the P write")
+                    r0.store.write_poll = broken
+                t0 = sim.clock.monotonic()
+                with mock.patch("traceback.print_exc"):
+                    self.assertTrue(sim.run(self.RECOVERY_S + 15,
+                                            until=lambda: any(c[0] >= t0 + 1 for c in sent[r1.key])))
+                self.assertIn(sim.pid, r0.poller._fenced)
+                self.assertEqual(len([e for e in r0.entries("internal_error") if e.get("error") == "worker_stuck"]), 1)
+                self.no_violations(sim)
+
+    def test_a_fault_that_stays_keeps_the_printer_with_the_backup(self):
+        # Rank 0 can't write this one P, for ten minutes. The decline used to end every lock_stale_s:
+        # rank 0 took the printer back, failed, and was fenced 30 s later, a 45 s gap every ~95 s. Now each
+        # fence in a row doubles the decline, and a decline that ends on probation is renewed at once
+        sim = self.sim()
+        sim.expect()
+        r0, r1 = self.two(sim)
+        sent = record_calls(sim, [r0, r1])
+        self.steady(sim, 60)
+        real = r0.store.fs.write_whole
+
+        def write_whole(path, data):
+            if path.endswith(f"{sim.mid}.poll.json"):
+                raise PermissionError(13, "access denied (test)", path)
+            return real(path, data)
+        r0.store.fs.write_whole = write_whole
+        t0 = sim.clock.monotonic()
+        board = PC(sim, "carol")
+        views = []
+        for _ in range(600):
+            sim.run(1)
+            board.watcher.run_once()
+            m = machine_on_board(board, sim.mid)
+            views.append((sim.clock.monotonic() - t0, m.code))
+        calls = sorted(c[0] for c in sent[r0.key] + sent[r1.key] if c[0] >= t0)
+        backup = [c[0] for c in sent[r1.key] if c[0] >= t0]
+        recovered = backup[0]
+        self.assertLessEqual(recovered - t0, self.RECOVERY_S)
+        later = [c for c in calls if c >= recovered] + [sim.clock.monotonic()]
+        gaps = [(round(a - t0), round(b - a)) for a, b in zip(later, later[1:]) if b - a >= LOGIC.not_monitored_s]
+        self.assertEqual(gaps, [])
+        self.assertEqual([v for v in views if v[0] >= recovered - t0 + 1 and v[1] in ("not_monitored", "checking")],
+                         [])
+        stuck = [e for e in r0.entries("internal_error") if e.get("error") == "worker_stuck"]
+        self.assertEqual([e["declined_s"] for e in stuck], [60.0, 120.0, 240.0, 480.0][:len(stuck)])
+        self.assertLessEqual(len(stuck), 4)
+        self.assertIn(sim.pid, r0.poller._fenced)
+        self.no_violations(sim)
+        # The fault ends: after the decline the printer comes back to rank 0 and stays
+        r0.store.fs.write_whole = real
+        self.assertTrue(sim.run(hx_poller.DECLINE_MAX_S + 120, until=lambda: sim.p().poller == r0.key
+                                and r0.worker() is not None and r0.worker().rank_checked))
+        self.assertTrue(sim.run(60, until=lambda: sim.pid not in r0.poller._probation))
+        n = len(r0.entries("internal_error"))
+        sim.run(120)
+        self.assertEqual((sim.p().poller, len(r0.entries("internal_error"))), (r0.key, n))
+        self.no_violations(sim)
+
+    def test_the_decline_doubles_up_to_a_cap(self):
+        sim = self.sim()
+        poller = sim.pc("akim").poller
+        self.assertEqual(poller._decline_s("pr_x"), LOGIC.lock_stale_s)
+        cap = hx_poller.DECLINE_MAX_S
+        for count, want in ((1, 60.0), (2, 120.0), (4, 480.0), (5, cap), (9, cap)):
+            poller._strikes["pr_x"] = (count, 0.0)
+            self.assertEqual(poller._decline_s("pr_x"), want)
+
+    def test_a_coordinator_that_was_paused_too_isnt_a_stuck_worker(self):
+        # The whole PC slept: its workers didn't run either. The first pass after it gives them time
+        sim = self.sim()
+        sim.expect()
+        r0, r1 = self.two(sim)
+        self.steady(sim, 60)
+        sim.run(60, pcs=[r1])                   # r0's whole PC is paused for a minute
+        sim.run(60)
+        self.assertEqual([e for e in r0.entries("internal_error") if e.get("error") == "worker_stuck"], [])
+        self.assertEqual(r0.poller._fenced, {})
+        self.assertEqual(sim.p().poller, r0.key)
+
+    def test_bookkeeping_writes_dont_refresh_the_board(self):
+        # judged moves only with a judgement or a paused write: a start, a settle and a yield keep it
+        sim = self.sim()
+        sim.expect()
+        r0, r1 = self.two(sim)
+        self.steady(sim, 60)
+        judged = sim.p().judged
+        self.assertIsNotNone(judged)
+        stall(sim, r0.worker())
+        r1_writes = record_writes(sim, r1)
+        sim.run(25)                             # rank 1 takes over and hands straight back, before the watchdog
+        self.assertTrue(r1_writes)
+        self.assertEqual({x[1].judged for x in r1_writes}, {judged})
+        board = PC(sim, "carol")
+        sim.run(10)
+        board.watcher.run_once()
+        m = machine_on_board(board, sim.mid)
+        self.assertNotEqual(m.colour, "green")
+        self.assertIsNone(m.checked_age_s)      # "Checking...": judged long ago by its writer's clock
+
+    def test_a_long_lock_shows_no_not_monitored_after_it(self):
+        # Paused writes move judged: a Send holding the lock for 50 s doesn't show NOT MONITORED when it ends
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        lock = sim.observer.lock(sim.pid, purpose="send", run_id=SID)
+        self.assertEqual(lock.acquire(), "held")
+        codes = []
+        for _ in range(50):
+            sim.run(1)
+            a.watcher.run_once()
+            codes.append(machine_on_board(a, sim.mid).code)
+        lock.release()
+        for _ in range(15):
+            sim.run(1)
+            a.watcher.run_once()
+            codes.append(machine_on_board(a, sim.mid).code)
+        self.assertNotIn("not_monitored", codes)
+        self.assertEqual(codes[-1], "running_confirmed")
+
+    def test_an_older_writers_p_keeps_the_counter_age(self):
+        # A P without `judged` (an older Stripes wrote it): its counter's age counts, as before
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        a.poller.stop()
+        sim.pcs.remove(a)
+        old = sim.world.store(sim.world.identity("old", sender=False))
+        base = dataclasses.replace(sim.p(), judged=None, judged_at=0.0)
+        for i in range(8):
+            old.write_poll(dataclasses.replace(base, counter=base.counter + 1 + i, poller=old.identity.key))
+            sim.clock.advance(5.0)
+            a.watcher.run_once()
+            m = machine_on_board(a, sim.mid)
+            self.assertEqual((m.code, m.monitored), ("running_confirmed", True))
+            self.assertLess(m.checked_age_s, 10.0)
+
+
+# --------------------------------------------------------------------------
+# A superseded worker's writes (§6.4 step 7.2) and late writes (storage.md §12.6 rule 6)
+# --------------------------------------------------------------------------
+
+class SupersededTests(Base):
+    def test_a_pc_paused_between_ticks_never_writes_over_a_newer_poller(self):
+        # r0's whole PC sleeps; r2, ranked above it, starts meanwhile, takes over and commits a drift. r0
+        # wakes and is asked to hand over: its yield write would put its old green over r2's drift
+        sim = self.sim()
+        sim.expect()
+        n2, n0, n1 = ranked_names(sim, ["akim", "bob", "carol"])
+        r0, r1 = sim.pc(n0), sim.pc(n1)
+        self.steady(sim, 60)
+        self.assertEqual(sim.p().poller, r0.key)
+        r2 = sim.pc(n2)
+        r0_writes = record_writes(sim, r0)
+        sent = record_calls(sim, [r0])
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(120, pcs=[r1, r2], until=lambda: sim.code() == "drift" and sim.p().poller == r2.key))
+        drift_id = next(a.id for a in sim.p().alerts if a.kind == "drift")
+        woke = sim.clock.monotonic()
+        codes = []
+        sim.run(60, until=lambda: codes.append(sim.code()) or False)
+        self.assertEqual([x for x in r0_writes if x[0] >= woke], [])
+        self.assertEqual([c for c in sent[r0.key] if c[0] >= woke], [])
+        self.assertNotIn("running_confirmed", codes)
+        self.assertIn(drift_id, [a.id for a in sim.p().alerts])
+        self.no_violations(sim)
+
+    def pause_inside(self, sim, pc, where, others, seconds):
+        """pc's whole PC pauses for seconds at `where` in its worker's cycle while `others` run."""
+        w = pc.worker()
+        state = {"armed": True}
+
+        def pause():
+            state["armed"] = False
+            sim.run(seconds, pcs=others)
+            state["woke"] = sim.clock.monotonic()
+        if where == "after the lock check":
+            real = w._lock_check
+
+            def lock_check():
+                out = real()
+                if state["armed"] and sys._getframe(1).f_code.co_name == "_call":
+                    pause()
+                return out
+            w._lock_check = lock_check
+        else:                                   # inside the cycle's step-3 lock read, which is then too slow
+            real = pc.store.read_lock
+
+            def read_lock(printer_id):
+                out = real(printer_id)
+                if (state["armed"] and sys._getframe(1).f_code.co_name == "_lock_check"
+                        and sys._getframe(2).f_code.co_name == "_cycle"):
+                    pause()
+                return out
+            pc.store.read_lock = read_lock
+        return state
+
+    def test_a_pc_paused_mid_cycle_neither_writes_nor_sends_over_a_takeover(self):
+        for where in ("after the lock check", "in the step-3 lock read"):
+            with self.subTest(pause=where):
+                sim = self.sim()
+                sim.expect()
+                n0, n1 = ranked_names(sim, ["akim", "bob"])
+                r0, r1 = sim.pc(n0), sim.pc(n1)
+                sent = record_calls(sim, [r0, r1])
+                self.steady(sim, 60)
+                r0_writes = record_writes(sim, r0)
+                state = self.pause_inside(sim, r0, where, [r1], 45.0)
+                self.assertTrue(sim.run(10, pcs=[r0], until=lambda: "woke" in state))
+                woke = state["woke"]
+                self.assertTrue([c for c in sent[r1.key] if c[0] < woke])      # rank 1 took over and polled
+                self.assertTrue(sim.run(30, until=lambda: sim.p().poller == r1.key and sim.p().yielded_to == r0.key))
+                back = sim.clock.monotonic()
+                self.assertEqual([c for c in sent[r0.key] if woke <= c[0] < back], [])
+                self.assertEqual([x for x in r0_writes if woke <= x[0] < back], [])
+                back_green = lambda: (sim.code(), sim.p().poller) == ("running_confirmed", r0.key)
+                self.assertTrue(sim.run(30, until=back_green))
+                self.no_violations(sim)
+
+    def test_a_resumed_worker_adopts_a_newer_yield(self):
+        # Another PC polled, committed a drift and yielded back while this worker was paused: it continues
+        # from that PC's P, never from its own older green, and the drift alert keeps its id
+        sim = self.sim()
+        sim.expect()
+        n0, n1 = ranked_names(sim, ["akim", "bob"])
+        r0, r1 = sim.pc(n0), sim.pc(n1)
+        self.steady(sim, 60)
+        w = r0.worker()
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(120, pcs=[r1], until=lambda: sim.code() == "drift" and sim.p().poller == r1.key))
+        drift_id = next(a.id for a in sim.p().alerts if a.kind == "drift")
+        r0.poller._coordinate()                # its coordinator wakes first; the worker lags behind
+        self.assertTrue(sim.run(10, pcs=[r1], until=lambda: sim.p().yielded_to == r0.key))
+        self.assertIs(r0.worker(), w)
+        r0_writes = record_writes(sim, r0)
+        seen = []
+        drift_ids = lambda: [a.id for a in sim.p().alerts if a.kind == "drift"]
+        sim.run(30, until=lambda: seen.append((sim.code(), drift_ids())) or False)
+        self.assertNotIn("running_confirmed", [c for c, _ in seen])
+        self.assertNotIn("running_confirmed", [x[1].state.code for x in r0_writes])
+        self.assertEqual({tuple(ids) for c, ids in seen if c == "drift"}, {(drift_id,)})
+        self.no_violations(sim)
+
+    def test_a_late_write_by_a_superseded_owner_is_ignored(self):
+        # A write r0 gave up on (share timeout) lands after r1 took over: r1 neither adopts it nor yields to
+        # a PC that isn't polling, and its next write puts its own P back
+        sim = self.sim()
+        sim.expect()
+        n0, n1 = ranked_names(sim, ["akim", "bob"])
+        r0, r1 = sim.pc(n0), sim.pc(n1)
+        self.steady(sim, 60)
+        stale = sim.p()                         # r0's last P before its PC dropped out
+        r0.poller.stop()
+        sim.pcs.remove(r0)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(120, until=lambda: sim.code() == "drift" and sim.p().poller == r1.key))
+        drift_id = next(a.id for a in sim.p().alerts if a.kind == "drift")
+        sim.run(LOGIC.poll_fast_s)
+        # The abandoned write lands now: r0's content and counter from before, written long ago
+        landed = dataclasses.replace(stale, counter=stale.counter + 1)
+        sim.world.store(r0.identity).write_json(f"status/machines/{sim.mid}.poll.json",
+                                                {"file_type": "poll", **hx_model.to_json(landed)})
+        codes = []
+        sim.run(LOGIC.poll_fast_s + 1, until=lambda: codes.append(sim.code()) or False)
+        self.assertEqual(sim.code(), "drift")
+        self.assertEqual(sim.p().poller, r1.key)
+        self.assertIn(drift_id, [a.id for a in sim.p().alerts])
+        self.assertTrue(r1.entries("late_write_ignored"))
+        self.assertEqual([e for e in r1.entries("polling_stopped")], [])
+        sim.run(30)
+        self.assertEqual((sim.code(), sim.p().poller), ("drift", r1.key))
+        self.no_violations(sim)
+
+    def test_a_late_write_with_the_backups_start_counter_is_ignored(self):
+        # The likeliest collision: r0's late write and r1's start write both counted on from the same P,
+        # so they carry the same counter. Landing before r1's next write, it used to be adopted and
+        # yielded to (r0 isn't live): nobody polled until P went stale again
+        sim = self.sim()
+        sim.expect()
+        n0, n1 = ranked_names(sim, ["akim", "bob"])
+        r0, r1 = sim.pc(n0), sim.pc(n1)
+        self.steady(sim, 60)
+        stale = sim.p()
+        r0.poller.stop()
+        sim.pcs.remove(r0)
+        self.assertTrue(sim.run(60, until=lambda: r1.worker() is not None and r1.worker().started))
+        start = sim.p()
+        self.assertEqual((start.poller, r1.worker().p.counter), (r1.key, start.counter))
+        sent = record_calls(sim, [r1])
+        landed = dataclasses.replace(stale, counter=start.counter)
+        self.assertGreaterEqual(sim.clock.time() - landed.written_at, LOGIC.stale_s / 2)
+        sim.world.store(r0.identity).write_json(f"status/machines/{sim.mid}.poll.json",
+                                                {"file_type": "poll", **hx_model.to_json(landed)})
+        at = sim.clock.monotonic()
+        sim.run(hx_share.settle_s(LOGIC) + LOGIC.poll_fast_s + 1)
+        self.assertEqual(r1.entries("polling_stopped"), [])
+        self.assertTrue(r1.entries("late_write_ignored"))
+        self.assertTrue([c for c in sent[r1.key] if c[0] >= at])
+        self.assertEqual(sim.p().poller, r1.key)
+        sim.run(30)
+        self.assertEqual((sim.code(), sim.p().poller), ("running_confirmed", r1.key))
+        self.no_violations(sim)
+
+
+# --------------------------------------------------------------------------
+# The second reading (§3.8, §6.4 step 10) and printing that can't be read (§6.6)
+# --------------------------------------------------------------------------
+
+class SecondReadingTests(Base):
+    def test_a_stray_prin_then_no_reply_never_commits(self):
+        # One stray PRIN 0, and the second reading's PRIN gets no reply: the first value confirms nothing
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        answers = [sim.fake.DROP, sim.fake.DROP, "0"]
+        sim.fake.override("PRIN", lambda: answers.pop() if answers else None)
+        codes = []
+        sim.run(30, until=lambda: codes.append(sim.code()) or False)
+        self.assertEqual(answers, [])
+        self.assertNotIn("printing_off", codes)
+        self.assertEqual(a.entries("alert_started"), [])
+        self.assertEqual(sim.code(), "running_confirmed")
+
+    def test_a_re_read_that_cant_be_made_takes_prevs_value(self):
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        w = a.worker()
+        p = w.p
+        cyc = hx_poller._Cycle(a.clients.client(a.data.current.printers[sim.pid]), 0)
+        r = hx_state.Reading(at=sim.clock.time(), reachable=True, printing=False, ink_level=4, clock_offset_s=900.0,
+                             daily={"values": {"ENWHD": 99}})
+        for tag in ("PRIN", "INKL", "DATE", "ENWHD"):
+            sim.fake.override(tag, "7")         # busy
+        w._second_reading(cyc, r, ["PRIN", "INKL", "clock", "daily:ENWHD"], a.data.current)
+        for tag in ("PRIN", "INKL", "DATE", "ENWHD"):
+            sim.fake.override(tag, None)
+        self.assertEqual((r.printing, r.printing_unchecked, r.ink_level, r.clock_offset_s), (None, None, None, None))
+        self.assertEqual(r.daily["values"].get("ENWHD"), (p.daily or {}).get("values", {}).get("ENWHD"))
+
+    def hold_gate(self, sim, client, seconds):
+        held = threading.Event()
+
+        def holder():
+            with client._gate:
+                held.set()
+                time.sleep(0.3)                 # the poller's call is waiting for the gate now
+                sim.clock.advance(seconds)
+        t = threading.Thread(target=holder, daemon=True)
+        t.start()
+        held.wait(2)
+        return t
+
+    def test_a_second_reading_login_keeps_the_cycle_deadline(self):
+        # A Stop, Resume or clock set on this PC holds the gate: the login waits no longer than `end` and
+        # sends nothing late (states.md §6.4 step 7.3); before, it waited gate_wait_s and then logged in
+        timings = dataclasses.replace(LOGIC, gate_wait_s=3.0)
+        sim = self.sim(timings=timings)
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim, 60)
+        w = a.worker()
+        client = a.clients.client(a.data.current.printers[sim.pid])
+        before = len(sim.requests())
+        cyc = hx_poller._Cycle(client, 0)
+        r = hx_state.Reading(at=sim.clock.time(), reachable=True)
+        t = self.hold_gate(sim, client, 20.0)
+        w._second_reading(cyc, r, ["login"], a.data.current)
+        t.join()
+        self.assertEqual(sim.requests()[before:], [])
+        self.assertFalse(cyc.login_done)
+        # The client: a deadline it can't meet raises PrinterBusy at once and sends nothing
+        t = self.hold_gate(sim, client, 20.0)
+        with self.assertRaises(hx_model.PrinterBusy):
+            client.login(deadline=sim.clock.monotonic() + 1.0)
+        t.join()
+        self.assertEqual(sim.requests()[before:], [])
+
+    def login_change(self, sim, a, second_login):
+        """The printer refuses the token (a read answers AuthFailed), and the second reading's login does
+        `second_login`. Returns the codes P went through."""
+        sim.fake.set_password("other")
+        real = hx_protocol.PrinterClient.login
+
+        def login(client, *, deadline=None):
+            second_login()
+        codes = []
+        with mock.patch.object(hx_protocol.PrinterClient, "login", login):
+            sim.run(40, until=lambda: codes.append(sim.code()) or False)
+        self.assertIs(hx_protocol.PrinterClient.login, real)
+        return codes
+
+    def test_a_login_reply_that_cant_be_used_is_login_failed(self):
+        for error in (hx_model.BadReply, hx_model.WebReadFailed):
+            with self.subTest(error=error.__name__):
+                sim = self.sim()
+                sim.expect()
+                a = sim.pc("akim")
+                self.steady(sim)
+
+                def second_login(error=error):
+                    raise error(Msg("test"))
+                codes = self.login_change(sim, a, second_login)
+                self.assertEqual(codes[-1], "login_failed")
+
+    def test_a_login_that_couldnt_be_made_confirms_nothing(self):
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+
+        def second_login():
+            raise hx_model.PrinterBusy(Msg("test: this PC's gate"))
+        codes = self.login_change(sim, a, second_login)
+        self.assertNotIn("login_failed", codes)
+
+
+class PrinUnreadTests(Base):
+    AUTOPILOT = ("HXUI", "PRIN", "MSGNAM", "PMCNT", "INKL", "INKT", "PHTP", "DATE", "TIME")
+
+    def busy(self, sim, on=True):
+        for tag in self.AUTOPILOT:
+            sim.fake.override(tag, "7" if on else None)
+
+    def test_printing_that_cant_be_read_is_never_green(self):
+        # Every Autopilot read answers busy while Loads work, and printing is switched off at the panel:
+        # after PRIN_UNREAD_LIMIT cycles printing is unknown and the machine amber, never green
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        self.busy(sim)
+        with sim.fake.lock:
+            sim.fake.printing = False
+        t0 = sim.clock.monotonic()
+        board = []
+        for _ in range(90):
+            sim.run(1)
+            a.watcher.run_once()
+            m = machine_on_board(a, sim.mid)
+            board.append((sim.clock.monotonic() - t0, m.code, m.colour, m.printing))
+        late = [b for b in board if b[0] >= (hx_poller.PRIN_UNREAD_LIMIT + 1) * LOGIC.poll_fast_s]
+        self.assertEqual([b for b in late if b[2] == "green"], [])
+        self.assertIn(("printing_unchecked", "amber"), {(b[1], b[2]) for b in late})
+        # P keeps the last known value (on); the board shows printing as unknown
+        self.assertIs(sim.p().printing, True)
+        self.assertTrue(sim.p().printing_unchecked)
+        self.assertEqual({b[3] for b in late if b[1] == "printing_unchecked"}, {None})
+        # A busy-only cycle moves no judged counter: only the cycles with a good Load do
+        self.assertIn("not_monitored", {b[1] for b in late})
+        self.assertEqual({b[2] for b in late if b[1] == "not_monitored"}, {"amber"})
+        # E says stopped, and PRIN is read again: on. Red printing_on_unexpected, as for any reading
+        sim.sender.write_expected(dataclasses.replace(sim.sender.read_expected(sim.mid), mode="stopped_by_user",
+                                                      printing_expected=False, stopped_by=JSMITH,
+                                                      counter=sim.sender.read_expected(sim.mid).counter + 1))
+        self.busy(sim, False)
+        with sim.fake.lock:
+            sim.fake.printing = True
+        self.assertTrue(sim.run(30, until=lambda: sim.code() == "printing_on_unexpected"))
+        self.assertFalse(sim.p().printing_unchecked)
+
+    def test_a_red_printing_on_stays_red_while_prin_is_busy(self):
+        # Switched on at the panel after a Stop: red printing_on_unexpected. Then only PRIN answers busy:
+        # the red state and its alert stay, the same id, while the printer still prints
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        e = sim.sender.read_expected(sim.mid)
+        sim.sender.write_expected(dataclasses.replace(e, mode="stopped_by_user", printing_expected=False,
+                                                      stopped_by=JSMITH, counter=e.counter + 1))
+        with sim.fake.lock:
+            sim.fake.printing = False
+        self.assertTrue(sim.run(30, until=lambda: sim.code() == "stopped"))
+        with sim.fake.lock:
+            sim.fake.printing = True
+        self.assertTrue(sim.run(30, until=lambda: sim.code() == "printing_on_unexpected"), sim.code())
+        (first,) = [x for x in sim.p().alerts if x.kind == "printing_on" and x.active]
+        sim.fake.override("PRIN", "7")
+        seen = []
+        for _ in range(40):
+            sim.run(1)
+            a.watcher.run_once()
+            m = machine_on_board(a, sim.mid)
+            seen.append((sim.p().state.code, m.colour,
+                         tuple(x.id for x in sim.p().alerts if x.kind == "printing_on" and x.active)))
+        self.assertTrue(sim.p().printing_unchecked)
+        self.assertEqual(set(seen), {("printing_on_unexpected", "red", (first.id,))})
+
+    def test_an_acked_ink_out_keeps_its_id_through_a_prin_busy_spell(self):
+        sim = self.sim()
+        sim.expect()
+        sim.pc("akim")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.ink_level = 4                  # out of ink while printing
+        self.assertTrue(sim.run(120, until=lambda: any(x.kind == "ink_out" and x.active for x in sim.p().alerts)))
+        first = next(x for x in sim.p().alerts if x.kind == "ink_out" and x.active)
+        sim.observer.write_ack(Ack(alert_id=first.id, by=JSMITH, computer="FLOOR01", at=sim.clock.time()))
+        self.assertTrue(sim.run(30, until=lambda: any(x.id == first.id and x.acked_by for x in sim.p().alerts)))
+        sim.fake.override("PRIN", "7")              # PRIN busy, everything else answers
+        sim.run(30)
+        self.assertTrue(sim.p().printing_unchecked)
+        during = [(x.id, x.active, x.acked_by) for x in sim.p().alerts if x.kind == "ink_out"]
+        sim.fake.override("PRIN", None)
+        sim.run(30)
+        self.assertFalse(sim.p().printing_unchecked)
+        after = [(x.id, x.active, x.acked_by) for x in sim.p().alerts if x.kind == "ink_out"]
+        self.assertEqual((during, after), ([(first.id, True, JSMITH)], [(first.id, True, JSMITH)]))
+
+    def test_a_busy_cycle_or_two_keeps_the_colour(self):
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        self.busy(sim)
+        codes = []
+        sim.run((hx_poller.PRIN_UNREAD_LIMIT - 1) * LOGIC.poll_fast_s - 0.5,
+                until=lambda: codes.append(sim.code()) or False)
+        self.busy(sim, False)
+        sim.run(20, until=lambda: codes.append(sim.code()) or False)
+        self.assertEqual(set(codes), {"running_confirmed"})
 
 
 def machine_on_board(pc, machine_id):

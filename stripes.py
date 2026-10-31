@@ -917,29 +917,74 @@ class DeploymentLog:
 
     MAX_EVENTS = 50
     OBSOLETE = ("pending_update", "last_update_error", "beta")  # left by builds that updated themselves
+    CARRIED = ("version", "first_seen", "last_update", "events")  # from the older versions' record
 
-    def __init__(self, folder, computer=None, user=None):
+    def __init__(self, folder, computer=None, user=None, old_folder=None):
         self.folder = folder
         self.computer = computer or os.environ.get("COMPUTERNAME") or socket.gethostname()
         self.user = user or os.environ.get("USERNAME") or getpass.getuser()
         self.path = os.path.join(folder, f"{_safe_name(self.computer)}_{_safe_name(self.user)}.json")
+        # The older versions' record of this PC and user (same file name in their folder): read on
+        # this version's first start so the upgrade isn't shown as a fresh install. Never written.
+        self.old_path = None
+        if old_folder and os.path.normcase(os.path.abspath(old_folder)) != os.path.normcase(os.path.abspath(folder)):
+            self.old_path = os.path.join(old_folder, os.path.basename(self.path))
         self._lock = threading.Lock()
 
-    def read(self):
+    def read(self, path=None):
         try:
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+            return self._load(path or self.path) or {}
+        except OSError:
             return {}
 
+    @staticmethod
+    def _load(path):
+        """The record in path: {} when there's no such file, None when it's damaged. Raises
+        OSError when it can't be read (the share went away for a moment)."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
     def write(self, event=None, **fields):
-        """Merge fields into this PC/user's record (and log an event).
-        Returns False when the status folder isn't there or can't be reached."""
+        """Merge fields into this PC/user's record (and log an event). Returns False when the
+        status folder isn't there or the record can't be read."""
+        return self._update(lambda record: (event, fields))
+
+    def started(self, version, exe):
+        """Note a start: "Installed", "Updated" or (a plain restart) no event. Worked out from the
+        record read under the lock, so a heartbeat or config write can't come in between."""
+        def change(record):
+            fields = dict(version=version, exe=exe, last_start=_now(), running=True,
+                          windows=platform.platform())
+            previous = record.get("version")
+            if previous is None:
+                event = f"Installed ({version})"
+            elif previous != version:
+                event = f"Updated {previous} -> {version}"
+                fields["last_update"] = {"from": previous, "to": version, "at": _now()}
+            else:
+                event = None
+            return event, fields
+        return self._update(change, carry=True)
+
+    def _update(self, change, carry=False):
         with self._lock:
             if not os.path.isdir(self.folder):
                 return False
-            record = self.read()
+            try:
+                record = self._load(self.path)
+            except OSError:
+                return False            # writing a record we couldn't read would lose its history
+            if record is None:
+                record = {}             # damaged: start again, without the old versions' record
+            elif carry and "version" not in record:
+                record = self._carried(record)  # this version's first start (architecture §10.5)
+            event, fields = change(record)
             for key in self.OBSOLETE:
                 record.pop(key, None)
             now = _now()
@@ -954,18 +999,18 @@ class DeploymentLog:
             os.replace(tmp, self.path)
             return True
 
-    def started(self, version, exe):
-        previous = self.read().get("version")
-        fields = dict(version=version, exe=exe, last_start=_now(), running=True,
-                      windows=platform.platform())
-        if previous is None:
-            event = f"Installed ({version})"
-        elif previous != version:
-            event = f"Updated {previous} -> {version}"
-            fields["last_update"] = {"from": previous, "to": version, "at": _now()}
-        else:
-            event = None
-        return self.write(event, **fields)
+    def _carried(self, record):
+        """record (none yet, or one the heartbeat or config write made before any start) with the
+        older versions' version, install date, last update and events, so the upgrade is logged as
+        one. Without an old record (none, damaged or unreadable) it stays as it is."""
+        try:
+            old = (self._load(self.old_path) or {}) if self.old_path else {}
+        except OSError:
+            old = {}
+        merged = dict(record, **{key: old[key] for key in self.CARRIED if key in old and key != "events"})
+        if isinstance(old.get("events"), list):
+            merged["events"] = old["events"] + (record["events"] if isinstance(record.get("events"), list) else [])
+        return merged
 
 
 
@@ -1311,7 +1356,7 @@ class App(tk.Tk):
             remove_download_mark(sys.executable)
             remove_old_versions(sys.executable)  # leftovers from when it did
         folder = status_folder()
-        self.deployment = DeploymentLog(folder) if folder else None
+        self.deployment = DeploymentLog(folder, old_folder=old_status_folder()) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
         # Closing the window keeps Stripes running in the tray, so it opens instantly next

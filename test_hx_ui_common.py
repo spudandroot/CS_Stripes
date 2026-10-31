@@ -109,6 +109,10 @@ class TextTests(unittest.TestCase):
         epoch = 1_793_275_200.0
         self.assertEqual(common.when(epoch), time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)))
         self.assertRegex(common.when(epoch), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        # Times read from other PCs' share files can be anything JSON allows (NaN, Infinity, 1e400):
+        # a time this PC can't show is "?", never an exception that stops a pop-up or a board
+        for bad in (1e20, -1e20, float("inf"), float("-inf"), float("nan")):
+            self.assertEqual(common.when(bad), "?", bad)
 
     def test_join_names(self):
         self.assertEqual(common.join_names([]), "")
@@ -423,8 +427,10 @@ class StyleAndTextsTests(TkCase):
         self.assertIn("bold", str(style.lookup("Hx.Big.TButton", "font")))
         self.assertEqual(str(style.lookup("Hx.Card.TFrame", "background")), common.CARD_BG)
         self.assertEqual(str(style.lookup("Hx.Small.TLabel", "foreground")), common.MUTED_FG)
-        for name in ("Ok.TLabel", "Bad.TLabel", "Muted.TLabel"):
-            self.assertTrue(style.lookup(name, "foreground"), name)
+        # Where App hasn't set them, its own colours (lookup() alone would see the theme's black)
+        for name, colour in (("Ok.TLabel", common.COLOUR_HEX[common.GREEN]),
+                             ("Bad.TLabel", common.COLOUR_HEX[common.RED]), ("Muted.TLabel", common.MUTED_FG)):
+            self.assertEqual(str(style.lookup(name, "foreground")), colour, name)
 
     def test_fonts(self):
         self.assertIn(common.bag_font_family(self.root), common.BAG_FONTS + ("TkDefaultFont",))

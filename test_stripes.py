@@ -598,6 +598,155 @@ class DeploymentLogTests(unittest.TestCase):
         self.assertEqual(sorted(r["computer"] for r in records), ["PC1", "PC2"])
         self.assertIn("PC2_Bob_Smith.json", os.listdir(self.dir))
 
+    def test_first_start_carries_the_old_record_over(self):
+        # The MapleJet version writes to v2\status\deployment, where nothing is on its first start:
+        # it showed every upgraded PC as a fresh install (install date reset, no last update, no history)
+        old = os.path.join(self.dir, "status")
+        new = os.path.join(self.dir, "v2", "status", "deployment")
+        os.makedirs(old)
+        os.makedirs(new)
+        before = {"computer": "FLOOR01", "user": "jsmith", "version": "v1.4.0", "first_seen": "2025-01-10 08:00:00",
+                  "last_seen": "2026-10-29 16:00:00",
+                  "last_update": {"from": "v1.3.0", "to": "v1.4.0", "at": "2026-03-01 08:00:00"},
+                  "events": [{"at": "2025-01-10 08:00:00", "event": "Installed (v1.3.0)"},
+                             {"at": "2026-03-01 08:00:00", "event": "Updated v1.3.0 -> v1.4.0"}],
+                  "pending_update": "v1.4.1"}
+        old_file = os.path.join(old, "FLOOR01_jsmith.json")
+        with open(old_file, "w", encoding="utf-8") as f:
+            json.dump(before, f)
+        with open(old_file, "rb") as f:
+            old_bytes = f.read()
+        log = zl.DeploymentLog(new, "FLOOR01", "jsmith", old_folder=old)
+        self.assertTrue(log.started("v2.0.0", "x"))
+        r = log.read()
+        self.assertEqual((r["version"], r["first_seen"]), ("v2.0.0", "2025-01-10 08:00:00"))
+        self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.4.0", "v2.0.0"))
+        self.assertEqual([e["event"] for e in r["events"]],
+                         ["Installed (v1.3.0)", "Updated v1.3.0 -> v1.4.0", "Updated v1.4.0 -> v2.0.0"])
+        self.assertNotIn("pending_update", r)
+        shown = zl.read_all_deployment([new, old])
+        self.assertEqual([(s["version"], s["first_seen"]) for s in shown], [("v2.0.0", "2025-01-10 08:00:00")])
+        # The old folder is only read
+        self.assertEqual(os.listdir(old), ["FLOOR01_jsmith.json"])
+        with open(old_file, "rb") as f:
+            self.assertEqual(f.read(), old_bytes)
+        # Later starts use this version's record only: the old one can change and it isn't read again
+        with open(old_file, "w", encoding="utf-8") as f:
+            json.dump(dict(before, version="v1.4.2", first_seen="2026-10-30 08:00:00"), f)
+        log.started("v2.0.0", "x")
+        log.started("v2.0.1", "x")
+        r = log.read()
+        self.assertEqual((r["first_seen"], r["last_update"]["from"]), ("2025-01-10 08:00:00", "v2.0.0"))
+        self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v2.0.0 -> v2.0.1")
+        # No old record, a damaged one, or the same folder twice: a fresh install as before
+        for name, content in (("PC2", None), ("PC3", "{not json"), ("PC4", "[1, 2]")):
+            if content is not None:
+                with open(os.path.join(old, f"{name}_jsmith.json"), "w", encoding="utf-8") as f:
+                    f.write(content)
+            fresh = zl.DeploymentLog(new, name, "jsmith", old_folder=old)
+            fresh.started("v2.0.0", "x")
+            self.assertEqual([e["event"] for e in fresh.read()["events"]], ["Installed (v2.0.0)"], name)
+            self.assertNotIn("last_update", fresh.read())
+        self.assertIsNone(zl.DeploymentLog(new, "PC5", "jsmith", old_folder=new + os.sep).old_path)
+
+    OLD_RECORD = {"computer": "FLOOR01", "user": "jsmith", "version": "v1.4.0", "first_seen": "2025-01-10 08:00:00",
+                  "last_seen": "2026-10-29 16:00:00",
+                  "last_update": {"from": "v1.3.0", "to": "v1.4.0", "at": "2026-03-01 08:00:00"},
+                  "events": [{"at": "2025-01-10 08:00:00", "event": "Installed (v1.3.0)"}]}
+
+    def upgrade_folders(self):
+        """(new folder, old folder) with this PC and user's record in the old one."""
+        old = os.path.join(self.dir, "Share", "Stripes", "status")
+        new = os.path.join(self.dir, "Share", "Stripes", "v2", "status", "deployment")
+        os.makedirs(old)
+        os.makedirs(new)
+        with open(os.path.join(old, "FLOOR01_jsmith.json"), "w", encoding="utf-8") as f:
+            json.dump(self.OLD_RECORD, f)
+        return new, old
+
+    def assert_carried(self, r, version="v2.0.0"):
+        self.assertEqual((r["version"], r["first_seen"]), (version, "2025-01-10 08:00:00"))
+        self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v1.4.0", version))
+        self.assertEqual([e["event"] for e in r["events"]], ["Installed (v1.3.0)", f"Updated v1.4.0 -> {version}"])
+
+    def test_first_start_carries_over_after_the_share_was_down(self):
+        # Stripes starts at sign-in before the share is reachable: the start writes nothing, the
+        # heartbeat and the config write then make a record with no version. The next start still
+        # carries the old record over (it used to log a fresh install, dated today, no history)
+        new, old = self.upgrade_folders()
+        share = os.path.dirname(old)
+        os.rename(share, share + ".away")
+        log = zl.DeploymentLog(new, "FLOOR01", "jsmith", old_folder=old)
+        self.assertFalse(log.started("v2.0.0", "x"))
+        os.rename(share + ".away", share)
+        self.assertTrue(log.write(running=True))                  # App._heartbeat
+        self.assertTrue(log.write(config="server", printers=3))   # App._config_loaded
+        self.assertNotIn("version", log.read())
+        self.assertTrue(zl.DeploymentLog(new, "FLOOR01", "jsmith", old_folder=old).started("v2.0.0", "x"))
+        r = log.read()
+        self.assert_carried(r)
+        self.assertEqual((r["config"], r["printers"]), ("server", 3))
+
+    def test_config_write_during_the_first_start(self):
+        # App._config_loaded writes on its own worker thread. If it lands while started() is
+        # deciding, the start must still carry the old record over (the decision used to be made
+        # outside the lock, and the write then dropped the install date and history)
+        new, old = self.upgrade_folders()
+        log = zl.DeploymentLog(new, "FLOOR01", "jsmith", old_folder=old)
+        real_open, other = open, []
+
+        def racing_open(path, *args, **kwargs):
+            if path == log.old_path and not other:
+                other.append(threading.Thread(target=lambda: log.write(config="server", printers=3)))
+                other[0].start()
+                other[0].join(0.5)      # it gets its turn now, unless started() holds the lock
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch.object(zl, "open", racing_open, create=True):
+            self.assertTrue(log.started("v2.0.0", "x"))
+        other[0].join(5)
+        r = log.read()
+        self.assert_carried(r)
+        self.assertEqual((r["config"], r["printers"]), ("server", 3))
+
+    def test_unreadable_record_is_not_a_first_start(self):
+        # A share hiccup on the one read of this version's record: nothing is written (it used to
+        # take the old v1.4.0 record as the previous version and log a false "Updated v1.4.0 ->
+        # v2.0.1" over the real last update). A damaged record starts again without the old one.
+        new, old = self.upgrade_folders()
+        log = zl.DeploymentLog(new, "FLOOR01", "jsmith", old_folder=old)
+        log.started("v2.0.0", "x")
+        log.started("v2.0.1", "x")
+        with open(log.path, "rb") as f:
+            before = f.read()
+        self.assertEqual(json.loads(before)["last_update"]["from"], "v2.0.0")
+        real_open = open
+
+        def flaky_open(path, mode="r", *args, **kwargs):
+            if path == log.path and "r" in mode:
+                raise OSError("The specified network name is no longer available")
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch.object(zl, "open", flaky_open, create=True):
+            self.assertFalse(log.started("v2.0.1", "x"))
+            self.assertFalse(log.started("v2.0.2", "x"))
+            self.assertFalse(log.write(running=True))
+        with open(log.path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        log.started("v2.0.2", "x")                  # the share is back
+        r = log.read()
+        self.assertEqual(r["first_seen"], "2025-01-10 08:00:00")
+        self.assertEqual((r["last_update"]["from"], r["last_update"]["to"]), ("v2.0.1", "v2.0.2"))
+        self.assertEqual([e["event"] for e in r["events"]][-1], "Updated v2.0.1 -> v2.0.2")
+
+        with open(log.path, "w", encoding="utf-8") as f:
+            f.write('{"version": "v2.0.2", "first_s')
+        log.started("v2.0.2", "x")
+        r = log.read()
+        self.assertEqual([e["event"] for e in r["events"]], ["Installed (v2.0.2)"])
+        self.assertNotIn("last_update", r)
+        self.assertNotEqual(r["first_seen"], "2025-01-10 08:00:00")
+
     def test_no_status_folder_means_no_writes(self):
         log = zl.DeploymentLog(os.path.join(self.dir, "missing"), "PC", "U")
         self.assertFalse(log.started("v1.2.0", "x"))
@@ -1299,6 +1448,25 @@ class AppTests(unittest.TestCase):
                          (["Packing ZD420", "Pallets ZT410"], "Pallets ZT410"))
         app.update()
         zl.App._first_run.assert_not_called()    # printers to list, so no Welcome box (_maybe_first_run)
+
+    def test_first_start_keeps_the_deployment_history(self):
+        # The app gives its DeploymentLog the older versions' folder, so the upgrade shows as one
+        share = os.path.join(self.tmp, "Share", "Stripes")
+        new, old = os.path.join(share, "v2", "status", "deployment"), os.path.join(share, "status")
+        os.makedirs(new)                            # the folder script has run
+        name = os.path.basename(zl.DeploymentLog(new).path)
+        write_json(os.path.join(old, name), {"computer": "FLOOR01", "user": "jsmith", "version": "v1.4.0",
+                                             "first_seen": "2025-01-10 08:00:00", "last_seen": "2026-10-29 16:00:00",
+                                             "events": [{"at": "2025-01-10 08:00:00", "event": "Installed (v1.4.0)"}]})
+        self.with_config_folder()
+        app = self.app
+        self.assertTrue(self.pump_until(lambda: os.path.exists(os.path.join(new, name))))
+        r = app.deployment.read()
+        self.assertEqual((r["version"], r["first_seen"], (r.get("last_update") or {}).get("from")),
+                         ("dev", "2025-01-10 08:00:00", "v1.4.0"))
+        self.assertEqual([e["event"] for e in r["events"]], ["Installed (v1.4.0)", "Updated v1.4.0 -> dev"])
+        self.assertEqual(app.deployment.old_path, os.path.join(old, name))
+        self.assertEqual(os.listdir(old), [name])       # only read
 
     def test_deployment_status_lists_both_folders(self):
         # architecture §10.5 item 4: the rollout view reads this version's folder and the older versions' one

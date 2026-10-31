@@ -26,6 +26,7 @@ import traceback
 import webbrowser
 import tkinter as tk
 from datetime import date
+from decimal import Decimal
 from tkinter import filedialog, ttk
 
 import hx_message
@@ -688,11 +689,18 @@ def preview_lines(pt: PrintText, values: dict[str, str]) -> list[str]:
 # --------------------------------------------------------------------------
 
 def _num(x) -> str:
-    """A number for people (never translated): 150.0 -> "150", 152.5 -> "152.5"."""
+    """A number for people (never translated): 150.0 -> "150", 152.5 -> "152.5". Exact, with no
+    exponent, so a form reads back what it was filled with: 1480.125 stays 1480.125, and an
+    unrelated save never changes a stored value (ui.md §2.2 rule 7). Round worked-out values first."""
     if x is None:
         return ""
     if isinstance(x, float):
-        return f"{round(x, 3):g}"
+        if not math.isfinite(x):
+            return str(x)
+        shown = format(Decimal(repr(x)), "f")      # repr: the shortest text that reads back the same
+        if "." in shown:
+            shown = shown.rstrip("0").rstrip(".")
+        return "0" if shown == "-0" else shown
     return str(x)
 
 
@@ -3531,7 +3539,7 @@ class AdjustmentDialog(HxWindow):
     def __init__(self, master, services, *, machine_id: str, film_id: str):
         self.key = f"adjust:{machine_id}__{film_id}"
         super().__init__(master, services, title=N_("Machine + film adjustment"))
-        self.geometry("480x300")
+        self.geometry("480x340")
         self.resizable(True, False)
         texts = self.texts
         data = services.data.current
@@ -3575,8 +3583,12 @@ class AdjustmentDialog(HxWindow):
         self.problems_label = _Lines(body, style="Bad.TLabel", wrap=440)
         self.problems_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self.problems_label.show([])
+        # Why Save is off: the admin window's own texts (ui.md §11.1 items 9 and 10)
+        self.state_label = _Lines(body, style="Warn.TLabel", wrap=440)
+        self.state_label.grid(row=7, column=0, columnspan=3, sticky="w")
+        self.state_label.show([])
         buttons = ttk.Frame(body)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        buttons.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         self.save_button = ttk.Button(buttons, style="Hx.Main.TButton", command=self._save)
         texts.set(self.save_button, N_("Save"))
         self.save_button.pack(side="right")
@@ -3585,7 +3597,32 @@ class AdjustmentDialog(HxWindow):
         self.cancel_button.pack(side="right", padx=(0, 8))
         self.bind("<Escape>", lambda e: self.destroy())
         self.existing = None
+        self._saving = False
         self._chosen()
+        # Save follows the rule of every admin page's Save (ui.md §11.1 items 9 and 10)
+        self.subscribe(DataUpdate, lambda e: self._update_save_state())
+        self.subscribe(ShareHealth, lambda e: self._update_save_state())
+        self._update_save_state()
+
+    def can_save(self) -> bool:
+        services = self.services
+        data = services.data.current
+        return (not self._saving and data is not None and services.store.available and data.source != "local"
+                and roles(services).admin)
+
+    def _update_save_state(self):
+        services = self.services
+        data = services.data.current
+        _enable(self.save_button, self.can_save())
+        why = []
+        if not services.store.available or data is None or data.source == "local":
+            why.append(Msg(N_("The server can't be reached. Changes can't be saved now.")))
+        if not roles(services).admin:
+            why.append(Msg(N_("Only Stripes Administrators can change this.")))
+        self.state_label.show(why)
+
+    def refresh_texts(self) -> None:
+        _render_lines(self)
 
     def _machine(self):
         data = self.services.data.current
@@ -3646,6 +3683,8 @@ class AdjustmentDialog(HxWindow):
 
     def _save(self):
         services = self.services
+        if not self.can_save():
+            return
         try:
             adj = self.adjustment()
         except ValueError:
@@ -3656,12 +3695,14 @@ class AdjustmentDialog(HxWindow):
         if problems:
             return
         expected = self.existing.revision if self.existing is not None else None
-        _enable(self.save_button, False)
+        self._saving = True
+        self._update_save_state()
 
         def done(saved, error):
             if not _alive(self):
                 return
-            _enable(self.save_button, True)
+            self._saving = False
+            self._update_save_state()
             if error is not None:
                 self.problems_label.show([_error_msg(error)])
                 return
@@ -4227,8 +4268,9 @@ class TestPrintWindow(_TestRunner, HxWindow):
                     self.start_var.set("")
                     self.stop_var.set("")
                 else:
-                    self.start_var.set(_num(float(value - 2 * step)))
-                    self.stop_var.set(_num(float(value + 2 * step)))
+                    # Worked out, so rounded (1050.1 - 40 is 1010.0999999999999 in floating point)
+                    self.start_var.set(_num(round(float(value - 2 * step), 3)))
+                    self.stop_var.set(_num(round(float(value + 2 * step), 3)))
                 self.step_var.set(_num(step))
         self._show_machine_state()
         self.recompute()

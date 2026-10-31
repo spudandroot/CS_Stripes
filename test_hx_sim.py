@@ -28,7 +28,7 @@ import hx_share
 import hx_state
 import hx_time
 from hx_core import SYSTEM_CLOCK, EventBus
-from hx_model import (AMBER, RED, STEP_BUILD, STEP_CHECK_MACHINE, STEP_LOCK, STEP_WAIT_POLLER, STEPS, TIMINGS,
+from hx_model import (AMBER, GREEN, RED, STEP_BUILD, STEP_CHECK_MACHINE, STEP_LOCK, STEP_WAIT_POLLER, STEPS, TIMINGS,
                       DesignItem, ExpectedState, LineChoice, MessageDesign, SendEvent, SendRequest, new_id)
 from hx_share import settle_s
 
@@ -697,6 +697,49 @@ class PlantTests(unittest.TestCase):
         self.assertEqual([s for s in after if s[1] == "green" and s[2] != s[3]], [])
         self.assertEqual(after[-1][:3], ("running_confirmed", "green", ORIGIN))
         poller.stop()
+        plant.check_one_request_at_a_time()
+
+    def test_a_stuck_worker_is_replaced(self):
+        """A polling PC's worker thread really blocks while its coordinator heart-beats (states.md §6.2
+        step 3): its PC fences the worker and declines the printer, the other PC polls it within about
+        70 scaled seconds, and no board shows a green that isn't freshly judged."""
+        plant = Plant(self, printers=1)
+        a, b = plant.pc("akim"), plant.pc("bob")
+        a.start()
+        b.start()
+        self.addCleanup(b.stop)
+        self.addCleanup(a.stop)
+        pid = plant.pids[0]
+        self.assertTrue(wait(lambda: plant.code(0) == "running_confirmed", 8))
+        poller, other = plant.pollers(0, [a, b])
+        w = poller.poller._workers[pid]
+        hang = threading.Event()
+        self.addCleanup(hang.set)
+        stuck = threading.Event()
+
+        def blocked_cycle():
+            stuck.set()
+            hang.wait(30.0)
+        w._cycle = blocked_cycle
+        self.assertTrue(stuck.wait(2.0))
+        t0 = time.monotonic()
+        views = []
+        while time.monotonic() < t0 + 120 * F:
+            time.sleep(5 * F)
+            board = other.watcher.latest
+            if board is not None:
+                m = board.lines[0].machines[0]
+                views.append(((time.monotonic() - t0) / F, m.colour, m.monitored, m.checked_age_s))
+        with plant._lock:
+            by_other = [e for e in plant.exchanges if e[1] == other.name and e[3] >= t0]
+        self.assertTrue(by_other and (by_other[0][3] - t0) / F <= 70, by_other[:2])
+        self.assertTrue(w.fenced)
+        self.assertIn(pid, poller.poller._fenced)
+        stale_green = [v for v in views if v[1] == GREEN and v[2] and v[3] is not None
+                       and v[3] >= plant.timings.not_monitored_s]
+        self.assertEqual(stale_green, [])
+        hang.set()
+        self.assertTrue(wait(lambda: w.done, 2))
         plant.check_one_request_at_a_time()
 
     def test_slow_everything(self):

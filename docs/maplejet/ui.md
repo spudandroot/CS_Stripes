@@ -71,7 +71,8 @@ def check_tk_thread() -> None                       # RuntimeError("Tk call off 
                                                     # STRICT_THREADS and not on_tk_thread()
 def setup_styles(root: tk.Misc) -> None             # §2.4; idempotent
 def text(msg: Msg | None) -> str                    # architecture §6.10
-def when(epoch: float | None) -> str                # time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)); "" for None
+def when(epoch: float | None) -> str                # time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)); "" for None;
+                                                    # "?" when it can't be shown (inf, nan, out of range); never raises
 def join_names(names: list[str]) -> str             # "A", "A and B", "A, B and C" (§2.2 rule 6)
 def bag_font_family(root: tk.Misc) -> str           # first of BAG_FONTS in tkinter.font.families(), else "TkDefaultFont"
 def mono_font_family(root: tk.Misc) -> str          # first of MONO_FONTS, else "TkFixedFont"
@@ -433,9 +434,14 @@ is added to `i18n.ES` by architecture §10.6; the UI modules use the same pair.
    status, a tree cell with an item name) isn't put in `Texts`; `refresh_texts()` renders it again.
 6. `join_names(names)`: one name as it is; two as `tr("{first} and {last}", first=a, last=b)`; more as
    `", ".join(names[:-1])` for `first` and the last name for `last`.
-7. Numbers are shown with `f"{x:g}"` (150.0 → "150", 152.5 → "152.5"); times with `when()` or
-   `time.strftime`. Neither is translated. The Tcl `clock` command is never used (deploy.md §2.2: the
-   exe leaves out Tcl's time-zone data).
+7. The admin window shows lengths, positions, delays and adjustments exactly, with no exponent
+   and no trailing zeros (`hx_ui_admin._num`: 150.0 → "150", 152.5 → "152.5", 1480.125 →
+   "1480.125"). A form reads back what it was filled with, so a save never changes a value nobody
+   edited. A worked-out value (a test range start) is rounded to 3 decimals first. The Send window's
+   `placement_text` (§6) is a label that is never read back: it uses `f"{x:g}"` (at most 6
+   significant digits), so a 1480.125 ms delay shows as "Delay 1480.12 ms". Times are shown with
+   `when()` or `time.strftime`. Neither is translated. The Tcl `clock` command is never used
+   (deploy.md §2.2: the exe leaves out Tcl's time-zone data).
 8. Window titles are set through `Texts.title`. Tab texts of the two top tabs are names and aren't
    translated (architecture §10.2 rule 4).
 
@@ -470,7 +476,8 @@ is added to `i18n.ES` by architecture §10.6; the UI modules use the same pair.
 ### 2.4 Look
 
 `setup_styles(root)` defines these `ttk` styles once (the existing `Print.TButton`, `Warn.TLabel`,
-`Ok.TLabel`, `Bad.TLabel` and `Muted.TLabel` of `stripes.py` are reused, not redefined):
+`Ok.TLabel`, `Bad.TLabel` and `Muted.TLabel` of `stripes.py` are reused, not redefined; where
+`stripes.App` hasn't set one's own foreground, in tests and the self-check, it gets App's colour):
 
 | Style | Settings | Used for |
 |---|---|---|
@@ -515,7 +522,7 @@ sizes (negative Tk sizes, §10.3). Colours for states are always `COLOUR_HEX[vie
    | `AdminWindow` | 1180x820 | 900x600 |
    | `TestPrintWindow`, `CalibrationWindow` | 1000x760 | 760x560 |
    | `AlertPopup` | 520x320 | 420x240 |
-   | `UserSettingsDialog`, `AdjustmentDialog` | 480x320 / 480x300 | |
+   | `UserSettingsDialog`, `AdjustmentDialog` | 480x320 / 480x340 | |
    | `PhotoWindow` | sized to the photo, at most 90% of the screen (§5.11) | 320x240 |
 
 4. Windows open centred on the main window when it is visible, else on the primary screen.
@@ -1660,8 +1667,8 @@ status, age. Nothing wraps and nothing runs into the next column: a name, status
 its column shrinks, then ends in "…"; an origin is never shortened, it shrinks instead, and every
 origin on the board is drawn at one size, so the rows look even. All rows fit, or the board scrolls.
 (This replaces the build's first layout, which put the line's name above each machine's full name,
-sized each origin on its own row, wrapped long texts and never scrolled; where states.md §8.1 still
-describes that, this section is the one to follow.)
+sized each origin on its own row, wrapped long texts and never scrolled. states.md §8.1 sums up this
+layout and points here for the drawing rules, sizes and examples.)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -1897,7 +1904,7 @@ names), `new_button`, `save_button`, `revert_button`, `reload_button`, `problems
 
 | Field | Widget | Notes |
 |---|---|---|
-| `time_server`, `time_server_fallback` | Entry | a host name or IP address |
+| `time_server`, `time_server_fallback` | Entry | a host name or IP address, with `:port` (ASCII digits, 1 to 65535) when it isn't 123 |
 | `countries` | `countries_tree` and the row editor | aliases typed comma-separated, stored as a list (stripped, empty ones dropped); a country is never removed: untick "Offered" (`active`) |
 | `inks` | `inks_tree` and the row editor; cartridge and colour `ChoiceBox`es | inks may be removed (a lookup list, not a record) |
 | `lot_min_digits`, `lot_max_digits` | Spinbox 1–20 | |
@@ -2327,6 +2334,12 @@ edits it from the other side.
    position_mm=..., delay_ms=...), expected_revision=<existing.revision, or None when there is no
    record>)`. Who set it and when are the record's `updated_by`/`updated_at`, shown as "Set by {user} at
    {time}".
+5. The dialog is the page's only editor, so its `save_button` follows §11.1 items 9 and 10 like every
+   page's Save: `can_save()` is `not saving and data.current is not None and store.available and
+   data.current.source != "local" and roles.admin`, checked when it opens, on every `DataUpdate` and
+   `ShareHealth`, and again in `_save`. While it is False, `state_label` (`Warn.TLabel`) says why with
+   the admin window's texts: "The server can't be reached. Changes can't be saved now." and/or "Only
+   Stripes Administrators can change this."
 
 ## 12. The test print window
 
@@ -3351,6 +3364,8 @@ last.
 | `test_alert_wav` | `test_hx_ui.py` | `assets/alert.wav` matches `alert_wav_bytes()` within 1 per sample; 22,050 Hz, mono, 16-bit, 66,150 frames |
 | `test_admin_save_and_conflict` | `test_hx_ui_admin.py` | change a line's name and save: revision + 1 and "Saved Line 1." ; after another store writes a newer revision, Save shows the `RevisionConflict` text and `reload_button` |
 | `test_admin_refuses_non_admin` | `test_hx_ui_admin.py` | `nav.open_admin()` for a sender only tells "Only Stripes Administrators can do this." |
+| `test_adjustment_dialog_follows_the_save_rule` | `test_hx_ui_admin.py` | an open `AdjustmentDialog`: Save off with `state_label` saying why for `source "local"`, for `store.available` False (and a dialog opened then), and after a real `DataUpdate` removes the role; on again when the share is back; nothing saved meanwhile (§11.9 rule 5) |
+| `test_unedited_numbers_survive_an_unrelated_save` | `test_hx_ui_admin.py` | a film with `delay_ms` 1480.125 or 100000.5 or `position_mm` 150.4996: changing only the artwork revision and saving keeps the value exactly; the adjustment dialog shows 12.0625 as "12.0625" (§2.2 rule 7) |
 | `test_printer_password_once` | `test_hx_ui_admin.py` | a new printer with password "123321": the saved token unscrambles to `make_token("123321")`; the password entry is empty after Save; neither "123321", its md5 hex nor the plain token appears in the record file or in any `hx-admin` log file; the status reads "A password is saved..." |
 | `test_film_files_and_previews` | `test_hx_ui_admin.py` | with `filedialog.askopenfilename` patched to a generated JPEG: `save_file` and `save_preview` ran, the `FileRef` is in `working.files`, the thumbnail shows, a second front photo replaces the first ref; a PDF gets no preview |
 | `test_print_text_membership` | `test_hx_ui_admin.py` | ticking a film in the print-text designer and saving adds the id to the film's `print_text_ids`; unticking a film's default is refused with its problem and nothing is saved |

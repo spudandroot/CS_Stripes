@@ -111,7 +111,7 @@ def examples():
     heartbeat = m.HeartbeatInfo(key="FLOOR01_EXAMPLE_jsmith_4242", computer="FLOOR01", user="EXAMPLE\\jsmith",
                                 pid=4242, version="v2.0.0", counter=3311, written_at=T0, can_poll=True,
                                 last_printer_reach=T0 - 1, polling=[printer.id], monitor_open=True,
-                                floor_board=True)
+                                floor_board=True, declined=["pr_2b3c4d5e6f"])
     poll = m.PollStatus(machine_id=machine.id, printer_id=printer.id, poller="FLOOR01_EXAMPLE_jsmith_4242",
                         counter=18734, written_at=T0, paused_for_lock="a3f9c2e17b4d8e01",
                         yielded_to="FLOOR02_EXAMPLE_akim_77", reachable=True, failures=2, last_answer_at=T0 - 1,
@@ -120,7 +120,8 @@ def examples():
                         running=running, daily={"fonts": ["Arial"], "at": T0}, state=snapshot, alerts=[alert],
                         foreign_client=True, problem="wrong_printer", expected_counter=42, reread_seen="tok1",
                         unreachable_since=T0 - 30, running_ok_at=T0 - 35, running_unchecked=True,
-                        dst={"change": T0 - 600, "done": True}, standalone=True)
+                        dst={"change": T0 - 600, "done": True}, standalone=True, judged=18700, judged_at=T0 - 2,
+                        printing_unchecked=True)
     failure = m.FailureInfo(step=m.STEP_SWITCH, msg=MSG, after_switch=True, at=T0)
     expected = m.ExpectedState(machine_id=machine.id, counter=42, written_at=T0, written_by="EXAMPLE\\akim",
                                computer="FLOOR02", mode="switch_pending", printing_expected=True,
@@ -470,6 +471,20 @@ class HelperTests(unittest.TestCase):
 
     def test_adjustment_id(self):
         self.assertEqual(m.adjustment_id("mc_5d1e2f3a4b", "fm_3f9a1c22b0"), "mc_5d1e2f3a4b__fm_3f9a1c22b0")
+
+    def test_natural_key_takes_only_ascii_digits(self):
+        # str.isdigit() also takes "²", and int("²") raised
+        self.assertEqual(m._natural_key("Bagger 1²"), [(1, 0, "bagger "), (0, 1, ""), (1, 0, "²")])
+        self.assertEqual(sorted(["Bagger 10", "Bagger 2²", "Bagger 2"], key=m._natural_key),
+                         ["Bagger 2", "Bagger 2²", "Bagger 10"])
+
+    def test_older_status_files_read_with_defaults(self):
+        # A P an older Stripes wrote has no judged counter (freshness falls back to its counter), and an
+        # older heartbeat declines nothing
+        poll = m.from_json(m.PollStatus, {"machine_id": "mc", "printer_id": "pr", "poller": "k", "counter": 3})
+        self.assertEqual((poll.judged, poll.judged_at, poll.printing_unchecked), (None, 0.0, False))
+        beat = m.from_json(m.HeartbeatInfo, {"key": "k", "computer": "c", "user": "u", "pid": 1, "version": "v"})
+        self.assertEqual(beat.declined, [])
 
     def test_same_user(self):
         self.assertTrue(m.same_user("EXAMPLE\\jsmith", "example\\JSmith"))
