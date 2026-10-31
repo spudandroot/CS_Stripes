@@ -3728,7 +3728,7 @@ class NotMonitoredAlarmTests(Base):
         sim = self.sim()
         carol = PC(sim, "carol")
         self.printing(sim, carol)
-        self.ring(sim, carol)
+        aid = self.ring(sim, carol)
         data = carol.data.current
         off = dataclasses.replace(data.machines[sim.mid], active=False)
         carol.data.current = dataclasses.replace(data, machines={**data.machines, sim.mid: off})
@@ -3738,11 +3738,31 @@ class NotMonitoredAlarmTests(Base):
         sim.run(600)
         carol.watcher.run_once()
         self.assertEqual(ringing_on(carol), [])
-        # Active again: a fresh start, so it rings only after this PC has seen it judged again
+        self.assertNotIn(sim.mid, carol.watcher._judged_seen)          # its record is dropped
+        # Active again: a fresh start. Nobody judged it meanwhile, and nobody acknowledged the alarm this
+        # PC rang: the shared marker still holds that occurrence, so it rings again with its id, as on a
+        # PC started later (states.md §7 item 7.6)
+        carol.data.current = data
+        rows = self.passes(sim, 300, carol, step=5)
+        self.assertEqual({tuple(ids) for _, ids in self.quiet(rows)}, {(aid,)})
+        self.assertEqual(rows[-1][0], "not_monitored")
+
+    def test_not_for_an_inactive_machine_that_never_rang(self):
+        sim = self.sim()
+        carol = PC(sim, "carol")
+        self.printing(sim, carol)
+        self.passes(sim, 60, carol, step=5)                            # NOT MONITORED, not yet ringing
+        data = carol.data.current
+        off = dataclasses.replace(data.machines[sim.mid], active=False)
+        carol.data.current = dataclasses.replace(data, machines={**data.machines, sim.mid: off})
+        carol.watcher.run_once()
+        sim.run(600)
+        # Active again: a fresh start, so with no marker it rings only after this PC has seen it judged again
         carol.data.current = data
         rows = self.passes(sim, 600, carol, step=5)
         self.assertEqual(self.quiet(rows), [])
         self.assertEqual(rows[-1][0], "not_monitored")
+        self.assertIsNone(sim.observer.read_alarm_marker(sim.mid))
 
     def test_not_while_a_lock_shows(self):
         sim = self.sim()
@@ -3782,9 +3802,11 @@ class NotMonitoredAlarmTests(Base):
             if rows[-1][0] == "running_confirmed":
                 break
         self.assertEqual(rows[-1][0], "running_confirmed")
-        # It ended when the view stopped being NOT MONITORED, at the latest when judged moved
-        self.assertEqual([r for r in rows if r[0] != "not_monitored" and r[2]], [])
+        # It ended when judged moved. bob's start write ("Checking...") judges nothing, so it goes on
+        # through that (states.md §7 item 7.5), and through nothing else
+        self.assertEqual([r for r in rows if r[0] not in ("not_monitored", "checking") and r[2]], [])
         self.assertEqual([r for r in rows if r[1] != judged and r[2]], [])
+        self.assertTrue([r for r in rows if r[0] == "checking" and r[2]])
         sim.pcs.remove(bob)                             # bob's PC freezes too
         second = self.ring(sim, carol)
         self.assertNotEqual(second, first)
