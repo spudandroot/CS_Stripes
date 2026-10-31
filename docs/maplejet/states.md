@@ -1253,11 +1253,13 @@ The share is down. Polling carries on only on PCs with the MapleJet monitor or t
 3. Judging uses the same `judge` with `reading.standalone = True`, the last E read from the share (the
    watcher's and the coordinator's cache), L = None, and prev = this PC's previous local status. At the
    first check prev is None, except for a known origin mismatch (owner decision, 31 Oct): when the
-   newest P this PC read from the share (the coordinator's last read, `seen_polls()`, or what this PC's
-   own worker last wrote, whichever has the higher counter) has `expected_counter` equal to the cached
-   E's counter and either the code `drift` or an active `drift` alert with R not matching E (R None
-   included: a failed Load left it unknown, C11e), or a message share mode couldn't check (the code
-   `message_unchecked` or `running_unchecked` True; second review, 31 Oct), prev is that P (its
+   newest P this PC read from the share or wrote (the coordinator's last read, `seen_polls()`; any other
+   read on this PC, `store.cached_poll()`, such as the watcher's own read when the coordinator's copy is
+   older than `heartbeat_s`; or what this PC's own worker last wrote; the highest counter wins) has
+   `expected_counter` equal to the cached E's counter and either the code `drift` or an active `drift`
+   alert with R not matching E (R None included: a failed Load left it unknown, C11e), or a message
+   share mode couldn't check (the code `message_unchecked` or `running_unchecked` True; second review,
+   31 Oct), prev is that P (its
    committed state, R, and open alerts with their acks) with `standalone` True, this PC as `poller`,
    and `running_unchecked` True for a message that couldn't be checked. Only those are carried, so no
    other state becomes sticky. C3, C4, C11 and C11b are skipped, C11c keeps a known drift (red, its
@@ -1966,7 +1968,8 @@ of real time.
     `local_statuses()` filled, no drift alert; `refresh_now()` twice within 10 s returns True then
     False; without the monitor open the mode is `idle` and no request is made. Owner decision, 31 Oct:
     a same-name drift known in share mode (from this PC's own worker, and on a PC that only watches,
-    from its coordinator's last read) stays red `drift` for the whole outage with the same alert id,
+    from its coordinator's last read, or from its watcher's own read while its coordinator stalled)
+    stays red `drift` for the whole outage with the same alert id,
     its ack (this PC's own, or one its watcher read from the share before the outage), R's origin and
     its sound, on every board sample from the share going down, over the change of mode and the
     seconds before the first standalone check, until share mode judges it (card, floor row, line card,

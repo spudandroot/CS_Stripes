@@ -1503,6 +1503,39 @@ class StandaloneTests(Base):
         st = a.poller.local_statuses()[sim.mid]
         self.assertEqual((st.state.code, [x.id for x in st.alerts if x.active]), ("drift", [drift.id]))
 
+    def test_a_known_drift_seen_only_by_the_watcher(self):
+        # Integrator, from the owner-decision review's probe: a's coordinator stalls (a slow share) while
+        # another PC commits the drift, so only a's watcher reads the drift P (its seen_polls copy is older
+        # than heartbeat_s). The share then goes down: the seed uses that read too, so a's board stays red
+        sim = self.sim()
+        sim.expect()
+        pcs = [sim.pc("akim"), sim.pc("bob")]
+        r0 = assign_order(sim, *pcs)[0]
+        b = next(pc for pc in pcs if pc.key == r0)
+        a = next(pc for pc in pcs if pc is not b)
+        self.steady(sim)
+        a.watcher.run_once()
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, pcs=[b], until=lambda: sim.code() == "drift"))
+        sim.run(LOGIC.heartbeat_s + 0.5, pcs=[b])
+        a.watcher.run_once()
+        self.assertNotEqual(a.poller.seen_polls()[sim.mid][0].state.code, "drift")
+        self.assertEqual(machine_on_board(a, sim.mid).colour, RED)
+        drift = next(x for x in sim.p().alerts if x.kind == "drift")
+        a.poller.set_monitor_open(True, True)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        self.assertTrue(sim.run(90, until=lambda: a.poller.mode == "standalone"))
+        sim.run(2 * LOGIC.standalone_poll_s)
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual((st.state.code, [x.id for x in st.alerts if x.active]), ("drift", [drift.id]))
+        a.watcher.run_once()
+        mv = machine_on_board(a, sim.mid)
+        self.assertEqual((mv.colour, mv.origin_line), (RED, "Product of Mexico"))
+        self.assertEqual([x.id for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)],
+                         [drift.id])
+
     def test_an_acknowledged_known_drift_stays_quiet_and_red(self):
         sim = self.sim()
         a, drift = self.known_drift_then_down(sim, ack=True)

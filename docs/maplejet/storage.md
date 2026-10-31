@@ -1940,6 +1940,9 @@ class ShareStore:
         # "paused" | "stale" | "missing" | "polling" (§11.6)
     def cached_expected(self, machine_id: str) -> ExpectedState | None: ...
         # the last ExpectedState this store read or wrote for that machine; no share access (§5.4 rule 4)
+    def cached_poll(self, machine_id: str) -> PollStatus | None: ...
+        # the newest PollStatus (highest counter) this store read for that machine, by any reader on this
+        # PC; no share access. The standalone seed uses it (states.md §6.12 item 3)
     def local_lock_info(self, printer_id: str) -> LockInfo | None: ...
         # a copy of the LockInfo acquire() registered with local_locks (§11.2 step 2), with the latest
         # update() note; None when printer_id isn't in local_locks; no share access; thread-safe
@@ -2115,7 +2118,8 @@ sleeps more than 0.5 s in real time.
     file's + 1, plus `written_by` and `computer`. A format-2 `poll.json` raises `FormatTooNew`, and
     `poll_age` still tracks its counter. `write_ack` twice: the first ack stays. `read_ack` caches it
     (one `read_bytes` for two calls). `preview.bmp` round-trips. `cached_expected` returns the state
-    last read or written, and still returns it with `down=True`.
+    last read or written, and still returns it with `down=True`; so does `cached_poll` for the newest P
+    read.
 16. **Not-found cache:** with `not_found_cache_s=5` on store B's view, a lock created by store A is
     invisible to B's `read_lock` for 5 s and visible after. `settle_s()` with the default timings is
     6.0, which is more than 5.

@@ -1238,6 +1238,7 @@ class ShareStore:
         self._released = collections.OrderedDict()   # token -> printer_id of locks this store released
         self._expected = {}                  # machine_id -> the last ExpectedState read or written
         self._max_poll = {}                  # machine_id -> the highest poll counter written or read
+        self._polls = {}                     # machine_id -> the newest PollStatus read (any reader)
         self._acks = {}
         self._lock_tokens = {}               # printer_id -> token of the last lock read, or None
         self._heartbeat = Heartbeat(self)
@@ -1531,9 +1532,19 @@ class ShareStore:
             else:
                 self.watch.see(key, status.counter)
                 self._note_poll_counter(machine_id, status.counter)
+                with self._lock:
+                    kept = self._polls.get(machine_id)
+                    if kept is None or status.counter >= kept.counter:
+                        self._polls[machine_id] = copy.deepcopy(status)
                 return status
         self.watch.missing(key)
         return None
+
+    def cached_poll(self, machine_id):
+        """The newest PollStatus this store read for the machine, by any reader (the coordinator, the
+        watcher, a worker); no share access. The standalone seed uses it (states.md §6.12 item 3)."""
+        with self._lock:
+            return copy.deepcopy(self._polls.get(machine_id))
 
     def write_poll(self, status):
         _check_id(status.machine_id, "machine id")

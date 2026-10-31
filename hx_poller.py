@@ -1380,10 +1380,11 @@ class _StandaloneCheck:
           can't check it either, so it is carried with running_unchecked set: at best amber, the origin
           unknown (C11d).
         Only those are carried; every other machine starts afresh as before. The newest P this PC has: the
-        coordinator's last read, or what this PC's own worker last wrote (the coordinator reads only
-        every heartbeat_s)."""
+        coordinator's last read, any other read of P on this PC (the watcher reads P itself when the
+        coordinator's copy is older than heartbeat_s), or what this PC's own worker last wrote."""
         poller = self.poller
         found = [p for p in ((poller.seen_polls().get(self.machine_id) or (None, 0.0))[0],
+                             poller.store.cached_poll(self.machine_id),
                              poller._written_polls().get(self.machine_id)) if p is not None]
         if not found:
             return None

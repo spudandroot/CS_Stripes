@@ -2241,6 +2241,23 @@ class StatusFileTests(ShareCase):
         cached.send_id = "changed"
         self.assertEqual(st.cached_expected(MACHINE_ID).send_id, "sd_2")
 
+    def test_cached_poll(self):
+        # The newest P any reader on this PC read, kept for the standalone seed (states.md §6.12 item 3)
+        view = self.fs.view()
+        st = self.store(identity(sender=True), view=view)
+        self.assertIsNone(st.cached_poll(MACHINE_ID))
+        self.poller.write_poll(self.poll(1))
+        self.poller.write_poll(self.poll(2))
+        self.assertEqual(st.read_poll(MACHINE_ID).counter, 2)
+        view.down = True
+        with self.assertRaises(ShareUnavailable):
+            st.read_poll(MACHINE_ID)
+        cached = st.cached_poll(MACHINE_ID)
+        self.assertEqual(cached.counter, 2)
+        cached.counter = 99
+        self.assertEqual(st.cached_poll(MACHINE_ID).counter, 2)
+        self.assertIsNone(st.cached_poll(MACHINE2_ID))
+
     def test_ids_are_checked(self):
         for call in (lambda: self.sender.read_poll("x"), lambda: self.sender.read_lock("../pr"),
                      lambda: self.sender.read_expected("mc_ZZZZZZZZZZ"), lambda: self.sender.read_line_status(""),
