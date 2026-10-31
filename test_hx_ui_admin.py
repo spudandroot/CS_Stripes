@@ -1614,6 +1614,25 @@ class LayoutTests(UiCase):
         self.assertEqual(page.editor_xbar.winfo_manager(), "")
         self.assertEqual(page.editor_scroller.canvas.xview()[0], 0.0)
 
+    def test_wrap_fit_stops_a_width_loop(self):
+        # On the Windows CI runner a wrapped label and its wraplength fed each other for ever, two
+        # widths in turn, and the admin window hung in update(). Each made-up Configure here gives the
+        # other width, as Tk did there
+        label = hx_ui_admin._fit_wrap(tk.Label(self.root, text="word " * 60), cap=620)
+        clock = [100.0]
+        wraps = []
+        with mock.patch.object(hx_ui_admin, "time", mock.Mock(monotonic=lambda: clock[0])), \
+                mock.patch.object(label, "configure", side_effect=lambda **kw: wraps.append(kw["wraplength"])):
+            for width in [504, 404] * 50:
+                label._fit_wrap(mock.Mock(width=width))
+            self.assertEqual(wraps, [500, 400])
+            label._fit_wrap(mock.Mock(width=604))           # a real resize still wraps to the new width
+            self.assertEqual(wraps, [500, 400, 600])
+            clock[0] += 1.0
+            label._fit_wrap(mock.Mock(width=504))           # and so does an old width, later on
+            self.assertEqual(wraps, [500, 400, 600, 500])
+        label.destroy()
+
 
 class TestPrintTests(UiCase):
     def test_test_print_window(self):

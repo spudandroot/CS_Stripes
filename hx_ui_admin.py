@@ -22,6 +22,7 @@ import math
 import os
 import re
 import sys
+import time
 import traceback
 import webbrowser
 import tkinter as tk
@@ -468,6 +469,10 @@ _WRAP = 620
 FIELD_MIN_PX = 160
 HINT_MIN_PX = 100
 FORM_MIN_PX = 500
+# A wrapped label's own width depends on its wraplength, so two widths can feed each other for
+# ever (seen with the Windows fonts: wrap to a, the label narrows to b, wrap to b, it widens to a...).
+# A width the label was given less than _FIT_LOOP_S ago is taken as that loop, not a resize
+_FIT_LOOP_S = 0.5
 
 
 # --------------------------------------------------------------------------
@@ -767,12 +772,21 @@ def _fit_wrap(label, *, cap=_WRAP, floor=HINT_MIN_PX):
     """Wrap a label's text to the width it's given, at most cap and at least floor pixels, so a long
     hint wraps instead of running out of the window. The label must fill its cell (grid sticky "ew",
     or pack fill="x") so it gets wider again when the window does."""
+    recent = []         # (monotonic, px) of this label's latest wrap changes, within _FIT_LOOP_S
+
     def fit(event):
         px = max(floor, min(cap, event.width - 4))
-        if getattr(label, "_wrap_px", None) != px:
-            label._wrap_px = px
-            label.configure(wraplength=px)
+        if getattr(label, "_wrap_px", None) == px:
+            return
+        now = time.monotonic()
+        recent[:] = [(t, p) for t, p in recent if now - t < _FIT_LOOP_S]
+        if any(p == px for _, p in recent):
+            return          # back to a width it had a moment ago: the loop, not a resize
+        recent.append((now, px))
+        label._wrap_px = px
+        label.configure(wraplength=px)
     label.bind("<Configure>", fit, add="+")
+    label._fit_wrap = fit       # tests call it with made-up events
     return label
 
 
