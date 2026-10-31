@@ -8,6 +8,7 @@ don't depend on hx_ui. The Tk tests need a display; they skip themselves when Tk
 """
 
 import dataclasses
+import faulthandler
 import gc
 import hashlib
 import json
@@ -430,6 +431,9 @@ class PureTests(unittest.TestCase):
 # Tk
 # --------------------------------------------------------------------------
 
+HANG_S = 300
+
+
 class UiCase(unittest.TestCase):
     """ui.md §17.1: a FakeWorld, services on its share, strict threads, and tell/ask patched on
     hx_ui_common."""
@@ -451,6 +455,10 @@ class UiCase(unittest.TestCase):
         cls.root.destroy()
 
     def setUp(self):
+        # A test that hangs (a modal wait, a stuck thread) prints every thread's stack and ends the run
+        # after HANG_S, instead of holding a CI runner until the job's time limit
+        faulthandler.dump_traceback_later(HANG_S, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.tmp = tempfile.mkdtemp(prefix="hx_ui_admin_")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.world = FakeWorld(self.tmp, printers=self.printers, timings=SCALED)
