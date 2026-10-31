@@ -49,6 +49,7 @@ MAX_BAGS_PER_S = 5.0           # a bag counter may rise by at most this per seco
 DAILY_S = 86_400.0             # daily checks
 DST_KEEP_S = 86_400.0          # a pending daylight-saving clock set is kept this long
 ACK_RETRY_S = 600.0            # the watcher retries a failed ack write this long
+NOT_MONITORED_ALARM_S = 120.0  # a machine that was printing rings after this long NOT MONITORED (states.md §7 item 7)
 UNCHECKED_LOADS = 2            # failed running-message Loads in a row before running_unchecked ...
 UNCHECKED_SLOW_SETS = 3        # ... or this many poll_slow_s without a successful one (§6.5)
 UNCHECKED_CONFIRMS = 3         # ... or this many failed confirming Loads in a row (owner decision, 31 Oct)
@@ -2420,6 +2421,7 @@ class StatusWatcher:
         self._too_new = set()
         self._found_acks = {}
         self._counters = {}          # machine id -> [P counter first seen, seen moving since]
+        self._judged_seen = {}       # machine id -> hx_state.JudgedSeen, for the NOT MONITORED alarm (§7 item 7)
         self._watch = CounterWatch(clock)
         self._cancel = CancelToken()
         self._wake = CancelToken()
@@ -2565,11 +2567,49 @@ class StatusWatcher:
             acks = {**self._found_acks, **own}
         board = hx_state.board_view(data, polls, poll_ages, expected, locks, lock_ages, lines, acks,
                                     share_ok=share_ok, standalone=standalone, now=self.clock.time(), timings=t)
+        board = self._with_alarms(data, board, polls, expected, acks)
         board.next_check_s = self.poller.last_update().next_check_s
         # An acknowledge() during this pass (most of which is share reads) already posted its board:
         # this one carries its acks too, so the sound doesn't start again (§4.5 item 2)
         self._publish_pass(board, own)
         self._write_acks()
+
+    def _with_alarms(self, data, board, polls, expected, acks):
+        """The board with each machine's NOT MONITORED alarm (§7 item 7): no poller judges such a machine, so
+        every PC's watcher raises it itself, with the same id on every PC, and reads its ack from the share
+        like any other. Machines no longer on the board are forgotten. Not while the share is down or in
+        standalone mode, which have their own banner."""
+        mono, now = self.clock.monotonic(), self.clock.time()
+        share_ok = board.share_ok and not board.standalone
+        seen, alarms = {}, {}
+        for line in board.lines:
+            record = data.lines.get(line.line_id)
+            for view in line.machines:
+                mid = view.machine_id
+                s, alarm = hx_state.not_monitored_alarm(self._judged_seen.get(mid), polls.get(mid), view,
+                                                        expected.get(mid), record, share_ok=share_ok, mono=mono,
+                                                        now=now, alarm_s=NOT_MONITORED_ALARM_S)
+                if s is not None:
+                    seen[mid] = s
+                if alarm is not None:
+                    alarms[mid] = alarm
+        self._judged_seen = seen
+        acks = dict(acks)
+        for alarm in alarms.values():
+            if alarm.id in acks:
+                continue
+            try:
+                ack = self.store.read_ack(alarm.id)
+            except ValueError:
+                ack = None
+            except ShareUnavailable:
+                return board            # gone part-way: no sound from this pass; the next one is share down
+            except ShareError:
+                ack = None
+            if ack is not None:
+                self._found_acks[alarm.id] = ack
+                acks[alarm.id] = ack
+        return hx_state.with_board_alerts(board, alarms, acks)
 
     def _last_good(self, machine_id):
         """While the share is down: the newest P this PC has, the watcher's last read or what this PC's

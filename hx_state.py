@@ -268,6 +268,7 @@ ES = {
     "Stripes can't read the message on {machine}": "Stripes no puede leer el mensaje de {machine}",
     "{machine} is printing a message that wasn't sent from Stripes":
         "{machine} está imprimiendo un mensaje que no se envió desde Stripes",
+    "No PC has checked {machine} for {minutes} min": "Ninguna PC revisa {machine} desde hace {minutes} min",
     # details, lines and the board
     "Started by {user}.": "Iniciado por {user}.",
     "Started by {user}. This machine needs a new Send.": "Iniciado por {user}. Esta máquina necesita un nuevo envío.",
@@ -351,6 +352,10 @@ ALERT_KINDS = {k.kind: k for k in (
               text=N_("Stripes can't read the message on {machine}")),
     AlertKind(kind="not_from_stripes", sound=False, colour="", roles=("notify",),
               text=N_("{machine} is printing a message that wasn't sent from Stripes")),
+    # Raised by every PC's status watcher, never by judge(): nobody is judging that machine (§7 item 7).
+    # It adds sound only, so the machine keeps its NOT MONITORED colour (owner decision, 31 Oct 2026)
+    AlertKind(kind="not_monitored", sound=True, colour="", roles=_FLOOR_ROLES,
+              text=N_("No PC has checked {machine} for {minutes} min")),
 )}
 
 _ROLE_CONSTANTS = {"floor": "floor", "admins": "admins", "monitor": "monitor"}
@@ -1512,6 +1517,97 @@ def sounding_alerts(board: BoardView, identity: Identity, *, floor_board: bool) 
                 if mine or (floor_board and "floor" in a.recipients):
                     found[a.id] = a
     return sorted(found.values(), key=lambda a: (a.started_at, a.id))
+
+
+# --------------------------------------------------------------------------
+# The NOT MONITORED alarm (§7 item 7; owner decision, 31 Oct 2026)
+# --------------------------------------------------------------------------
+
+@dataclass(kw_only=True)
+class JudgedSeen:
+    """What one PC's status watcher has seen of a machine's P since it started."""
+    value: int                      # P.judged at the last read (P.counter for a P from an older Stripes)
+    at: float = 0.0                 # P.judged_at at that read (P.written_at for an older P)
+    moved: bool = False             # value seen to change: someone judged the machine while this PC watched
+    printing: bool = False          # at the last good judgement: P.printing True and E.mode "running"
+    since: float | None = None      # clock.monotonic() of the first pass showing NOT MONITORED, share up
+    alarm_id: str = ""              # the alarm on the board now, and its started_at (this PC's wall clock)
+    alarm_at: float = 0.0
+
+
+def not_monitored_alarm_id(machine_id: str, value: int, at: float, send_id: str) -> str:
+    """Every PC derives the same id from the same P and E: the last judged counter and its judged_at,
+    and E's send_id. A later occurrence has a new judged value or a new Send, so an old ack never
+    silences it. e.g. mc_5d1e2f3a4b.not_monitored.18740_sd_8a7b6c5d4e.1793275240200"""
+    return alert_id(machine_id, "not_monitored", ref=_alarm_ref(value, send_id), at=at)
+
+
+def _alarm_ref(value, send_id):
+    return f"{value}_{send_id}" if send_id else str(value)
+
+
+def not_monitored_alarm(seen: JudgedSeen | None, poll: PollStatus | None, view: MachineView,
+                        expected: ExpectedState | None, line: Line | None, *, share_ok: bool, mono: float,
+                        now: float, alarm_s: float) -> tuple[JudgedSeen | None, Alert | None]:
+    """The watcher's record of the machine after this pass, and its not_monitored alarm or None (§7 item 7).
+
+    It rings when the view is NOT MONITORED, this watcher saw P's judged counter move earlier in this run,
+    P said printing with E running at the last good judgement (monitored, no lock, not "Checking..."), E is
+    still running, and this PC has shown NOT MONITORED for alarm_s with the share readable. So the first
+    PC to start in the morning never rings for last night's P. Not while the share is down or in
+    standalone (share_ok False): the record is kept, the wait starts again. A real judgement, E not
+    running or a lock ends it. It never changes the code or colour: sound only."""
+    if seen is None and poll is None:
+        return None, None
+    if not share_ok or view.code == "update_stripes":
+        return (dataclasses.replace(seen, since=None, alarm_id="", alarm_at=0.0) if seen is not None else None), None
+    if poll is not None:
+        value, at = (poll.counter, poll.written_at) if poll.judged is None else (poll.judged, poll.judged_at)
+        if seen is None:
+            seen = JudgedSeen(value=value, at=at)
+        elif value != seen.value:
+            seen = dataclasses.replace(seen, value=value, at=at, moved=True)
+            # A new judgement, seen now. A paused write (a lock) moves judged too but reads nothing: the
+            # last good judgement stays the one before it
+            if (view.monitored and view.code not in BLUE_CODES and view.code != "checking"
+                    and not poll.paused_for_lock):
+                running = expected is not None and expected.mode == "running"
+                seen = dataclasses.replace(seen, printing=poll.printing is True and running)
+    nm = view.code == "not_monitored"
+    seen = dataclasses.replace(seen, since=(mono if seen.since is None else seen.since) if nm else None)
+    if not (nm and seen.moved and seen.printing and expected is not None and expected.mode == "running"
+            and view.checked_age_s is not None and mono - seen.since >= alarm_s):
+        return dataclasses.replace(seen, alarm_id="", alarm_at=0.0), None
+    aid = not_monitored_alarm_id(view.machine_id, seen.value, seen.at, expected.send_id)
+    started = seen.alarm_at if seen.alarm_id == aid else now
+    seen = dataclasses.replace(seen, alarm_id=aid, alarm_at=started)
+    kind = ALERT_KINDS["not_monitored"]
+    notify = line.notify_user if line is not None else ""
+    alert = Alert(id=aid, machine_id=view.machine_id, line_id=view.line_id, kind=kind.kind, sound=kind.sound,
+                  msg=Msg(kind.text, {"machine": view.name, "minutes": int(view.checked_age_s // 60)}),
+                  started_at=started,
+                  recipients=resolve_recipients(kind.roles, sender="", notify=notify, last_sender=expected.sender),
+                  active=True, colour=kind.colour, ref=_alarm_ref(seen.value, expected.send_id))
+    return seen, alert
+
+
+def with_board_alerts(board: BoardView, alerts: dict[str, Alert], acks: dict[str, Ack]) -> BoardView:
+    """The board with the watcher's own alerts (machine id -> Alert) added to their machines, acks
+    applied: they join `alerts`, the details and `unacked_sound`, and change no code, colour or headline."""
+    if not alerts:
+        return board
+    lines = []
+    for line in board.lines:
+        machines = []
+        for m in line.machines:
+            a = alerts.get(m.machine_id)
+            if a is not None:
+                a = _with_ack(a, acks or {})
+                m = dataclasses.replace(m, alerts=m.alerts + [a], details=m.details + [a.msg],
+                                        unacked_sound=m.unacked_sound or (a.sound and not a.acked_by))
+            machines.append(m)
+        lines.append(dataclasses.replace(line, machines=machines))
+    return dataclasses.replace(board, lines=lines)
 
 
 def checked_text(age_s: float | None) -> Msg:

@@ -200,15 +200,18 @@ class TableTests(unittest.TestCase):
         self.assertEqual(hs.STATE_TEXTS["off"], "Printer off")
 
     def test_alert_kinds(self):
-        self.assertEqual(len(hs.ALERT_KINDS), 19)
+        self.assertEqual(len(hs.ALERT_KINDS), 20)
         sound = {k for k, v in hs.ALERT_KINDS.items() if v.sound}
         self.assertEqual(sound, {"send_failed", "send_rejected", "send_interrupted", "stop_failed", "drift",
                                  "printing_off", "printing_on", "ink_out", "cartridge_error", "went_silent",
-                                 "test_still_printing", "encoder_changed"})
+                                 "test_still_printing", "encoder_changed", "not_monitored"})
         for k in hs.ALERT_KINDS.values():
             if k.sound:                         # no sound alert is addressed to administrators
                 self.assertNotIn("admins", k.roles)
         self.assertEqual(hs.ALERT_KINDS["drift"].roles, ("notify", "last_sender", "floor"))
+        # The watcher's NOT MONITORED alarm rings like drift and never colours the machine (§7 item 7)
+        self.assertEqual(hs.ALERT_KINDS["not_monitored"].roles, hs.ALERT_KINDS["drift"].roles)
+        self.assertEqual(hs.ALERT_KINDS["not_monitored"].colour, "")
         self.assertEqual(hs.ALERT_KINDS["stop_failed"].roles, ("last_sender", "notify", "floor"))
         self.assertEqual(hs.ALERT_KINDS["send_failed"].ref_from, "send_id")
         self.assertEqual(hs.ALERT_KINDS["test_still_printing"].ref_from, "run_id")
@@ -497,7 +500,8 @@ class NameNotIdTests(unittest.TestCase):
             view = hs.machine_view(machine, p, 5.0, e, kw.get("lk"), 70.0, {})
             self.assertNoIds([view.headline] + view.details, name)
             views.append(view)
-        self.assertEqual(kinds_seen, set(hs.ALERT_KINDS))           # every kind's text was checked
+        # Every kind's text was checked; the watcher's not_monitored alarm in NotMonitoredAlarmTests
+        self.assertEqual(kinds_seen, set(hs.ALERT_KINDS) - {"not_monitored"})
 
         # A line headline names its worst machine; the board and floor rows carry the views' texts
         for view in views:
@@ -1857,6 +1861,221 @@ class NotFromStripesTests(unittest.TestCase):
         j2 = commit_second(p, reading(running=OLD, printing=False), None)
         self.assertEqual(j2.state.code, "idle")
         self.assertEqual([x.kind for x in j2.ended], ["not_from_stripes"])
+
+
+
+# --------------------------------------------------------------------------
+# 23. The NOT MONITORED alarm (§7 item 7; owner decision, 31 Oct 2026)
+# --------------------------------------------------------------------------
+
+ALARM_S = 120.0                         # hx_poller.NOT_MONITORED_ALARM_S
+
+
+class NotMonitoredAlarmTests(unittest.TestCase):
+    """The watcher's own alarm, pass by pass: hx_state.not_monitored_alarm with the watcher's record, P, the
+    view and E. mono is this PC's monotonic clock at the pass; P's age is mono minus when it was judged."""
+
+    def step(self, seen, p, age, e, mono, *, lk=None, lock_age=None, share_ok=True):
+        v = view(p, age=age, e=e, lk=lk, lock_age=lock_age)
+        return hs.not_monitored_alarm(seen, p, v, e, LINE, share_ok=share_ok, mono=mono, now=T0 + mono,
+                                      alarm_s=ALARM_S)
+
+    def watched(self, e, **kw):
+        """P judged 41, then 42 at mono 5.0, while this watcher looked: (its record, P 42). NOT MONITORED
+        from mono 35.0."""
+        seen, a = self.step(None, poll(judged=41, judged_at=T0 - 5, **kw), 5.0, e, 0.0)
+        self.assertIsNone(a)
+        p = poll(judged=42, judged_at=T0, **kw)
+        seen, a = self.step(seen, p, 0.0, e, 5.0)
+        self.assertIsNone(a)
+        return seen, p
+
+    def stale(self, seen, p, e, judged, start, end, **kw):
+        """A pass every second from mono start to end, P judged at mono judged: (record, [(mono, Alert)])."""
+        rang = []
+        for mono in range(int(start), int(end) + 1):
+            seen, a = self.step(seen, p, mono - judged, e, float(mono), **kw)
+            if a is not None:
+                rang.append((float(mono), a))
+        return seen, rang
+
+    def test_two_minutes_after_not_monitored(self):
+        e = expected()
+        seen, p = self.watched(e)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 35 + 119)
+        self.assertEqual(rang, [])                              # 119 s NOT MONITORED: quiet
+        self.assertEqual(seen.since, 35.0)
+        seen, a = self.step(seen, p, 150.0, e, 155.0)            # 120 s: it rings
+        self.assertIsNotNone(a)
+        # The same id on every PC: the machine, the last judged counter and its judged_at, E's send_id
+        self.assertEqual(a.id, f"{MID}.not_monitored.42_{SID}.{int(T0 * 1000)}")
+        self.assertEqual(a.id, hs.not_monitored_alarm_id(MID, 42, T0, SID))
+        self.assertRegex(a.id, AlertIdentityTests.PATTERN)
+        self.assertEqual((a.kind, a.sound, a.colour, a.active, a.acked_by, a.machine_id, a.line_id),
+                         ("not_monitored", True, "", True, "", MID, LINE_ID))
+        self.assertEqual(a.recipients, ["user:" + AKIM, "user:" + JSMITH, "floor"])    # as drift's
+        self.assertEqual(rendered(a.msg), ["No PC has checked Line 1 Bagger 1 for 2 min",
+                                           "Ninguna PC revisa Line 1 Bagger 1 desde hace 2 min"])
+        self.assertEqual(a.started_at, T0 + 155.0)
+        # It goes on with the same id and start; the minutes count up
+        seen, b = self.step(seen, p, 245.0, e, 250.0)
+        self.assertEqual((b.id, b.started_at, b.msg.values["minutes"]), (a.id, a.started_at, 4))
+
+        # On the board: sound only. The machine stays grey NOT MONITORED, also on the floor board
+        board = hs.board_view(DATA, {MID: p}, {MID: 245.0}, {MID: e}, {}, {}, {}, {}, share_ok=True,
+                              standalone=False, now=T0 + 250)
+        rung = hs.with_board_alerts(board, {MID: b}, {})
+        before, m = board.lines[0].machines[0], rung.lines[0].machines[0]
+        self.assertEqual(m.machine_id, MID)
+        self.assertEqual((m.code, m.colour, m.headline, m.monitored), ("not_monitored", GREY, Msg("NOT MONITORED"),
+                                                                       False))
+        self.assertEqual((m.alerts, m.unacked_sound, m.details), ([b], True, before.details + [b.msg]))
+        self.assertEqual((rung.lines[0].colour, rung.lines[0].headline), (board.lines[0].colour,
+                                                                          board.lines[0].headline))
+        guest = Identity(user="EXAMPLE\\guest", computer="FLOOR03", sids=frozenset(), pid=1)
+        akim = Identity(user="example\\AKIM", computer="FLOOR02", sids=frozenset(), pid=1)
+        self.assertEqual(hs.sounding_alerts(rung, guest, floor_board=True), [b])
+        self.assertEqual(hs.sounding_alerts(rung, guest, floor_board=False), [])
+        self.assertEqual(hs.sounding_alerts(rung, akim, floor_board=False), [b])
+        self.assertEqual(hs.sounding_alerts(board, akim, floor_board=True), [])
+        row = next(r for r in hs.floor_board_rows(rung) if r.machine_id == MID)
+        self.assertEqual((row.colour, row.status), (GREY, Msg("NOT MONITORED")))
+        # An ack silences it; the machine stays grey NOT MONITORED
+        ack = Ack(alert_id=b.id, by=JSMITH, computer="FLOOR01", at=T0 + 260)
+        m = hs.with_board_alerts(board, {MID: b}, {b.id: ack}).lines[0].machines[0]
+        self.assertEqual((m.alerts[0].acked_by, m.unacked_sound, m.code, m.colour), (JSMITH, False, "not_monitored",
+                                                                                      GREY))
+        self.assertEqual(hs.sounding_alerts(hs.with_board_alerts(board, {MID: b}, {b.id: ack}), akim,
+                                            floor_board=True), [])
+        # A last known red stays red, with its own headline: the alarm never changes how the machine looks
+        red = hs.board_view(DATA, {MID: poll("drift")}, {MID: 245.0}, {MID: e}, {}, {}, {}, {}, share_ok=True,
+                            standalone=False, now=T0 + 250)
+        m = hs.with_board_alerts(red, {MID: b}, {}).lines[0].machines[0]
+        self.assertEqual((m.code, m.colour, m.headline), ("not_monitored", RED, Msg("NOT MONITORED")))
+        self.assertIs(hs.with_board_alerts(board, {}, {}), board)
+
+    def test_never_for_a_p_this_watcher_never_saw_move(self):
+        # The first PC started in the morning: P still says printing with E running, judged last night
+        e = expected()
+        p = poll(judged=42, judged_at=T0 - 36_000)
+        seen = None
+        for mono in range(0, 4 * 3600, 5):
+            age = None if mono < 30 else float(mono)            # "Checking...", then NOT MONITORED (§7 item 6)
+            seen, a = self.step(seen, p, age, e, float(mono))
+            self.assertIsNone(a, mono)
+        self.assertFalse(seen.moved)
+        # Judged again while it watches, then nobody: now it rings, two minutes after NOT MONITORED
+        p2 = poll(judged=43, judged_at=T0 + 14_400)
+        seen, a = self.step(seen, p2, 0.0, e, 14_400.0)
+        seen, rang = self.stale(seen, p2, e, 14_400.0, 14_401, 14_550)
+        self.assertEqual([(t, x.id) for t, x in rang], [(14_550.0, hs.not_monitored_alarm_id(MID, 43, T0 + 14_400,
+                                                                                               SID))])
+
+    def test_not_while_the_share_is_down_or_in_standalone(self):
+        e = expected()
+        seen, p = self.watched(e)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 155)
+        self.assertEqual([t for t, _ in rang], [155.0])
+        aid = rang[0][1].id
+        # This PC can't read the share (the watcher passes share_ok False then, and in standalone mode)
+        seen, rang = self.stale(seen, p, e, 5.0, 156, 1000, share_ok=False)
+        self.assertEqual(rang, [])
+        self.assertTrue(seen.moved and seen.printing)
+        self.assertIsNone(seen.since)
+        # The share back: two more minutes of NOT MONITORED first (pollers come back within that), then
+        # the same occurrence, with the same id
+        seen, rang = self.stale(seen, p, e, 5.0, 1001, 1121)
+        self.assertEqual([(t, a.id) for t, a in rang], [(1121.0, aid)])
+
+    def test_only_while_e_is_running(self):
+        not_running = [expected("stopped_by_user", stopped_by=JSMITH, stop_reason="user"),
+                       expected("test_finished", test={"run_id": RUN_ID, "kind": "test", "by": AKIM, "step": 3,
+                                                       "of": 3}),
+                       expected("none", send_id=""), expected("switch_pending"), None]
+        for e2 in not_running:
+            with self.subTest(mode=e2.mode if e2 is not None else None):
+                e = expected()
+                seen, p = self.watched(e)
+                seen, rang = self.stale(seen, p, e, 5.0, 6, 160)
+                self.assertTrue(rang)
+                # E stops being running: it ends, and doesn't come back while E isn't running
+                seen, rang = self.stale(seen, p, e2, 5.0, 161, 1000)
+                self.assertEqual(rang, [])
+                # E running again for a new Send: a new occurrence, with a new id
+                e3 = expected(send_id=SID2, counter=6)
+                seen, a = self.step(seen, p, 996.0, e3, 1001.0)
+                self.assertEqual(a.id, hs.not_monitored_alarm_id(MID, 42, T0, SID2))
+                self.assertNotEqual(a.id, rang[0][1].id if rang else hs.not_monitored_alarm_id(MID, 42, T0, SID))
+
+    def test_only_for_a_machine_printing_at_its_last_good_judgement(self):
+        stopped = expected("stopped_by_user", stopped_by=JSMITH, stop_reason="user")
+        for name, e_then, kw in (("printing off", expected(), {"printing": False}),
+                                 ("E stopped", stopped, {}),
+                                 ("no E", None, {})):
+            with self.subTest(name):
+                seen, p = self.watched(e_then, **kw)
+                seen, rang = self.stale(seen, p, expected(), 5.0, 6, 1000)       # E running by now
+                self.assertEqual(rang, [])
+        # The control: printing with E running at the last good judgement rings
+        seen, p = self.watched(expected())
+        self.assertTrue(self.stale(seen, p, expected(), 5.0, 6, 1000)[1])
+
+    def test_not_while_a_lock_shows(self):
+        e = expected()
+        seen, p = self.watched(e)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 155)
+        aid = rang[0][1].id
+        # A fresh lock (a Send in progress): its blue code shows, no sound, however long it is held
+        seen, rang = self.stale(seen, p, e, 5.0, 156, 600, lk=lock("send"), lock_age=5.0)
+        self.assertEqual(rang, [])
+        # The lock goes and still nobody checks the printer: two minutes later, the same occurrence again
+        seen, rang = self.stale(seen, p, e, 5.0, 601, 721)
+        self.assertEqual([(t, a.id) for t, a in rang], [(721.0, aid)])
+
+    def test_paused_writes_keep_the_last_good_judgement(self):
+        # The poller steps aside for a Send (paused writes move judged but read nothing), then freezes;
+        # the Send ends with E running a new Send and nobody checks the printer
+        seen, p = self.watched(expected())
+        sending = expected("switch_pending", send_id=SID2, counter=6)
+        for i, mono in enumerate((10.0, 15.0)):
+            paused = poll(judged=43 + i, judged_at=T0 + mono - 5, paused_for_lock="a3f9c2e17b4d8e01", printing=False)
+            seen, a = self.step(seen, paused, 0.0, sending, mono, lk=lock("send", run_id=SID2), lock_age=1.0)
+            self.assertIsNone(a)
+        self.assertTrue(seen.printing)                          # what the last real judgement saw
+        sent = expected(send_id=SID2, counter=7)
+        seen, rang = self.stale(seen, paused, sent, 15.0, 16, 165)
+        self.assertEqual([(t, a.id) for t, a in rang], [(165.0, hs.not_monitored_alarm_id(MID, 44, T0 + 10, SID2))])
+
+    def test_ends_when_judged_moves_and_a_new_occurrence_has_a_new_id(self):
+        e = expected()
+        seen, p = self.watched(e)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 155)
+        first = rang[0][1]
+        # A real judgement: it ends at once
+        p43 = poll(judged=43, judged_at=T0 + 195)
+        seen, a = self.step(seen, p43, 0.0, e, 200.0)
+        self.assertIsNone(a)
+        self.assertEqual((seen.since, seen.alarm_id), (None, ""))
+        # Nobody again: NOT MONITORED from 230, rings at 350 with a new id
+        seen, rang = self.stale(seen, p43, e, 200.0, 201, 350)
+        self.assertEqual([t for t, _ in rang], [350.0])
+        self.assertNotEqual(rang[0][1].id, first.id)
+        self.assertEqual(rang[0][1].id, hs.not_monitored_alarm_id(MID, 43, T0 + 195, SID))
+        self.assertEqual(rang[0][1].started_at, T0 + 350)
+
+    def test_a_p_from_an_older_stripes_uses_its_counter(self):
+        e = expected()
+        seen, _ = self.step(None, poll(counter=100, written_at=T0 - 5), 5.0, e, 0.0)
+        p = poll(counter=101, written_at=T0)
+        seen, _ = self.step(seen, p, 0.0, e, 5.0)
+        seen, rang = self.stale(seen, p, e, 5.0, 6, 155)
+        self.assertEqual([(t, a.id) for t, a in rang], [(155.0, f"{MID}.not_monitored.101_{SID}.{int(T0 * 1000)}")])
+
+    def test_names_the_machine_not_its_id(self):
+        seen, p = self.watched(expected())
+        (_, a), = self.stale(seen, p, expected(), 5.0, 6, 155)[1]
+        NameNotIdTests.assertNoIds(self, [a.msg], "not_monitored")
+        self.assertIn("Line 1 Bagger 1", a.msg.english())
 
 
 if __name__ == "__main__":
