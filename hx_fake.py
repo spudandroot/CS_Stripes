@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import dataclasses
 import gzip
 import hashlib
 import http.server
@@ -289,6 +290,9 @@ class FakePrinter:
         self.web_result_delay_s = 0.0
         self.web_first_reply_fresh = False
         self.web_reply_hook = None           # bytes -> bytes; runs under self.lock, so it mustn't call the fake
+        # record -> None: runs without the lock once a request is in flight and its latency has passed, before
+        # its reply is made. Tests hold requests in it to make an overlap happen exactly, not by timing
+        self.in_flight_hook = None
         self.single_web_session = False
         self.write_echo = False
         self.gzip_files = False
@@ -510,7 +514,13 @@ class FakePrinter:
             if (authed and req.parsed and req.query and req.tag in FORBIDDEN_QUERY_TAGS
                     and override is None):
                 wait += self.multi_value_hang_s
+            hook = self.in_flight_hook
         self._stopping.wait(wait)
+        if hook is not None:
+            try:
+                hook(record)
+            except Exception:
+                traceback.print_exc()
         with self.lock:
             if req.kind == "autopilot" and overlapping:
                 reply = None
@@ -1120,6 +1130,22 @@ _FOLDERS = ("config/hx/lines", "config/hx/machines", "config/hx/printers", "conf
             "status/pollers", "logs/hx-sends", "logs/hx-events", "logs/hx-admin")
 
 
+def first_load(data):
+    """A simulated PC's first data load: data.run_once(), again until data.current is set, for up to
+    4 x share_retry_s (real seconds, at most 20), with a probe of the share between tries. It reads every
+    record through the PC's own store with its scaled share timeout, and one slow file operation (a busy
+    Windows runner) marks that share down for share_retry_s, as it would on a real PC, whose data thread
+    loads again later. Returns data.current (None if it never loaded)."""
+    timings = data.timings
+    deadline = time.monotonic() + min(4 * timings.share_retry_s, 20.0)
+    data.run_once()
+    while data.current is None and time.monotonic() < deadline:
+        if not data.store.reach_now():
+            time.sleep(min(timings.share_timeout_s, 1.0))
+        data.run_once()
+    return data.current
+
+
 class FakeWorld:
     """A temp share, fake printers and a fake time server, seeded with example records (Example Co,
     Line 1 Bagger 1, ...) with hx_share.write_record plus a changes.json (protocol.md §16.2)."""
@@ -1160,7 +1186,7 @@ class FakeWorld:
         return fake
 
     def _seed(self, names):
-        store = self.store(self.identity("admin", admin=True, sender=False))
+        store = self.setup_store(self.identity("admin", admin=True, sender=False))
         now = self.clock.time()
         base = {"revision": 1, "updated_by": "EXAMPLE\\admin", "updated_at": now}
         write = lambda record: hx_share.write_record(store, record)
@@ -1211,10 +1237,20 @@ class FakeWorld:
         sids = ([SENDER_SID] if sender else []) + ([ADMIN_SID] if admin else [])
         return Identity(user=f"EXAMPLE\\{name}", computer=f"PC-{name.upper()}", sids=frozenset(sids), pid=pid)
 
-    def store(self, identity):
-        """Each simulated PC gets its own store, on its own fs.view() (its own caches and calls)."""
+    def store(self, identity, *, timings=None):
+        """Each simulated PC gets its own store, on its own fs.view() (its own caches and calls), with the
+        world's timings unless given."""
         return hx_share.ShareStore(self.share_root, identity=identity, clock=self.clock, fs=self.fs.view(),
-                                   timings=self.timings, version="test")
+                                   timings=self.timings if timings is None else timings, version="test")
+
+    def setup_store(self, identity):
+        """A store for a test's own set-up writes (the seed records, an expected state written before the
+        PCs start): the world's timings, but a share timeout no shorter than the real one. A set-up write
+        isn't under test, and with scaled timings one slow file write (a Windows runner's disk, its virus
+        scanner) would fail the test before it starts. The simulated PCs keep their scaled timeouts."""
+        timings = dataclasses.replace(self.timings,
+                                      share_timeout_s=max(self.timings.share_timeout_s, TIMINGS.share_timeout_s))
+        return self.store(identity, timings=timings)
 
     def paths(self, identity):
         pc = os.path.join(self.tmpdir, "pcs", identity.key)

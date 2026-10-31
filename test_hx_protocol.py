@@ -1460,25 +1460,44 @@ class FakePrinterTests(unittest.TestCase):
         self.assertEqual(raw(fake, hp.sme_request("127.0.0.1", fake.port, {}, repeat=True,
                                                   body=b"<SM>RepeatRequest</SM>")).status, 401)
 
+    def overlap(self, fake, second, *, after_first=False):
+        """A raw PRIN and, while it is in flight, a raw second request: (the PRIN's reply body, the second's).
+        The overlap is made exactly, not by timing (on Windows a 15.6 ms timer tick can put the second's
+        reply first, or let the PRIN end before the second arrives): the fake holds the PRIN in its
+        in_flight_hook until the second is in flight too, and with after_first makes the second's reply
+        only once the PRIN's is made."""
+        def until(cond):
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with fake.lock:
+                    if cond():
+                        return True
+                time.sleep(0.001)
+            return False
+
+        def hold(record):
+            with fake.lock:
+                first = fake.requests[0] is record
+            if first:
+                until(lambda: fake.in_flight >= 2)
+            elif after_first:
+                until(lambda: fake.requests[0]["reply"] is not None)
+        fake.in_flight_hook = hold
+        first = in_thread(lambda: raw_autopilot(fake, "<PRIN/>").body)
+        self.assertTrue(until(lambda: fake.in_flight >= 1))     # the PRIN is in flight before the second is sent
+        reply = raw_autopilot(fake, second).body
+        return first(), reply
+
     def test_overlap(self):
         fake = start(self, latency_s=0.05)
-        first = in_thread(lambda: raw_autopilot(fake, "<PRIN/>").body)
-        time.sleep(0.01)
-        self.assertEqual(raw_autopilot(fake, "<PRIN/>").body, b"7")
-        self.assertEqual(first(), b"1")
+        self.assertEqual(self.overlap(fake, "<PRIN/>"), (b"1", b"7"))
         self.assertEqual(fake.max_in_flight, 2)
         self.assertEqual(fake.violations, ["two requests in flight"])
         fake = start(self, latency_s=0.05, mixup=True)
         fake.mixup_p = 1.0
-        first = in_thread(lambda: raw_autopilot(fake, "<PRIN/>").body)
-        time.sleep(0.01)
-        self.assertEqual(raw_autopilot(fake, "<MSGNAM/>").body, b"1")      # the PRIN's reply
-        self.assertEqual(first(), b"1")
+        self.assertEqual(self.overlap(fake, "<MSGNAM/>", after_first=True), (b"1", b"1"))   # the PRIN's reply
         fake = start(self, latency_s=0.05, busy_on_overlap=False)
-        first = in_thread(lambda: raw_autopilot(fake, "<PRIN/>").body)
-        time.sleep(0.01)
-        self.assertEqual(raw_autopilot(fake, "<MSGNAM/>").body, b"None")
-        first()
+        self.assertEqual(self.overlap(fake, "<MSGNAM/>")[1], b"None")
 
     def test_overload(self):
         fake = start(self, latency_s=0.1)

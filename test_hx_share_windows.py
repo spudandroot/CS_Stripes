@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,46 @@ def _printed(*command):
     except (LookupError, UnicodeDecodeError):
         printed = raw.decode("utf-8", "replace")
     return f"> {shown}  (exit code {done.returncode})\n{printed.strip()}"
+
+
+def inheriting_temp_folder(prefix):
+    """A new folder in the temp folder whose rights are inherited the usual way, marked (I); the caller
+    removes it. tempfile.mkdtemp's folder won't do on Windows: Python 3.12.4 and later make it (mode 0o700)
+    with a protected list of its own, SYSTEM, Administrators and OWNER RIGHTS full control, not marked as
+    inheriting automatically, and Windows gives every folder made inside it copies of those entries as
+    entries of its own (no (I) in icacls, as the CI runner showed for os.mkdir and os.makedirs).
+    icacls /inheritance:r, which removes inherited entries only, leaves them."""
+    base = tempfile.gettempdir()
+    while True:
+        path = os.path.join(base, f"{prefix}{secrets.token_hex(6)}")
+        try:
+            os.mkdir(path)      # the default mode: no list of its own, only what the temp folder passes down
+        except FileExistsError:
+            continue
+        return path
+
+
+def icacls_entries(path):
+    """The entries icacls lists for path, as it prints them ("NT AUTHORITY\\SYSTEM:(I)(F)")."""
+    done = subprocess.run(["icacls", path], capture_output=True, timeout=30)
+    if done.returncode != 0:
+        raise OSError(f"icacls {path} failed: {done.stdout!r} {done.stderr!r}")
+    try:
+        text = done.stdout.decode("oem")        # the console's code page (a Windows-only codec)
+    except (LookupError, UnicodeDecodeError):
+        text = done.stdout.decode("utf-8", "replace")
+    entries = []
+    for i, line in enumerate(text.splitlines()):
+        if i == 0:
+            # The first line starts with the path as given, then the first entry
+            if not line.startswith(path):
+                raise OSError(f"icacls {path} printed something else: {text!r}")
+            line = line[len(path):]
+        line = line.strip()
+        if not line:
+            break               # a blank line, then "Successfully processed 1 files; ..."
+        entries.append(line)
+    return entries
 
 
 @unittest.skipUnless(sys.platform == "win32", WINDOWS_ONLY)
@@ -186,28 +227,54 @@ class AddOnlyFolderTests(unittest.TestCase):
         if not user:
             self.skipTest("no USERNAME")
         self.who = f"{domain}\\{user}" if domain else user
-        # A folder of its own in the temp folder: mkdtemp's folder won't do. Python 3.12.4 and later make
-        # it (os.mkdir with mode 0o700) with explicit entries giving SYSTEM, Administrators and OWNER
-        # RIGHTS full control, and icacls keeps them: /inheritance:r removes inherited entries only, and
-        # /grant:r replaces the named accounts' entries only. Every new file then inherited
-        # Administrators' full control, so on the CI runner (an administrator, UAC off, so its token
-        # has Administrators enabled) the log file could be opened to change it. A folder made by
-        # os.mkdir has inherited entries only, and /inheritance:r takes them all away
-        self.parent = tempfile.mkdtemp(prefix="hx-share-win-")
+        # The folder must end with exactly the three entries below. Not inside mkdtemp's folder: every folder
+        # made in it gets SYSTEM, Administrators and OWNER RIGHTS full control as entries of its own
+        # (inheriting_temp_folder), which icacls keeps, so every new file inherited Administrators' full
+        # control and on the CI runner (an elevated administrator) the log file could be opened to change
+        # it. Inside a folder that inherits the usual way, every entry the new folder gets is marked
+        # inherited, and /inheritance:r takes them all away
+        self.parent = inheriting_temp_folder("hx-share-win-")
         self.folder = os.path.join(self.parent, "hx-events")
         os.mkdir(self.folder)
         self.addCleanup(self.clean_up)
+        # Exactly these entries, so an elevated administrator gets nothing through its groups. Anything
+        # else, and the test couldn't tell an add-only folder from a writable one
+        wanted = sorted(e.lower() for e in (f"{self.who}:(RX,WD,AD)", f"{self.who}:(OI)(IO)(R)",
+                                            "OWNER RIGHTS:(OI)(IO)(R)"))
+        self.set_rights()
+        entries = self.entries()
+        if sorted(e.lower() for e in entries) != wanted:
+            # Should Windows still have copied entries in as the folder's own: every account off, then the
+            # three entries again
+            for account in sorted({e.partition(":(")[0] for e in entries}):
+                self.icacls("/remove:g", account)
+            self.set_rights()
+            entries = self.entries()
+        if sorted(e.lower() for e in entries) != wanted:
+            self.fail(f"the test folder's entries aren't exactly {wanted}\n\n"
+                      f"{_printed('icacls', self.folder)}\n\n{_printed('whoami', '/user', '/groups')}")
+        self.fs = file_ops()
+
+    def icacls(self, *args):
+        """icacls on the test folder; the set-up fails if it does."""
+        try:
+            done = subprocess.run(["icacls", self.folder, *args], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.fail(f"the set-up's icacls {' '.join(args)} failed: {e}")
+        if done.returncode != 0:
+            self.fail(f"the set-up's icacls {' '.join(args)} failed: {done.stdout!r} {done.stderr!r}")
+
+    def set_rights(self):
         # The account's two entries differ only in where they apply: the second is added (/grant), so
         # it can't replace the first (/grant:r)
-        for args in (["/inheritance:r", "/grant:r", f"{self.who}:(RX,WD,AD)", "*S-1-3-4:(OI)(IO)(R)"],
-                     ["/grant", f"{self.who}:(OI)(IO)(R)"]):
-            try:
-                done = subprocess.run(["icacls", self.folder, *args], capture_output=True, timeout=30)
-            except (OSError, subprocess.SubprocessError) as e:
-                self.skipTest(f"icacls failed: {e}")
-            if done.returncode != 0:
-                self.skipTest(f"icacls failed: {done.stdout!r} {done.stderr!r}")
-        self.fs = file_ops()
+        self.icacls("/inheritance:r", "/grant:r", f"{self.who}:(RX,WD,AD)", "*S-1-3-4:(OI)(IO)(R)")
+        self.icacls("/grant", f"{self.who}:(OI)(IO)(R)")
+
+    def entries(self):
+        try:
+            return icacls_entries(self.folder)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.fail(f"the set-up's icacls failed: {e}")
 
     def clean_up(self):
         # Full control first, or the files can't be removed

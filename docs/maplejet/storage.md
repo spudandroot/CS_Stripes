@@ -1553,9 +1553,11 @@ What §11.2 to §11.5 can't close, and what it costs. architecture.md §7.3 rule
    renames the winner's fresh file aside for up to three share calls (§11.4 step 2 puts it back). That
    needs two takers within milliseconds, or a taker frozen between its read and its rename. Bound: the
    winner's Send fails red, a ghost lock lasts 60 s, and at most one poller request overlaps.
-5. **A refresh in flight at release.** `release()` waits for the keeper only `lock_refresh_s`; a refresh
-   still in flight can land after the removal and leave a ghost lock with a released token. This PC
-   ignores it until `until`; other PCs pause up to 60 s. Liveness only.
+5. **A refresh in flight at release.** `release()` waits for the keeper `lock_refresh_s + 2 *
+   share_timeout_s`, as long as one refresh's read and write can take, so a refresh in flight lands
+   before the removal. Only a refresh stuck longer than that (an OS call the share timeout couldn't
+   abandon) can still land after it and leave a ghost lock with a released token. This PC ignores it
+   until `until`; other PCs pause up to 60 s. Liveness only.
 6. **Read lag.** Two holders become possible if one PC's reads of the lock lag the share by 30 s or
    more (Offline Files, DFS replicas). §8.2 note 5 already rules that out (one server, `CachingMode
    None`).

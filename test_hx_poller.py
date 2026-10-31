@@ -34,6 +34,11 @@ from hx_model import (ALLOWED_WRITE_TAGS, AMBER, GREY, RED, TIMINGS, Ack, AuthFa
 EDT = lambda utc: -14400.0               # a fixed offset: the fake printer's clock doesn't follow the host
 # Logic tests: default timings on a FakeClock, with short real network and share limits
 LOGIC = dataclasses.replace(TIMINGS, http_timeout_s=0.1, read_retry_s=0.01, share_timeout_s=2.0)
+# Threaded tests on the system clock: TIMINGS scaled by RT as a whole, so the spec's ratios between the
+# waits hold. A Windows runner gets twice the time: its clock ticks every 15.6 ms, and its file writes
+# (NTFS, the virus scanner) are slower. RS scales the tests' own absolute waits, set for RT = 0.02
+RT = 0.04 if sys.platform == "win32" else 0.02
+RS = RT / 0.02
 NAME = "EXCO1-PKO07-BBBB-M9"
 OLD_NAME = "EXCO1-PKO07-AAAA-K0"
 ORIGIN = "Product of USA and Canada"
@@ -85,7 +90,8 @@ class PC:
         self.bus = EventBus()
         self.data = hx_share.DataService(store=self.store, local=self.local, bus=self.bus, identity=self.identity,
                                          clock=clock, timings=timings)
-        self.data.run_once()
+        # Tried again if one slow share operation failed it (hx_fake.first_load)
+        sim.test.assertIsNotNone(hx_fake.first_load(self.data), "the PC's first data load kept failing")
         self.logs = []
         original = self.data.append_log
 
@@ -126,8 +132,9 @@ class Sim:
         test.addCleanup(self.world.close)
         self.fake = self.world.printers[0]
         self.mid, self.pid = self.world.ids["machine1"], self.world.ids["printer1"]
-        self.observer = self.world.store(self.world.identity("observer", sender=False))
-        self.sender = self.world.store(self.world.identity("jsmith"))
+        # The test's own reads and set-up writes aren't under test: the real share timeout
+        self.observer = self.world.setup_store(self.world.identity("observer", sender=False))
+        self.sender = self.world.setup_store(self.world.identity("jsmith"))
         self.pcs = []
         self.offset_fn = (printers or [{}])[0].get("offset_fn", EDT)
         if install_message:
@@ -167,10 +174,12 @@ class Sim:
         return p.state.code if p is not None and p.state is not None else ""
 
     def read_back(self, slot):
-        """The fake's message as a Load reads it; the fake's observations are cleared afterwards."""
+        """The fake's message as a Load reads it; the fake's observations are cleared afterwards. Its requests
+        wait as long as this sim's do, so a slow fake (more than LOGIC's 0.1 s) still answers in time."""
+        timings = dataclasses.replace(LOGIC, http_timeout_s=max(LOGIC.http_timeout_s, self.timings.http_timeout_s))
         client = hx_protocol.PrinterClient("127.0.0.1", self.fake.uid, hx_protocol.make_token("123321"),
                                            port=self.fake.port, clock=SYSTEM_CLOCK, gates=hx_protocol.GateRegistry(),
-                                           timings=LOGIC)
+                                           timings=timings)
         rb = client.load_slot(slot)
         self.fake.reset_observations()
         return rb
@@ -1004,7 +1013,7 @@ class DstTests(Base):
         def now(self_, **kw):
             threads.append(threading.current_thread().name)
             return real_now(self_, **kw)
-        timings = TIMINGS.scaled(0.02)
+        timings = TIMINGS.scaled(RT)
         sim = self.sim(clock=SYSTEM_CLOCK, timings=timings)
         sim.expect()
         a = sim.pc("akim", time_source=hx_time.TimeSource(["time.example.local"], clock=SYSTEM_CLOCK,
@@ -1013,7 +1022,7 @@ class DstTests(Base):
         with mock.patch.object(hx_time.TimeSource, "now", now):
             a.poller.start()
             self.addCleanup(a.poller.stop)
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 5 * RS
             while time.monotonic() < deadline and not (threads and a.store.read_poll(sim.mid)
                                                        and a.store.read_poll(sim.mid).clock_offset_s is not None):
                 time.sleep(0.05)
@@ -2305,7 +2314,9 @@ class CoordinationTests(Base):
         self.no_violations(sim)
 
     def test_worker_thread_survives_failing_writes(self):
-        timings = dataclasses.replace(TIMINGS.scaled(0.02), http_timeout_s=0.09)
+        # The fake answers at once, so a request keeps http_timeout_s + 2 x read_retry_s within stale_s / 4,
+        # as the real timings do (states.md §6.4: a read fits after a keep-fresh write)
+        timings = dataclasses.replace(TIMINGS.scaled(RT), http_timeout_s=2.7 * RT)
         sim = self.sim(clock=SYSTEM_CLOCK, timings=timings)
         sim.expect()
         a = sim.pc("akim")
@@ -2318,17 +2329,17 @@ class CoordinationTests(Base):
             while time.monotonic() < deadline and not cond():
                 time.sleep(0.02)
             return cond()
-        self.assertTrue(wait_for(lambda: sim.code() == "running_confirmed", 3.0))
+        self.assertTrue(wait_for(lambda: sim.code() == "running_confirmed", 3.0 * RS))
         w = a.worker()
         with mock.patch("traceback.print_exc"):
             a.broken[0] = 2
-            self.assertTrue(wait_for(lambda: a.broken[0] == 0, 1.0))
+            self.assertTrue(wait_for(lambda: a.broken[0] == 0, 1.0 * RS))
             before = sim.p().counter
-            self.assertTrue(wait_for(lambda: sim.p().counter > before + 2, 1.0))
+            self.assertTrue(wait_for(lambda: sim.p().counter > before + 2, 1.0 * RS))
         self.assertTrue(w.thread.is_alive())
         self.assertFalse(w.done)
         self.assertIs(a.worker(), w)
-        self.assertTrue(wait_for(lambda: sim.code() == "running_confirmed", 1.0))
+        self.assertTrue(wait_for(lambda: sim.code() == "running_confirmed", 1.0 * RS))
 
     def test_a_dead_worker_thread_is_replaced(self):
         # Belt and braces: a worker thread that ended without finishing is reaped, and a new worker
@@ -2560,7 +2571,10 @@ class CoordinationTests(Base):
 
 class FreshnessTests(Base):
     def threaded(self, *, slow_lock_s=0.0, gate_grab=False, run_s=1.3):
-        timings = dataclasses.replace(TIMINGS.scaled(0.02), http_timeout_s=0.09, web_repeat_window_s=0.2)
+        """run_s: the run's length at RT = 0.02 (scaled by RS). The fake's latency is 0.4 x stale_s / 2, which
+        http_timeout_s must exceed, so a request can't keep http_timeout_s + 2 x read_retry_s within
+        stale_s / 4 here: the keep-fresh rule is tested at its limits."""
+        timings = dataclasses.replace(TIMINGS.scaled(RT), http_timeout_s=4.5 * RT, web_repeat_window_s=10 * RT)
         half = timings.stale_s / 2
         sim = self.sim(clock=SYSTEM_CLOCK, timings=timings,
                        printers=[{"offset_fn": EDT, "latency_s": 0.4 * half}])
@@ -2588,12 +2602,12 @@ class FreshnessTests(Base):
                         time.sleep(half + timings.http_timeout_s)
                 grabbed.append(threading.Thread(target=hold, daemon=True))
                 grabbed[0].start()
-                got.wait(1.0)
+                got.wait(1.0 * RS)
             return real_lock(printer_id)
         a.store.write_poll, a.store.read_lock = write_poll, read_lock
         a.poller.start()
         self.addCleanup(a.poller.stop)
-        deadline = time.monotonic() + run_s
+        deadline = time.monotonic() + run_s * RS
         while time.monotonic() < deadline:
             time.sleep(0.2)
         a.poller.stop()
@@ -2603,7 +2617,7 @@ class FreshnessTests(Base):
         half = timings.stale_s / 2
         latency = 0.4 * half
         bound = half + timings.http_timeout_s
-        slack = 0.03                                    # thread scheduling on a busy test machine
+        slack = 1.5 * RT                                # thread scheduling on a busy test machine
         reqs = sim.requests()
         self.assertGreaterEqual(len(reqs), 6)
         # No request may still run stale_s / 2 + http_timeout_s after the start of the last good P write
@@ -2625,8 +2639,7 @@ class FreshnessTests(Base):
         self.check(sim, timings, writes)
 
     def test_slow_lock_reads(self):
-        timings = dataclasses.replace(TIMINGS.scaled(0.02), http_timeout_s=0.09)
-        slow = timings.stale_s / 4 - 0.02
+        slow = TIMINGS.scaled(RT).stale_s / 4 - RT
         sim, timings, writes, _ = self.threaded(slow_lock_s=slow, run_s=2.2)
         self.check(sim, timings, writes, lock_s=slow, strict=False)
 

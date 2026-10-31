@@ -13,6 +13,7 @@ import itertools
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -895,23 +896,41 @@ class SendTests(Base):
 
     def test_lock_budget(self):
         self.quiet()
+        # Scaled as a whole (the keeper's refresh and the share timeout within lock_stale_s / 2), and twice as
+        # long on a Windows runner, whose clock ticks every 15.6 ms and whose file writes are slower
+        windows = 2.0 if sys.platform == "win32" else 1.0
         budget = dataclasses.replace(FAST, http_timeout_s=0.1, web_repeat_window_s=0.1, lock_stale_s=1.6,
-                                     share_timeout_s=0.25)
+                                     share_timeout_s=0.25).scaled(windows)
         self.timings = budget
-        w = self.world([{"latency_s": 0.03}], timings=budget)
+        w = self.world([{"latency_s": 0.03 * windows}], timings=budget)
         pc = self.pc()
         self.own_poll(pc)
         fake = w.printers[0]
         marks = {}
+        refreshed = []
+        real_write = pc.store.write_bytes
+
+        def write_bytes(rel, data):
+            real_write(rel, data)
+            if rel.startswith("status/locks/"):
+                refreshed.append(time.monotonic())      # a good refresh by the lock's keeper
+        pc.store.write_bytes = write_bytes
 
         def on(event):
             if isinstance(event, SendEvent) and event.step == STEP_CHECK_MACHINE and event.status == "running":
+                # Right after a good refresh, so the lease has its whole length left: at any other moment in the
+                # keeper's cycle a slow share (a Windows runner) can leave too little of it for even the first
+                # request, and the Send rightly asks nothing more
+                n = len(refreshed)
+                marks["refreshed"] = wait_until(lambda: len(refreshed) > n,
+                                                2 * (budget.lock_refresh_s + budget.share_timeout_s))
                 pc.store.fs.fail_replace = 10 ** 6      # the keeper's refreshes fail from here
                 marks["fail"] = time.monotonic()
             if isinstance(event, SendEvent) and event.status == "failed":
                 marks["lost"] = time.monotonic()
         result, _, _ = self.send(pc, on_event=on)
         r = result.machines[0]
+        self.assertTrue(marks["refreshed"])
         self.assertFalse(r.ok)
         self.assertEqual(r.msg.english(), LOCK_LOST)
         self.assertLess(marks["lost"] - marks["fail"], budget.lock_stale_s / 2)
@@ -2223,14 +2242,26 @@ class LeaseTests(Base):
         self.addCleanup(taker.release)
         marks = {}
 
+        def stale_for_b():
+            for _ in range(4):
+                b.store.read_lock(pid)
+                if (b.store.lock_age(pid) or 0.0) >= self.timings.lock_stale_s:
+                    return
+                clock.jump(self.timings.lock_stale_s + 1)
+
         def freeze(name, args):
             if name != "command" or args[0].tag != "PRINT" or ">0<" not in args[0].xml or marks:
                 return
-            for _ in range(4):                                  # the admin PC's keeper stops by itself
-                b.store.read_lock(pid)
-                if (b.store.lock_age(pid) or 0.0) >= self.timings.lock_stale_s:
-                    break
-                clock.jump(self.timings.lock_stale_s + 1)
+            stale_for_b()
+            # The admin PC's keeper stops by itself at its next refresh, past the lease. But its thread runs on
+            # while this PC "freezes", and a refresh already writing may still land over B's new file (the
+            # residual README sign-off 5 accepts; not what this test is about), so B takes over only once the
+            # keeper has ended, and the lock has stood still for lock_stale_s on B's clock
+            keeper = _CHECKED.lock._keeper
+            if keeper is not None:
+                keeper.join(10 * self.timings.lock_refresh_s + 2 * self.timings.share_timeout_s)
+            marks["keeper_ended"] = keeper is None or not keeper.is_alive()
+            stale_for_b()
             self.assertEqual(taker.acquire(), "held")
             b.store.write_line_status(LineStatus(line_id=line_id, send_id="sd_bbbbbbbbbb"))
             marks.update(requests=len(fake.requests), line=b.store.read_line_status(line_id),
@@ -2240,6 +2271,7 @@ class LeaseTests(Base):
                          admin.data.current, admin.identity)
         result = admin.print_run(plan).run(lambda e: None)
         self.assertIn("requests", marks)
+        self.assertTrue(marks["keeper_ended"])
         self.assertEqual(len(fake.requests), marks["requests"])  # nothing after the takeover
         self.assertFalse(result.ok)
         self.assertEqual(to_json(b.store.read_line_status(line_id)), to_json(marks["line"]))

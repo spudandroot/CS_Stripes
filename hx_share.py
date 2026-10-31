@@ -2412,7 +2412,11 @@ class PrinterLock:
             if stop is not None:
                 stop.cancel()
             if keeper is not None and keeper is not threading.current_thread():
-                keeper.join(self.store.timings.lock_refresh_s)
+                # As long as one refresh can take (its read and its write, each up to share_timeout_s): a
+                # refresh still being written would otherwise land after the removal below and put the file
+                # back, a lock nobody holds that pauses the other PCs for up to lock_stale_s
+                t = self.store.timings
+                keeper.join(t.lock_refresh_s + 2 * t.share_timeout_s)
             with self._lock:
                 until = self._last_ok + self.store.timings.lock_stale_s / 2
                 if self.state == "held" and self.store.clock.monotonic() >= until:

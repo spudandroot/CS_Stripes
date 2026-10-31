@@ -2339,6 +2339,30 @@ class LockTests(ShareCase):
         self.assertFalse(os.path.exists(self.path(f"status/locks/{PRINTER_ID}.lock")))
         self.assertIsNone(lk._keeper)
 
+    def test_release_waits_for_a_refresh_in_flight(self):
+        # A keeper refresh still being written when release() ran used to land after the removal and put the
+        # file back: a lock nobody held, which paused the other PCs' pollers and refused their Sends for up to
+        # lock_stale_s (seen on the Windows runner). release() now waits as long as one refresh can take
+        t = dataclasses.replace(FAST, share_timeout_s=1.0, lock_stale_s=4.0)
+        st = self.store(identity(sender=True), timings=t, clock=SYSTEM_CLOCK)
+        lk = self.lock(st)
+        self.assertEqual(lk.acquire(), "held")
+        real, writing = st.fs.write_whole, threading.Event()
+
+        def slow_write(path, data):
+            if "locks" in path:
+                writing.set()
+                time.sleep(0.5)                 # a slow share: the refresh's write takes 0.5 s, within the timeout
+            return real(path, data)
+
+        st.fs.write_whole = slow_write
+        lk.start_keeping()
+        self.assertTrue(writing.wait(2))
+        lk.release()
+        time.sleep(0.8)                         # long after the slow write has landed
+        self.assertEqual(self.listing("status/locks"), [])
+        self.assertIsNone(self.b.read_lock(PRINTER_ID))
+
     def test_bad_arguments(self):
         with self.assertRaises(ValueError):
             self.a.lock(PRINTER_ID, purpose="party", run_id="x")

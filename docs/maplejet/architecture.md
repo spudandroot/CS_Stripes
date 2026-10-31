@@ -1730,9 +1730,15 @@ class FakeWorld:
     printers: list[FakePrinter]
     sntp: FakeSntp
     def identity(self, name: str, *, admin: bool = False, sender: bool = True, pid: int = 1) -> Identity: ...
-    def store(self, identity: Identity) -> ShareStore: ...   # each simulated PC gets its own store,
-                                                             # on its own fs.view() (per-PC caches)
+    def store(self, identity: Identity, *, timings: Timings | None = None) -> ShareStore: ...
+                                                  # each simulated PC gets its own store, on its own
+                                                  # fs.view() (per-PC caches), the world's timings unless given
+    def setup_store(self, identity: Identity) -> ShareStore: ...   # for a test's own set-up writes: the
+                                                  # world's timings with a share timeout no shorter than the real one
     def close(self) -> None: ...
+
+def first_load(data: DataService) -> None: ...   # a simulated PC's first load: run_once() until data.current
+                                                 # is set, up to 4 x share_retry_s, with reach_now() between tries
 
 # python hx_fake.py [--printers N] [--encoder] [--mixup]
 #   runs fakes and a seeded temp share for manual UI work, and prints the STRIPES_V2 and

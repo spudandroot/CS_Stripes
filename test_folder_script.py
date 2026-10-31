@@ -19,6 +19,7 @@ import dataclasses
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -281,9 +282,26 @@ def remove_tree(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
+def inheriting_temp_folder(prefix):
+    """A new folder in the temp folder whose rights are inherited the usual way, marked (I), as a server's
+    Stripes folder's are. tempfile.mkdtemp's folder won't do on Windows: Python 3.12.4 and later make it
+    (mode 0o700) with a protected list of its own, SYSTEM, Administrators and OWNER RIGHTS full control,
+    not marked as inheriting automatically, and Windows gives every folder made inside it copies of those
+    entries as entries of its own: the CI runner showed v2, made by os.makedirs, with no (I) entry."""
+    base = tempfile.gettempdir()
+    while True:
+        path = os.path.join(base, f"{prefix}{secrets.token_hex(6)}")
+        try:
+            os.mkdir(path)      # the default mode: no list of its own, only what the temp folder passes down
+        except FileExistsError:
+            continue
+        return path
+
+
 def make_tree(test):
-    """<tmp>/Stripes/config with copies of the example Zebra files; returns (config, v2). Removed after."""
-    tmp = tempfile.mkdtemp(prefix="stripes-v2-")
+    """<tmp>/Stripes/config with copies of the example Zebra files; returns (config, v2). Removed after. The
+    folders inherit their rights the usual way (inheriting_temp_folder)."""
+    tmp = inheriting_temp_folder("stripes-v2-")
     test.addCleanup(remove_tree, tmp)
     config = os.path.join(tmp, "Stripes", "config")
     os.makedirs(config)

@@ -1121,7 +1121,9 @@ of them is bag text.
    and `rng.random() < drop_after_idle_p`, drop the request. A dropped request still counts as activity.
    `last_activity` starts at the construction time.
 7. `last_activity = clock.monotonic()`.
-8. Sleep `latency_s`, plus `web_latency_s` for a login, SME or file request.
+8. Sleep `latency_s`, plus `web_latency_s` for a login, SME or file request. Then, if `in_flight_hook` is
+   set, call it with the request's record (still counted in flight, before its reply is made): a test
+   can hold one request there until a second arrives, to make an overlap without relying on timing.
 9. Compute the reply under the lock (§15.3 to §15.5). For an Autopilot request marked overlapping: with
    `mixup` and `rng.random() < mixup_p`, answer with the reply most recently computed for a different
    request, when there is one; otherwise, with `busy_on_overlap`, answer `7`; otherwise answer
@@ -1315,7 +1317,7 @@ The client sees "connection closed without reply". `rng` is `random.Random(seed)
 | One command per request; the rest ignored (seen) | §15.3 step 2 | none |
 | Codes in 200 bodies, looking like values (seen, manual) | §15.3; any answer through `override` | `override` |
 | Busy from 2 overlapping requests (stress test) | `7` to overlapping Autopilot requests | `busy_on_overlap` |
-| Mixed-up replies with 2 or more in flight: 39 in the stress test, none in about 12,700 sent one at a time | another request's reply | `mixup`, `mixup_p` |
+| Mixed-up replies with 2 or more in flight: 39 in the stress test, none in about 12,700 sent one at a time | another request's reply | `mixup`, `mixup_p`; tests force the overlap with `in_flight_hook` |
 | Stopped answering at 8 and at 32 overlapping requests, back within about 1 s (stress test) | drops everything for `overload_pause_s` | `overload_at`, `overload_pause_s` |
 | About 2 at once and about 16 a second in total; 80 ms per reply (stress test) | a thread per connection plus latency | `latency_s` |
 | The first request after about 4.7 s of quiet sometimes closed without a reply (soak: 5 in 9,536) | drops it | `drop_after_idle_s`, `drop_after_idle_p` |
