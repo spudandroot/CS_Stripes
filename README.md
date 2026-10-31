@@ -131,6 +131,14 @@ It creates the folders and sets their permissions, copies `printers.json` and `s
 safe: it puts the permissions back and never deletes anything. Get it from `tools/` in the
 release's source, read it, and `Unblock-File` it if your execution policy asks.
 
+- `v2` doesn't inherit the Stripes folder's rights, so rights granted there (a helpdesk group, say)
+  stop at `v2`. Run the script again later as a member of the file server's Administrators group
+  (a domain admin) or as the account that ran it first.
+- A re-run removes any entry added by hand on the `v2` folders, and lists each one as
+  `Removed entry`.
+- The share's own (SMB) permissions must allow at least Change for Domain Users. The folder rights
+  below do the real limiting.
+
 | Folder under `v2\` | Domain Users | Stripes MapleJet Senders | Stripes Administrators |
 |---|---|---|---|
 | `config\` (Zebra printers and stock, `hx\` settings) | Read | Read | Modify |

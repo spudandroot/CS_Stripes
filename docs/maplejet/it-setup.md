@@ -190,6 +190,16 @@ You should see:
 - A group that isn't found, or a mapped drive, stops it before any change, with "Group '<name>'
   wasn't found. Create it, or pass its name with -<Parameter>." or "... Use the UNC path, as in the
   ConfigPath policy value.", then "Nothing was changed."
+
+Good to know:
+
+- `v2` doesn't inherit the Stripes folder's rights, so rights granted on `\\SERVER\Share\Stripes`
+  (a helpdesk group, say) stop at `v2`. Run the script again later as a member of the file server's
+  Administrators group (a domain admin) or as the account that ran it first.
+- A re-run removes any entry added by hand on the 23 folders and lists each one as `Removed entry`.
+  Make permission changes by changing the groups' members, not the folders.
+- "Put Stripes.exe on the share" in the closing message comes after the test PC (step 11): try the
+  release there first.
 - Any other error prints "Failed while <step> (<item>): <error>" and "What is done stays done. Fix the
   problem and run the script again to finish."
 

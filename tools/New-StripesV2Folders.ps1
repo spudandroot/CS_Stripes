@@ -18,23 +18,24 @@ The script:
     gets exactly its own entries; any other entry added by hand is removed and listed.
  6. Reminds you about offline caching and DFS, and lists the permissions with icacls.
 
-    Folder under v2                                  Users          Senders              Administrators
-    config, templates                                Read           Read                 Modify
-    status\machines, status\pollers, status\deployment  Modify      Modify               Modify
-    status\lines, status\locks, status\alerts        Read           Modify               Modify
-    logs\hx-sends                                    Read           Read and add files   Read
-    logs\hx-events                                   Read and add files (all three)
-    logs\hx-admin                                    Read           Read                 Read and add files
+    Folder under v2                        Users        Senders      Administrators
+    config, templates                      Read         Read         Modify
+    status\machines, \pollers, \deployment Modify       Modify       Modify
+    status\lines, \locks, \alerts          Read         Modify       Modify
+    logs\hx-sends                          Read         Read, add    Read
+    logs\hx-events                         Read, add    Read, add    Read, add
+    logs\hx-admin                          Read         Read         Read, add
 
-Log files can be added but never changed or deleted. The server's SYSTEM and Administrators have
-Full Control everywhere.
+"Read, add" is read and add files: log files can be added but never changed or deleted. The file
+server's SYSTEM and Administrators have Full Control everywhere.
 
 Running it again is safe: it never deletes, renames or overwrites anything, and it puts the
 permissions back. It never touches today's config or status folders (it only reads the two Zebra
 files), the share's own settings, the registry or Group Policy.
 
-Run it as an account with Full Control on the Stripes folder, best a member of the file server's
-Administrators group. On the file server itself, run it as administrator.
+Run it as an account with Full Control on the Stripes folder. v2 doesn't inherit that, so run it
+again later as a member of the file server's Administrators group (a domain admin), or as the
+same account. On the file server itself, run it as administrator.
 
 .PARAMETER ConfigPath
 Today's Zebra config folder, exactly as in the ConfigPath policy value, for example
@@ -475,6 +476,10 @@ function Resolve-GroupSid([string]$Name, [string]$Parameter) {
     $sid
 }
 
+function Write-Warn([string]$Text) {
+    Write-Host "Warning: $Text" -ForegroundColor Yellow
+}
+
 function New-V2Folder {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([string]$Path, [string]$Shown)
@@ -495,7 +500,7 @@ function Copy-ZebraFile {
     if (Test-Path -LiteralPath $Target) {
         Write-Host "Kept: $Shown (already there)"
     } elseif (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
-        Write-Host "Warning: there is no $Source to copy to $Shown." -ForegroundColor Yellow
+        Write-Warn "there is no $Source to copy to $Shown."
     } elseif ($PSCmdlet.ShouldProcess($Shown, "Copy $Source")) {
         [System.IO.File]::Copy($Source, $Target, $false)
         Write-Host "Copied: $Source to $Shown"
@@ -529,33 +534,34 @@ function Test-ShareSettings([string]$V2) {
     $here = [string]$env:COMPUTERNAME
     $onServer = ($server -eq '') -or ($here -ne '' -and ($server -eq $here -or $server -like "$here.*")) -or
                 ($server -eq 'localhost')
-    $check = "Get-SmbShare $share | Select CachingMode"
+    $check = "Check on the file server that offline caching is off: Get-SmbShare $share | Select CachingMode"
     $smb = Get-Command -Name Get-SmbShare -ErrorAction SilentlyContinue
     if (-not $onServer -or $null -eq $smb) {
-        Write-Host "Check on the file server that offline caching is off: $check"
+        Write-Host $check
     } else {
         try {
             if ($server -eq '') {
-                $shares = @(Get-SmbShare | Where-Object {
-                    $_.Name -notlike '*$' -and $_.Path -and (
-                        $V2 -eq $_.Path.TrimEnd('\') -or $V2.StartsWith($_.Path.TrimEnd('\') + '\', 'OrdinalIgnoreCase'))
+                # A local path: the shares that hold it (not the hidden ones like D$)
+                $shares = @(Get-SmbShare | Where-Object { $_.Name -notlike '*$' -and $_.Path } | Where-Object {
+                    $top = $_.Path.TrimEnd('\')
+                    $V2 -eq $top -or $V2.StartsWith($top + '\', 'OrdinalIgnoreCase')
                 })
             } else {
                 $shares = @(Get-SmbShare -Name $share)
             }
             if ($shares.Count -eq 0) {
-                Write-Host "No share on this computer holds v2. Check on the file server that offline caching is off: $check"
+                Write-Host "No share on this computer holds v2. $check"
             }
             foreach ($s in $shares) {
                 if ([string]$s.CachingMode -eq 'None') {
                     Write-Host "Offline caching is off for share $($s.Name)."
                 } else {
-                    Write-Host ("Warning: offline caching is {0} for share {1}. Turn it off: Set-SmbShare -Name {1} -CachingMode None" -f
-                                $s.CachingMode, $s.Name) -ForegroundColor Yellow
+                    $text = 'offline caching is {0} for share {1}.' -f $s.CachingMode, $s.Name
+                    Write-Warn "$text Turn it off: Set-SmbShare -Name $($s.Name) -CachingMode None"
                 }
             }
         } catch {
-            Write-Host ("Warning: couldn't check offline caching ({0}). Check it: {1}" -f $_.Exception.Message, $check) -ForegroundColor Yellow
+            Write-Warn ("couldn't check offline caching ({0}). {1}" -f $_.Exception.Message, $check)
         }
     }
     Write-Host "v2 must stay on this one server: don't replicate it with DFS-R."
@@ -571,13 +577,14 @@ function Show-Summary([object[]]$Folders) {
         foreach ($folder in $Folders) {
             if (-not (Test-Path -LiteralPath $folder.Path -PathType Container)) { continue }
             try {
-                $lines = @(& icacls.exe $folder.Path 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() -ne '' })
+                $lines = @(& icacls.exe $folder.Path 2>&1 | ForEach-Object { [string]$_ } |
+                           Where-Object { $_.Trim() -ne '' })
                 if ($LASTEXITCODE -eq 0 -and $lines.Count -gt 1) {
                     $lines = $lines[0..($lines.Count - 2)]      # without "Successfully processed 1 files"
                 }
                 foreach ($line in $lines) { Write-Host $line }
             } catch {
-                Write-Host "Warning: icacls failed on $($folder.Shown): $($_.Exception.Message)" -ForegroundColor Yellow
+                Write-Warn "icacls failed on $($folder.Shown): $($_.Exception.Message)"
             }
         }
     }
@@ -585,7 +592,8 @@ function Show-Summary([object[]]$Folders) {
     if ($WhatIfPreference) {
         Write-Host 'Nothing was changed (-WhatIf). Run it again without -WhatIf to make these changes.'
     } else {
-        Write-Host 'Done. Put Stripes.exe on the share. Then an administrator opens MapleJet > Admin > Company to set the time server, countries and inks.'
+        Write-Host ('Done. Put Stripes.exe on the share. Then an administrator opens MapleJet > Admin > Company ' +
+                    'to set the time server, countries and inks.')
     }
 }
 
@@ -624,7 +632,8 @@ function Invoke-FolderSetup {
     $v2config = Join-Path $v2 'config'
     foreach ($name in 'printers.json', 'stock.json') {
         $script:SetupItem = $name
-        Copy-ZebraFile -Source (Join-Path $config $name) -Target (Join-Path $v2config $name) -Shown "v2\config\$name"
+        $source = Join-Path $config $name
+        Copy-ZebraFile -Source $source -Target (Join-Path $v2config $name) -Shown "v2\config\$name"
     }
 
     # 5. The first company settings and the change counter
@@ -641,9 +650,11 @@ function Invoke-FolderSetup {
         SenderSid   = $sids['Senders']
     }
     $script:SetupItem = 'company.json'
-    Write-SeedFile -Path (Join-Path $hx 'company.json') -Shown 'v2\config\hx\company.json' -Text (Get-CompanyJson @company)
+    $text = Get-CompanyJson @company
+    Write-SeedFile -Path (Join-Path $hx 'company.json') -Shown 'v2\config\hx\company.json' -Text $text
     $script:SetupItem = 'changes.json'
-    Write-SeedFile -Path (Join-Path $hx 'changes.json') -Shown 'v2\config\hx\changes.json' -Text (Get-ChangesJson $account $now)
+    $text = Get-ChangesJson $account $now
+    Write-SeedFile -Path (Join-Path $hx 'changes.json') -Shown 'v2\config\hx\changes.json' -Text $text
 
     # 6. The rights, top-down, v2 first. Last, so the files above inherit them too
     $script:SetupStep = 'setting the rights'
@@ -678,8 +689,9 @@ function Write-SetupError($ErrorRecord) {
 
 $script:SetupStep = 'starting'
 $script:SetupItem = ''
+$setup = @{ ConfigPath = $ConfigPath; AdminGroup = $AdminGroup; SenderGroup = $SenderGroup; UsersGroup = $UsersGroup }
 try {
-    Invoke-FolderSetup -ConfigPath $ConfigPath -AdminGroup $AdminGroup -SenderGroup $SenderGroup -UsersGroup $UsersGroup
+    Invoke-FolderSetup @setup
 } catch {
     Write-SetupError $_
     exit 1

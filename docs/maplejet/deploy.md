@@ -729,13 +729,16 @@ that matter; the implementer may reflow lines):
 
 1. File: `tools/New-StripesV2Folders.ps1`, committed to the repository after development, with
    `test_folder_script.py` (§8.8). It isn't attached to releases; IT takes it from the release
-   tag's source, so the script and the exe always match.
+   tag's source, so the script and the exe always match. **Delivered 31 Oct 2026.** This section
+   now describes the script as built; §8.9 lists where it differs from the first version of this
+   spec, and why.
 2. Windows PowerShell 5.1 and PowerShell 7 or later. No modules beyond what Windows has; the
    `SmbShare` module is used only for the optional check in §8.3 step 9.
 3. Comment-based help (`.SYNOPSIS`, `.DESCRIPTION`, one `.PARAMETER` per parameter, two
    `.EXAMPLE`s: with `-WhatIf` and without), so `Get-Help .\New-StripesV2Folders.ps1 -Full` explains
    it.
 4. It is unsigned. OPEN: sign it if the file server's execution policy is `AllSigned` (§11).
+5. ASCII only: Windows PowerShell 5.1 reads a file without a BOM in the ANSI code page.
 
 ### 8.2 Parameters
 
@@ -751,42 +754,61 @@ that matter; the implementer may reflow lines):
 
 ### 8.3 Procedure
 
-`$ErrorActionPreference = 'Stop'`. Every step prints one line per item (`Created`, `Exists`,
-`Rights set`, `Rights unchanged`, `Removed entry`, `Copied`, `Kept`, `Wrote`, `Warning`).
+`Set-StrictMode -Version 2.0` and `$ErrorActionPreference = 'Stop'`. Every step prints one line
+per item (`Created`, `Exists`, `Copied`, `Kept`, `Wrote`, `Rights set`, `Rights unchanged`,
+`Removed entry`, `Warning`), naming folders and files from `v2` down (`v2\config\hx`).
 
-1. `ConfigPath` (trailing `\` removed) must be an existing folder (`Test-Path -LiteralPath
-   -PathType Container`). `$Stripes = Split-Path -Parent $ConfigPath`; `$V2 = Join-Path $Stripes
-   'v2'`. Print both. If `$ConfigPath` is on a mapped drive (`[System.IO.DriveInfo]` of its root
-   has `DriveType` `Network`), stop: "Use the UNC path, as in the ConfigPath policy value".
+1. `ConfigPath` must be an existing folder (`Test-Path -LiteralPath -PathType Container`). Its
+   full path is `(Resolve-Path -LiteralPath).ProviderPath` without a trailing `\`.
+   `$Stripes = [System.IO.Path]::GetDirectoryName($ConfigPath)` and `$V2 = Join-Path $Stripes 'v2'`,
+   exactly as `hx_share.v2_share_root` finds it. Print both. If `$ConfigPath` is on a mapped drive
+   (`[System.IO.DriveInfo]` of its root has `DriveType` `Network`), stop: "Use the UNC path, as in
+   the ConfigPath policy value". A `ConfigPath` at the root of a drive or share (no parent) stops
+   too.
 2. Resolve every SID before changing anything: the three groups with
    `([System.Security.Principal.NTAccount]$name).Translate([System.Security.Principal.SecurityIdentifier])`;
    `SYSTEM` = `S-1-5-18`, `BUILTIN\Administrators` = `S-1-5-32-544`, OWNER RIGHTS = `S-1-3-4`
-   (well-known SIDs, so they work in any language). A group that doesn't resolve stops the script
-   with "Group '<name>' wasn't found. Create it, or pass its name with -<Parameter>." and nothing has
-   changed. Print each name with its SID.
-3. Create each folder of §8.4 that is missing, top-down (`New-Item -ItemType Directory`, inside
-   `ShouldProcess`). Never delete or rename anything.
-4. Set the rights of §8.4 on each folder, top-down, `v2` first (§8.5). Each folder gets exactly its
+   (well-known SIDs, so they work in any language). A group that doesn't resolve
+   (`IdentityNotMappedException`) stops the script with "Group '<name>' wasn't found. Create it, or
+   pass its name with -<Parameter>." and "Nothing was changed.". Print each name with its SID.
+3. Create each folder of §8.4 that is missing, top-down
+   (`[System.IO.Directory]::CreateDirectory`, inside `ShouldProcess`). Never delete or rename
+   anything.
+4. The one-time Zebra copy: for `printers.json` and `stock.json`, if `$ConfigPath\<file>` exists and
+   `$V2\config\<file>` doesn't, `[System.IO.File]::Copy($source, $target, $false)` it (never
+   overwrites; it gets `v2\config`'s rights in step 7). An existing copy is kept (`Kept`). A
+   missing source prints a warning only.
+5. If `$V2\config\hx\company.json` is missing, write it (§8.6).
+6. If `$V2\config\hx\changes.json` is missing, write it (§8.6).
+7. Set the rights of §8.4 on each folder, top-down, `v2` first (§8.5). Each folder gets exactly its
    explicit entries: explicit entries that aren't in its set are removed and printed (`Removed entry:
-   <account> <rights> on <folder>`), so a re-run puts the rights back. Inherited entries are left to
-   Windows. Only folders whose rights differ are written (compare
-   `GetSecurityDescriptorSddlForm('Access')` before and after building the new ACL).
-5. The one-time Zebra copy: for `printers.json` and `stock.json`, if `$ConfigPath\<file>` exists and
-   `$V2\config\<file>` doesn't, `Copy-Item -LiteralPath` it (a new file inherits `v2\config`'s
-   rights). An existing copy is kept (`Kept`). A missing source prints a warning only.
-6. If `$V2\config\hx\company.json` is missing, write it (§8.6).
-7. If `$V2\config\hx\changes.json` is missing, write it (§8.6).
+   <account> <rights> (<inheritance>; <propagation>) on <folder>`), so a re-run puts the rights
+   back. Inherited entries are left to Windows. Only folders whose rights differ are written. The
+   rights come last so that a first run also works for an account whose Full Control comes only
+   from the Stripes folder: once `v2` stops inheriting, that account can still change the rights,
+   as the owner of what it created, but it could no longer write the files.
 8. Never touch today's `config\` or `status\` folders apart from reading the two Zebra files.
 9. Checks that only warn: if this computer is the file server (the UNC server name is
-   `$env:COMPUTERNAME` or starts with it and a dot, or the path is local), find the share holding `$V2` with `Get-SmbShare` and
-   warn unless `CachingMode` is `None`; otherwise print "Check on the file server that offline
-   caching is off: Get-SmbShare <share> | Select CachingMode". Always print "v2 must stay on this one
-   server: don't replicate it with DFS-R."
-10. Summary: `icacls "<folder>"` for each folder of §8.4, then the next steps: "Put Stripes.exe on
-    the share. Then an administrator opens MapleJet > Admin > Company to set the time server,
-    countries and inks."
-11. Exit code 0 when done (also with `-WhatIf`). Any error: print the step, the item and the error,
-    and exit 1. Steps already done stay done; running again finishes the job.
+   `$env:COMPUTERNAME`, starts with it and a dot, or is `localhost`, or the path is local), find
+   the share holding `$V2` with `Get-SmbShare` (by name for a UNC path; for a local path, the shares
+   whose path holds it, hidden `$` shares left out) and warn unless `CachingMode` is `None`;
+   otherwise, or if `Get-SmbShare` is missing or fails, print "Check on the file server that
+   offline caching is off: Get-SmbShare <share> | Select CachingMode". Always print "v2 must stay
+   on this one server: don't replicate it with DFS-R."
+10. Summary: `icacls "<folder>"` for each folder of §8.4 that exists (without icacls' closing
+    "Successfully processed" line; a failing icacls only warns), then the next steps: "Done. Put
+    Stripes.exe on the share. Then an administrator opens MapleJet > Admin > Company to set the
+    time server, countries and inks." Under `-WhatIf` the last line is "Nothing was changed
+    (-WhatIf). Run it again without -WhatIf to make these changes."
+11. Exit code 0 when done (also with `-WhatIf`). Any error: print the step, the item and the error
+    ("Failed while <step> (<item>): <error>"), and exit 1. Steps already done stay done; running
+    again finishes the job.
+12. Under `-WhatIf` nothing at all changes, not even `v2`: each change prints its "What if:" line
+    instead (a missing folder's "Set rights" too).
+13. Who runs it: an account with Full Control on `\\SERVER\Share\Stripes`. `v2` doesn't inherit that
+    Full Control, so a later run needs a member of the file server's `Administrators` group (a
+    domain admin, over SMB), or the account that ran it first (the owner of the folders). On the
+    file server itself, it runs elevated.
 
 ### 8.4 Folders and their explicit entries
 
@@ -816,22 +838,26 @@ when `-UsersGroup` is narrower than Domain Users. There is no CREATOR OWNER entr
 
 ### 8.5 Setting the rights
 
-1. For each folder: `$item = Get-Item -LiteralPath $path`; `$acl =
-   $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)` (the
-   Access section only, so owner and audit settings are never touched, which also works over SMB).
-   Keep `$before = $acl.GetSecurityDescriptorSddlForm('Access')` and the list of its explicit
-   (non-inherited) rules.
-2. `v2`: `$acl.SetAccessRuleProtection($true, $false)`. Every other folder:
-   `$acl.SetAccessRuleProtection($false, $true)` (inheritance on, even if someone turned it off).
-3. Remove **every** explicit rule (`RemoveAccessRuleSpecific` for each), then add the folder's set
-   with `New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $rights, $inheritance,
-   $propagation, 'Allow')`, always with `SecurityIdentifier` objects, never names. .NET merges rules
-   for the same SID, so two parameters naming the same group still give one canonical result.
-4. If `GetSecurityDescriptorSddlForm('Access')` now differs from `$before`,
-   `$item.SetAccessControl($acl)` inside `ShouldProcess` and print `Rights set`; otherwise `Rights
-   unchanged`. Each explicit rule of the old list whose SID, rights, inheritance and propagation
-   aren't in the new list is printed as `Removed entry`. Windows passes inheritable entries down to
-   existing files and folders.
+1. For each folder: `$current = New-Object System.Security.AccessControl.DirectorySecurity($path,
+   'Access')` (the Access section only, so owner and audit settings are never read or touched,
+   which also works over SMB). The same constructor exists in Windows PowerShell 5.1 and 7.
+2. Build the folder's wanted rights in a new, empty `DirectorySecurity`: `v2`:
+   `SetAccessRuleProtection($true, $false)`; every other folder: `SetAccessRuleProtection($false,
+   $true)` (inheritance on, even if someone turned it off). Then `AddAccessRule` each entry of
+   §8.4 as `New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $rights,
+   $inheritance, $propagation, 'Allow')`, always with `SecurityIdentifier` objects, never names.
+   .NET merges rules for the same SID, so two parameters naming the same group still give one
+   canonical result. (A new object, not the one read: .NET refuses to change an ACL that isn't in
+   canonical order, and someone's hand edit can leave one like that.)
+3. Compare the current and the wanted rights: the protection flag, and the explicit
+   (non-inherited) rules as SID, access mask, inheritance, propagation and type
+   (`GetAccessRules($true, $false, [SecurityIdentifier])`), as sorted lists. Inherited entries
+   aren't compared: Windows makes them from the parent. Equal: print `Rights unchanged`.
+4. Different: inside `ShouldProcess`, write the wanted rights (Windows PowerShell 5.1:
+   `DirectoryInfo.SetAccessControl`; PowerShell 7: `[System.IO.FileSystemAclExtensions]::SetAccessControl`),
+   which writes only the Access section, and print `Rights set`, then `Removed entry` for each
+   explicit rule of the current rights that isn't in the wanted ones. Windows passes inheritable
+   entries down to existing files and folders.
 
 The `icacls` notation maps to .NET like this:
 
@@ -849,9 +875,13 @@ The `icacls` notation maps to .NET like this:
 
 Each is written only if missing, with `[System.IO.File]::Open($path, 'CreateNew', 'Write')` (so an
 administrator's save that lands at the same moment is never overwritten), as UTF-8 without a BOM
-(`New-Object System.Text.UTF8Encoding($false)`), from a text template, not `ConvertTo-Json`. Each
-string value is escaped with `ConvertTo-Json -InputObject $value -Compress`. Each time is
-`[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0`, written with
+(`New-Object System.Text.UTF8Encoding($false)`), from a text template, not `ConvertTo-Json`, with
+`\n` line ends and a `\n` at the end. The template has one `@NAME@` placeholder per line for each
+value the script fills in. Each string value is escaped with `ConvertTo-Json -InputObject $value
+-Compress` (Windows PowerShell 5.1 escapes more characters, `<`, `>`, `&` and `'` as `\u....`,
+than PowerShell 7; both are valid JSON). Both files get one time, the milliseconds since
+1970-01-01 UTC (`[DateTime]::UtcNow` minus that date, since `DateTimeOffset.ToUnixTimeMilliseconds`
+needs .NET 4.6) divided by 1000.0, written with
 `.ToString("0.0##", [Globalization.CultureInfo]::InvariantCulture)`, so it always has a decimal
 point and reads as a float. `<account>` is `[System.Security.Principal.WindowsIdentity]::GetCurrent().Name`
 (`EXAMPLE\itadmin` style, like `Identity.user`).
@@ -882,7 +912,8 @@ point and reads as a float. `<account>` is `[System.Security.Principal.WindowsId
 }
 ```
 
-`v2\config\hx\changes.json` (storage §4.2):
+`v2\config\hx\changes.json` (storage §4.2; the keys `DataService` writes on every save, in its
+order):
 
 ```
 {
@@ -895,8 +926,11 @@ point and reads as a float. `<account>` is `[System.Security.Principal.WindowsId
 }
 ```
 
-If `hx_model`'s `Company` defaults or `FORMAT` change, the template changes with them; the test in
-§8.8 catches a mismatch.
+If `hx_model`'s `Company` fields, their defaults or `FORMAT` change, or the keys `DataService`
+writes into `changes.json`, the template changes with them; the tests in §8.8 catch a mismatch.
+Checked against the code on 31 Oct 2026: `Company` has exactly these fields in this order (no
+field was added during the build), `FORMAT` is 1, and `hx_share.decode_json` and
+`hx_model.from_json` read both files (`from_json` needs `id`; every other field has a default).
 
 ### 8.7 What it never does
 
@@ -922,6 +956,55 @@ with a 120 s timeout.
 | `test_whatif_changes_nothing` | on a fresh temp tree, `-WhatIf` exits 0 and creates no `v2` |
 | `test_missing_group_stops` | `-AdminGroup "No Such Group 1109"` exits 1, names the group and creates no `v2` |
 | `test_existing_files_kept` | an existing `v2\config\printers.json` and `company.json` are left byte-identical |
+
+Delivered with more tests than the table above, in three classes:
+
+| Class | Runs | What it checks |
+|---|---|---|
+| `ScriptTextTests` | every platform (Linux too), from the script's text | the folder table is exactly `hx_share._SHARE_FOLDERS` plus `v2`, top-down, and every share folder the app code names (record folders, `LOG_KINDS`, `status\deployment`) is in it; each folder's entries match the rights tables of the root README and storage.md §14.1; the `company.json` template has `hx_model.Company`'s fields in order with their defaults, and reads back through `decode_json` and `from_json`; the group defaults are `Company`'s; the `changes.json` template has the keys `DataService` writes; the only SIDs are `S-1-5-18`, `S-1-5-32-544` and `S-1-3-4`, and every name is an example one; the script is ASCII, has its help, and uses nothing only PowerShell 6 or 7 has (`??`, `?.`, ternary, `&&`, `\|\|`, `-Parallel`, `-AsHashtable`, `Join-Path` with more than one child, ...) and no command that deletes, renames or changes the share or the registry |
+| `PowerShellTests`, `StubbedRunTests` | where `powershell` or `pwsh` is found (CI: both), skipped elsewhere | the PowerShell parser finds no error and no PowerShell 7 operator; the script's own functions, loaded without running it, give each folder its entries, map the icacls notation to the right .NET values and access masks, write times with a decimal point in any culture, and write both seed files (non-ASCII, quotes and a tab escaped; UTF-8 without a BOM; never overwritten); a copy of the script with stand-ins for the groups, the account and the rights runs `-WhatIf` (nothing created), a first run and a re-run, a missing group and a missing ConfigPath |
+| `WindowsTests` | Windows only | the table above, run for real with `powershell`, plus `test_powershell_7_gives_the_same_rights` (with `pwsh`: a re-run with either finds nothing to change) |
+
+### 8.9 As built: checks against the code, and changes to this spec
+
+Checked against the code before writing the script (31 Oct 2026), with no change needed:
+
+1. **Folders**: the 23 folders of §8.4 are `v2` plus `hx_share._SHARE_FOLDERS`; every folder the code
+   reads or writes on the share is one of them or below one (Stripes makes only
+   `templates\films\<film_id>\` and the log month folders). The script lists its folders in one
+   table that the tests compare with `_SHARE_FOLDERS`.
+2. **Rights**: §8.4 gives exactly the rights of the README table and storage.md §14.1; the code
+   writes nothing that needs more (senders write `hx-sends`, administrators `hx-admin` including
+   test prints, everyone `hx-events`; status files as storage.md §14.1 says).
+3. **Seed files**: `hx_model.Company` has the fields of §8.6 in that order, with those defaults
+   (nothing was added during the build); `FORMAT` is 1; `changes.json` has the keys
+   `DataService._bump_changes` writes, in its order. `changes.json` has no `hx_model` class:
+   `DataService` reads only `counter`.
+4. **Finding v2**: `hx_share.v2_share_root` is `os.path.join(os.path.dirname(os.path.normpath(ConfigPath)), "v2")`
+   (unless `STRIPES_V2` is set), the script's `GetDirectoryName` plus `v2`.
+
+Changed from the first version of this spec, for the reasons given:
+
+1. **The rights come last** (§8.3 step 7; they were step 4, before the copy and the seed files), so
+   that an account whose Full Control comes only from the Stripes folder can finish a first run:
+   once `v2` is protected it can't write files there any more, only change rights as their owner.
+2. **The rights are built in a new `DirectorySecurity` and compared as protection plus explicit
+   entries** (§8.5), not changed in place and compared as SDDL: .NET refuses to change a
+   non-canonical ACL, and inherited entries aren't the script's to compare.
+3. **PowerShell 7's `DirectoryInfo` has no `GetAccessControl` or `SetAccessControl`**: the script
+   reads with the `DirectorySecurity(path, sections)` constructor and writes through
+   `[System.IO.FileSystemAclExtensions]` when the method is missing.
+4. **`[System.IO.Directory]::CreateDirectory` and `[System.IO.File]::Copy(..., $false)`** instead
+   of `New-Item` and `Copy-Item`: literal paths, and a copy never replaces a file that appeared
+   in the meantime.
+5. **Times without `DateTimeOffset.ToUnixTimeMilliseconds`** (.NET 4.6), so Windows PowerShell 5.1
+   on .NET 4.5.2 runs it.
+6. **Output**: it prints the Stripes and `v2` folders, names everything from `v2` down, and ends
+   differently under `-WhatIf`; errors say "Failed while <step> (<item>): <error>".
+7. **Who runs it again** (§8.3 item 13): a member of the file server's Administrators group, or
+   the account that ran it first. README follow-up (§7 owns its text): the "Folders on the share"
+   paragraph could add "Run it again later as a member of the file server's Administrators group
+   (a domain admin), or as the same account: `v2` doesn't inherit the Stripes folder's rights."
 
 ## 9. Test-PC instructions (spec; delivered after development)
 
