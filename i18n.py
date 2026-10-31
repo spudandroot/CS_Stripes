@@ -4,6 +4,7 @@ Code is written in English; tr("...") shows it in the chosen language. Text with
 blanks to fill in uses {names}: tr("Sent {n} labels to {name}.", n=3, name=p.name).
 N_("...") marks text that is kept in English inside the app (printer problems, for
 example, are also used as keys) and passed through tr() where it's shown.
+Each MapleJet (hx_) module keeps its own ES dict and adds it with add_spanish().
 test_i18n.py checks that every tr() and N_() text has a Spanish version.
 """
 
@@ -43,11 +44,14 @@ def retranslate(shown):
 ES = {
     # Main window
     "Zebra label printing": "Impresión de etiquetas Zebra",
+    "Zebra labels and MapleJet bag printing": "Etiquetas Zebra e impresión de bolsas MapleJet",
     "Version {version}": "Versión {version}",
+    "Version {version} (development key)": "Versión {version} (clave de desarrollo)",
     "Printer:": "Impresora:",
     "Check printer": "Revisar impresora",
     "Manage printers...": "Administrar impresoras...",
     "Printer monitor": "Monitor de impresoras",
+    "MapleJet monitor": "Monitor MapleJet",
     "Label stock:": "Tipo de etiqueta:",
     "Simple": "Sencillo",
     "Advanced": "Avanzado",
@@ -491,3 +495,12 @@ ES = {
 }
 
 _ENGLISH = {spanish: english for english, spanish in ES.items()}
+
+
+def add_spanish(entries):
+    """Add a module's own Spanish texts (each MapleJet module keeps its own ES dict)."""
+    for english, spanish in entries.items():
+        if ES.get(english, spanish) != spanish or _ENGLISH.get(spanish, english) != english:
+            raise ValueError(f"conflicting Spanish for {english!r}")
+        ES[english] = spanish
+        _ENGLISH[spanish] = english

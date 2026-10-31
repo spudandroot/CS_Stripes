@@ -1,0 +1,8 @@
+POST / HTTP/1.1
+Host: 192.0.2.10
+Connection: close
+Accept-Encoding: gzip
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 58
+
+Type=LOG&pass=c8837b23ff8aaa8a2dde915473ce0991&remember=on

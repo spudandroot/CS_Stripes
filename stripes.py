@@ -3,6 +3,9 @@
 Sends raw ZPL to Zebra printers, either through a printer installed in
 Windows (via the print spooler) or straight to an IP address on port 9100.
 Needs pywin32 for Windows printers; everything else is standard library.
+
+The window has two tabs: Zebra (all of the above) and MapleJet, which sends and
+checks what MapleJet Hx printers print on bags (hx_ui and the other hx_ modules).
 """
 
 import copy
@@ -22,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import queue
 import urllib.request
 from dataclasses import dataclass, asdict, field, fields, replace
@@ -35,12 +39,19 @@ import label_design as ld
 import zpl_view as zv
 import i18n
 from i18n import tr, N_
+import hx_share  # the v2 folders (paths only)
+import hx_ui     # the MapleJet tab and its services
 
 APP_NAME = "Stripes"
 try:
     from stripes_version import VERSION  # written by the release build
 except ImportError:
     VERSION = "dev"
+try:
+    import hx_key  # noqa: F401  written by release builds: the printer-password key
+    HX_KEYED = True
+except ImportError:
+    HX_KEYED = False
 
 # Dots per millimetre for each print resolution (what ZPL and Labelary use).
 DPI_TO_DPMM = {203: 8, 300: 12, 600: 24}
@@ -129,11 +140,25 @@ class CompanyConfig:
 
 
 def settings_path():
+    """Each user's Zebra settings, in the v2 folder of their profile (today's format)."""
     override = os.environ.get("STRIPES_SETTINGS")
     if override:
         return override
+    return os.path.join(hx_share.roaming_dir(), "settings.json")
+
+
+def old_settings_path():
+    """Where versions before the MapleJet one keep the settings. Only ever read."""
     base = os.environ.get("APPDATA") or os.path.expanduser("~/.config")
     return os.path.join(base, "Stripes", "settings.json")
+
+
+def copy_old_settings():
+    """The first start of this version takes the user's printers, recent labels and language
+    from the older version's settings. Never overwrites; nothing when STRIPES_SETTINGS is set."""
+    if os.environ.get("STRIPES_SETTINGS"):
+        return False
+    return hx_share.copy_once(old_settings_path(), settings_path())
 
 
 def load_settings():
@@ -191,11 +216,55 @@ def local_folders():
 
 
 def cache_folder():
+    """This PC's copy of the company config (the single-instance note sits next to it)."""
     override = os.environ.get("STRIPES_CACHE")
     if override:
         return override
+    return os.path.join(hx_share.local_dir(), "config-cache")
+
+
+def old_cache_folder():
+    """Where versions before the MapleJet one keep the copy of the company config. Only ever read."""
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.cache")
     return os.path.join(base, "Stripes", "config-cache")
+
+
+def copy_old_cache():
+    """The first start of this version takes the older version's saved copy of the company config,
+    so its printers (and the one used last) are there before the server has been read. Only while
+    this version has no saved copy of its own; never overwrites; nothing when STRIPES_CACHE is set."""
+    if os.environ.get("STRIPES_CACHE"):
+        return False
+    old, new = old_cache_folder(), cache_folder()
+    if os.path.lexists(os.path.join(new, "printers.json")) or not os.path.isfile(os.path.join(old, "printers.json")):
+        return False
+    copied = False
+    for name in ("stock.json", "printers.json"):  # printers.json last: it is what makes a saved copy
+        src, dst = os.path.join(old, name), os.path.join(new, name)
+        try:
+            stamp = os.stat(src)
+        except OSError:
+            continue
+        if hx_share.copy_once(src, dst):
+            copied = True
+            try:  # load_cached_config shows the file's time as "saved {when}"
+                os.utime(dst, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            except OSError:
+                pass
+    return copied
+
+
+def zebra_config_folder():
+    r"""Where printers.json and stock.json are read from: v2\config once the folder script has
+    copied them there, else the configured folder (read-only). Looks at the share, so it's
+    only used off the UI thread (load_company_config)."""
+    folder = configured_folder()
+    v2 = hx_share.v2_share_root(folder)
+    if v2:
+        copied = os.path.join(v2, "config")
+        if os.path.isfile(os.path.join(copied, "printers.json")):
+            return copied
+    return folder
 
 
 def _read_json(path):
@@ -289,11 +358,12 @@ def load_cached_config(folder):
 
 
 def load_company_config():
-    """Read the company config: from the server if one is configured, else a local folder.
+    r"""Read the company config: from the server if one is configured (v2\config, or the
+    configured folder until the folder script has copied the files), else a local folder.
 
     Can be slow when the server is unreachable, so the app calls this off the UI thread.
     """
-    folder = configured_folder()
+    folder = zebra_config_folder()
     if folder:
         try:
             printers, stock, problems = parse_config(folder)
@@ -809,11 +879,18 @@ def wininet_post(host, path, data, headers, port=443, secure=True, timeout_ms=15
 # --------------------------------------------------------------------------
 
 def status_folder():
-    """Where each copy of Stripes reports in: a "status" folder next to the config
-    folder. It's only used if IT has created it."""
+    r"""Where each copy of Stripes reports in: v2\status\deployment, next to the config
+    folder. It's only used if IT has created it (the folder script does)."""
     override = os.environ.get("STRIPES_STATUS")
     if override:
         return override
+    v2 = hx_share.v2_share_root(configured_folder())
+    return os.path.join(v2, "status", "deployment") if v2 else None
+
+
+def old_status_folder():
+    """Where versions before the MapleJet one report in: a "status" folder next to the config
+    folder. The Deployment status window reads it too (never writes it) while they're about."""
     config = configured_folder()
     return os.path.join(os.path.dirname(os.path.normpath(config)), "status") if config else None
 
@@ -840,29 +917,74 @@ class DeploymentLog:
 
     MAX_EVENTS = 50
     OBSOLETE = ("pending_update", "last_update_error", "beta")  # left by builds that updated themselves
+    CARRIED = ("version", "first_seen", "last_update", "events")  # from the older versions' record
 
-    def __init__(self, folder, computer=None, user=None):
+    def __init__(self, folder, computer=None, user=None, old_folder=None):
         self.folder = folder
         self.computer = computer or os.environ.get("COMPUTERNAME") or socket.gethostname()
         self.user = user or os.environ.get("USERNAME") or getpass.getuser()
         self.path = os.path.join(folder, f"{_safe_name(self.computer)}_{_safe_name(self.user)}.json")
+        # The older versions' record of this PC and user (same file name in their folder): read on
+        # this version's first start so the upgrade isn't shown as a fresh install. Never written.
+        self.old_path = None
+        if old_folder and os.path.normcase(os.path.abspath(old_folder)) != os.path.normcase(os.path.abspath(folder)):
+            self.old_path = os.path.join(old_folder, os.path.basename(self.path))
         self._lock = threading.Lock()
 
-    def read(self):
+    def read(self, path=None):
         try:
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+            return self._load(path or self.path) or {}
+        except OSError:
             return {}
 
+    @staticmethod
+    def _load(path):
+        """The record in path: {} when there's no such file, None when it's damaged. Raises
+        OSError when it can't be read (the share went away for a moment)."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
     def write(self, event=None, **fields):
-        """Merge fields into this PC/user's record (and log an event).
-        Returns False when the status folder isn't there or can't be reached."""
+        """Merge fields into this PC/user's record (and log an event). Returns False when the
+        status folder isn't there or the record can't be read."""
+        return self._update(lambda record: (event, fields))
+
+    def started(self, version, exe):
+        """Note a start: "Installed", "Updated" or (a plain restart) no event. Worked out from the
+        record read under the lock, so a heartbeat or config write can't come in between."""
+        def change(record):
+            fields = dict(version=version, exe=exe, last_start=_now(), running=True,
+                          windows=platform.platform())
+            previous = record.get("version")
+            if previous is None:
+                event = f"Installed ({version})"
+            elif previous != version:
+                event = f"Updated {previous} -> {version}"
+                fields["last_update"] = {"from": previous, "to": version, "at": _now()}
+            else:
+                event = None
+            return event, fields
+        return self._update(change, carry=True)
+
+    def _update(self, change, carry=False):
         with self._lock:
             if not os.path.isdir(self.folder):
                 return False
-            record = self.read()
+            try:
+                record = self._load(self.path)
+            except OSError:
+                return False            # writing a record we couldn't read would lose its history
+            if record is None:
+                record = {}             # damaged: start again, without the old versions' record
+            elif carry and "version" not in record:
+                record = self._carried(record)  # this version's first start (architecture §10.5)
+            event, fields = change(record)
             for key in self.OBSOLETE:
                 record.pop(key, None)
             now = _now()
@@ -877,18 +999,18 @@ class DeploymentLog:
             os.replace(tmp, self.path)
             return True
 
-    def started(self, version, exe):
-        previous = self.read().get("version")
-        fields = dict(version=version, exe=exe, last_start=_now(), running=True,
-                      windows=platform.platform())
-        if previous is None:
-            event = f"Installed ({version})"
-        elif previous != version:
-            event = f"Updated {previous} -> {version}"
-            fields["last_update"] = {"from": previous, "to": version, "at": _now()}
-        else:
-            event = None
-        return self.write(event, **fields)
+    def _carried(self, record):
+        """record (none yet, or one the heartbeat or config write made before any start) with the
+        older versions' version, install date, last update and events, so the upgrade is logged as
+        one. Without an old record (none, damaged or unreadable) it stays as it is."""
+        try:
+            old = (self._load(self.old_path) or {}) if self.old_path else {}
+        except OSError:
+            old = {}
+        merged = dict(record, **{key: old[key] for key in self.CARRIED if key in old and key != "events"})
+        if isinstance(old.get("events"), list):
+            merged["events"] = old["events"] + (record["events"] if isinstance(record.get("events"), list) else [])
+        return merged
 
 
 
@@ -904,6 +1026,18 @@ def read_deployment(folder):
         if isinstance(data, dict) and data.get("computer"):
             records.append(data)
     return sorted(records, key=lambda r: r.get("last_seen", ""), reverse=True)
+
+
+def read_all_deployment(folders):
+    """The records of several status folders, newest first, keeping only the newest one for
+    each computer and user (a PC moving to the new version shows once)."""
+    newest = {}
+    for folder in folders:
+        for r in read_deployment(folder):
+            key = (str(r.get("computer", "")).casefold(), str(r.get("user", "")).casefold())
+            if key not in newest or str(r.get("last_seen") or "") > str(newest[key].get("last_seen") or ""):
+                newest[key] = r
+    return sorted(newest.values(), key=lambda r: str(r.get("last_seen") or ""), reverse=True)
 
 
 def is_open_now(record, now=None):
@@ -936,6 +1070,20 @@ def parse_version(text):
     """'v1.2.3' -> (1, 2, 3); None for anything else (e.g. development builds)."""
     m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", (text or "").strip())
     return tuple(int(n) for n in m.groups()) if m else None
+
+
+def check_release_key(version, keyed):
+    """A release (v1.2.3) must carry the printer-password key: with the public development key
+    it couldn't read the printer passwords saved by the other PCs."""
+    if parse_version(version) and not keyed:
+        raise RuntimeError("this release has no printer-password key (set the STRIPES_HX_KEY secret)")
+
+
+def version_text():
+    """The version in the header. A build without the release key says so."""
+    if HX_KEYED:
+        return tr("Version {version}", version=VERSION)
+    return tr("Version {version} (development key)", version=VERSION)
 
 
 def remove_old_versions(exe_path):
@@ -974,13 +1122,20 @@ class Background:
         threading.Thread(target=target, daemon=True).start()
 
     def _poll(self):
+        # The Zebra side, every MapleJet window and the tray all hand results back through here,
+        # so a bug in one done() is printed and the rest still get theirs.
         try:
             while True:
-                done, result, error = self.results.get_nowait()
-                done(result, error)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll)
+                try:
+                    done, result, error = self.results.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    done(result, error)
+                except Exception:
+                    traceback.print_exc()
+        finally:
+            self.root.after(100, self._poll)
 
 
 TRAY_FLAG = "--tray"  # start hidden in the tray (the logon shortcut uses this)
@@ -1051,6 +1206,7 @@ class Tray:
             # Labels are functions so the menu follows the English/Español switch
             pystray.MenuItem(lambda item: tr("Open Stripes"), lambda icon, item: app.call(app.show), default=True),
             pystray.MenuItem(lambda item: tr("Printer monitor"), lambda icon, item: app.call(app.show_monitor)),
+            pystray.MenuItem(lambda item: tr("MapleJet monitor"), lambda icon, item: app.call(app.show_hx_monitor)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda item: tr("Quit Stripes"), lambda icon, item: app.call(app.quit_app)))
         self.icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
@@ -1122,6 +1278,19 @@ def text_image(text, height, font_file):
     return img
 
 
+def _on_hx_path(anchor, path):
+    """Whether a widget Tk names only by its path is inside a MapleJet window (or its question)."""
+    parts = str(path).split(".")[1:]
+    for n in range(1, len(parts) + 1):
+        try:
+            widget = anchor.nametowidget("." + ".".join(parts[:n]))
+        except (KeyError, tk.TclError):
+            return False  # Tk's own part of the path: nothing of ours further down
+        if getattr(widget, "hx_window", False):
+            return True
+    return False
+
+
 class App(tk.Tk):
     def __init__(self, start_hidden=False):
         super().__init__()
@@ -1133,6 +1302,8 @@ class App(tk.Tk):
             self.iconbitmap(default=resource_path(os.path.join("assets", "icon.ico")))
         except tk.TclError:
             pass  # .ico window icons only work on Windows
+        copy_old_settings()  # the first start of this version brings the user's settings along
+        copy_old_cache()     # and the saved copy of the company config
         self.settings = load_settings()
         i18n.set_language(self.settings["language"])
         # Show the saved copy of the server's settings straight away; the server
@@ -1144,6 +1315,10 @@ class App(tk.Tk):
             self.cfg = load_company_config()
         self.stock_options = []
         self.bg = Background(self)
+        # MapleJet: the services start before the window is built and run whichever tab is
+        # showing, even when Stripes starts hidden in the tray, because every PC running Stripes
+        # takes part in watching the printers. Returns at once; the share is read on its threads.
+        self.hx = hx_ui.start_services(self, config_path=self.config_folder, bg=self.bg, version=VERSION)
         self.preview_family = pick_font_family(self)
         self.measure_font = tkinter.font.Font(self, family=self.preview_family, weight="bold")
         self.preview_font_file = find_preview_font()
@@ -1166,8 +1341,8 @@ class App(tk.Tk):
 
         self._build()
         self._load_printer_list(select=self.settings.get("last_printer"))
-        self.bind_all("<Control-p>", lambda e: self.print_label())
-        self.bind_all("<Control-Return>", lambda e: self.print_label())
+        self.bind_all("<Control-p>", lambda e: self._zebra_shortcut(e, self.print_label))
+        self.bind_all("<Control-Return>", lambda e: self._zebra_shortcut(e, self.print_label))
         self._fill_tree(select=[0])
         self.simple_box.focus_set()
         if self.config_folder:
@@ -1181,7 +1356,7 @@ class App(tk.Tk):
             remove_download_mark(sys.executable)
             remove_old_versions(sys.executable)  # leftovers from when it did
         folder = status_folder()
-        self.deployment = DeploymentLog(folder) if folder else None
+        self.deployment = DeploymentLog(folder, old_folder=old_status_folder()) if folder else None
         self._log(lambda log: log.started(VERSION, sys.executable))
         self.after(HEARTBEAT_MINUTES * 60 * 1000, self._heartbeat)
         # Closing the window keeps Stripes running in the tray, so it opens instantly next
@@ -1193,6 +1368,7 @@ class App(tk.Tk):
             except Exception:
                 self.tray = None
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray if self.tray else self._on_close)
+        hx_ui.startup(self, self.hx)  # last: the floor board, when this user's settings say so
 
     # ----- deployment log -----
 
@@ -1222,6 +1398,10 @@ class App(tk.Tk):
         self.open_monitor()
         self.monitor.lift()
 
+    def show_hx_monitor(self):
+        """The tray's MapleJet monitor. It's a window of its own, so it shows while this one is hidden."""
+        hx_ui.open_monitor(self, self.hx)
+
     def hide_to_tray(self):
         self.withdraw()
         if not self.settings.get("tray_hint_shown"):
@@ -1231,16 +1411,28 @@ class App(tk.Tk):
             self.save()
 
     def quit_app(self):
+        if not hx_ui.can_quit(self, self.hx):  # a MapleJet Send or test is running: asks once
+            return
         if self.tray:
             self.tray.stop()
-        self._on_close()
+        self._quit_now()
 
     def _on_close(self, event="Closed"):
+        """The window's close box when there's no tray: quit."""
+        if not hx_ui.can_quit(self, self.hx):
+            return
+        self._quit_now()
+
+    def _quit_now(self):
+        t, started = None, time.monotonic()
         if self.deployment:  # don't let a slow share hold up closing
             t = threading.Thread(target=lambda: self._quiet(self.deployment.write, running=False,
                                                             last_closed=_now()), daemon=True)
             t.start()
-            t.join(2)
+        # Meanwhile the poller hands its printers to the other PCs and the MapleJet services stop
+        hx_ui.stop_services(self.hx, timeout_s=2.0)
+        if t:
+            t.join(max(0.0, 2 - (time.monotonic() - started)))
         self.destroy()
 
     @staticmethod
@@ -1294,7 +1486,7 @@ class App(tk.Tk):
         titles = ttk.Frame(header)
         titles.pack(side="left")
         ttk.Label(titles, text=APP_NAME, font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(titles, text=tr("Zebra label printing"), style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(titles, text=tr("Zebra labels and MapleJet bag printing"), style="Muted.TLabel").pack(anchor="w")
         corner = ttk.Frame(header)
         corner.pack(side="right", anchor="n")
         switch = ttk.Frame(corner)  # English | Español
@@ -1303,12 +1495,22 @@ class App(tk.Tk):
         for code, name in i18n.LANGUAGES:
             ttk.Radiobutton(switch, text=name, value=code, variable=self.v_language, style="Toolbutton",
                             command=self._language_changed).pack(side="left")
-        self.update_label = ttk.Label(corner, text=tr("Version {version}", version=VERSION), style="Muted.TLabel")
+        self.update_label = ttk.Label(corner, text=version_text(), style="Muted.TLabel")
         self.update_label.pack(anchor="e", pady=(4, 0))
         ttk.Separator(outer).pack(fill="x", pady=(0, 10))
 
+        # Two tabs under the header: Zebra holds everything below it, as before; MapleJet the
+        # bag printers. The tab texts are names, so they aren't translated.
+        self.top_tabs = ttk.Notebook(outer)
+        self.top_tabs.pack(fill="both", expand=True)
+        self.zebra_tab = zebra = ttk.Frame(self.top_tabs, padding=(10, 8))
+        self.top_tabs.add(zebra, text="  Zebra  ")
+        self.hx_tab = hx_ui.MapleJetTab(self.top_tabs, self.hx)
+        self.top_tabs.add(self.hx_tab, text="  MapleJet  ")
+        self.top_tabs.bind("<<NotebookTabChanged>>", self._top_tab_changed)
+
         # Printer row
-        top = ttk.Frame(outer)
+        top = ttk.Frame(zebra)
         top.pack(fill="x")
         ttk.Label(top, text=tr("Printer:")).pack(side="left")
         self.printer_var = tk.StringVar()
@@ -1321,7 +1523,7 @@ class App(tk.Tk):
         self.printer_status = ttk.Label(top, text="", style="Muted.TLabel")
         self.printer_status.pack(side="left", padx=8)
 
-        stock_row = ttk.Frame(outer)
+        stock_row = ttk.Frame(zebra)
         stock_row.pack(fill="x", pady=(6, 8))
         ttk.Label(stock_row, text=tr("Label stock:")).pack(side="left")
         self.stock_box = ttk.Combobox(stock_row, state="readonly", width=34)
@@ -1330,7 +1532,7 @@ class App(tk.Tk):
         self.size_label = ttk.Label(stock_row, text="", style="Muted.TLabel")
         self.size_label.pack(side="left")
 
-        body = ttk.Frame(outer)
+        body = ttk.Frame(zebra)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=2, uniform="cols")
         body.columnconfigure(1, weight=3, uniform="cols")
@@ -1373,7 +1575,7 @@ class App(tk.Tk):
         ttk.Label(right, text=tr("On-screen preview is approximate."), style="Muted.TLabel").pack(anchor="w")
 
         # Bottom: copies + print
-        bottom = ttk.Frame(outer)
+        bottom = ttk.Frame(zebra)
         bottom.pack(fill="x", pady=(12, 0), side="bottom", before=body)  # keeps Print visible in a short window
         ttk.Label(bottom, text=tr("Copies:"), font=("Segoe UI", 11)).pack(side="left")
         self.copies_var = tk.StringVar(value="1")
@@ -1384,8 +1586,27 @@ class App(tk.Tk):
         self.print_btn = ttk.Button(bottom, text=tr("Print"), style="Print.TButton", command=self.print_label)
         self.print_btn.pack(side="right")
 
-        self.status = ttk.Label(outer, text=tr("Ready. Tip: Ctrl+P prints."), style="Muted.TLabel")
+        self.status = ttk.Label(zebra, text=tr("Ready. Tip: Ctrl+P prints."), style="Muted.TLabel")
         self.status.pack(anchor="w", pady=(8, 0), side="bottom", before=bottom)
+
+    def _top_tab_changed(self, _event=None):
+        """Switching tabs only changes what the MapleJet tab draws; Sends and the poller go on."""
+        if str(self.top_tabs.select()) == str(self.hx_tab):
+            self.hx_tab.on_shown()
+        else:
+            self.hx_tab.on_hidden()
+
+    def _zebra_shortcut(self, event, action):
+        """The Zebra shortcuts only work on the Zebra tab, and never in a MapleJet window."""
+        try:
+            if getattr(event.widget.winfo_toplevel(), "hx_window", False):
+                return
+        except (AttributeError, tk.TclError):
+            # Known only by its path name (a drop-down list, a message box): look along the path
+            if _on_hx_path(self.top_tabs, event.widget):
+                return
+        if str(self.top_tabs.select()) == str(self.zebra_tab):
+            action()
 
     def _build_simple(self, parent):
         ttk.Label(parent, text=tr("Type your label, one line per row:")).pack(anchor="w")
@@ -1660,7 +1881,7 @@ class App(tk.Tk):
         self.save()
         self._retranslate(self)
         # Text the app works out as it goes
-        self.update_label.configure(text=tr("Version {version}", version=VERSION))
+        self.update_label.configure(text=version_text())
         current = self.stock_box.current()
         self.stock_box["values"] = self._stock_labels()
         if current >= 0:
@@ -1674,10 +1895,13 @@ class App(tk.Tk):
             self.monitor._close()  # its cards are built from scratch; quicker to open it again
             self.open_monitor()
         self.refresh()
+        hx_ui.language_changed(self.hx)  # the MapleJet tab and windows redo their own text
 
     @staticmethod
     def _retranslate(widget):
         """Switch the fixed text of a window and everything in it to the current language."""
+        if getattr(widget, "hx_no_translate", False):
+            return  # MapleJet screens and bag text: they translate themselves, never the bag text
         if isinstance(widget, (tk.Tk, tk.Toplevel)):
             widget.title(i18n.retranslate(widget.title()))
         try:
@@ -2792,16 +3016,17 @@ class PrinterMonitor(tk.Toplevel):
 
 
 class DeploymentWindow(tk.Toplevel):
-    """Every PC/user running Stripes, from the shared status folder."""
+    """Every PC/user running Stripes, from the shared status folder (and the older versions' one)."""
 
     COLUMNS = (("computer", N_("Computer"), 110), ("user", N_("User"), 100), ("version", N_("Version"), 110),
                ("status", N_("Status"), 85), ("last_seen", N_("Last seen"), 125),
                ("last_update", N_("Last update"), 230),
                ("first_seen", N_("Installed"), 125), ("notes", N_("Notes"), 280))
 
-    def __init__(self, app, folder):
+    def __init__(self, app, folder, old_folder=None):
         super().__init__(app)
         self.app, self.folder = app, folder
+        self.folders = [folder] + ([old_folder] if old_folder and old_folder != folder else [])
         self.title(tr("Deployment status"))
         self.geometry("1100x480")
         self.transient(app)
@@ -2809,7 +3034,7 @@ class DeploymentWindow(tk.Toplevel):
         frame.pack(fill="both", expand=True)
         self.summary = ttk.Label(frame, text=tr("Loading..."), font=("Segoe UI", 11, "bold"))
         self.summary.pack(anchor="w")
-        ttk.Label(frame, text=tr("From {folder}. Double-click a row for its history.", folder=folder),
+        ttk.Label(frame, text=tr("From {folder}. Double-click a row for its history.", folder=", ".join(self.folders)),
                   style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
         table = ttk.Frame(frame)
         table.pack(fill="both", expand=True)
@@ -2832,7 +3057,7 @@ class DeploymentWindow(tk.Toplevel):
 
     def refresh(self):
         self.summary.configure(text=tr("Loading..."))
-        self.app.bg.run(lambda: read_deployment(self.folder), self._loaded)
+        self.app.bg.run(lambda: read_all_deployment(self.folders), self._loaded)
 
     def _loaded(self, records, error):
         if not self.winfo_exists():
@@ -3072,7 +3297,7 @@ class PrinterDialog(tk.Toplevel):
 
     def _open_deployment(self, folder):
         self.grab_release()  # this dialog is modal; hand input to the new window while it's open
-        win = DeploymentWindow(self.app, folder)
+        win = DeploymentWindow(self.app, folder, old_status_folder())
         win.transient(self)
         win.grab_set()
         self.wait_window(win)
@@ -3282,6 +3507,7 @@ def self_check(out_path):
 
 
 def _self_check():
+    check_release_key(VERSION, HX_KEYED)  # a release without the key must never be published
     import io
     from PIL import Image, ImageTk
     root = tk.Tk()
@@ -3309,6 +3535,9 @@ def _self_check():
             import pystray._win32  # noqa: F401 (the tray's Windows backend, loaded by name at run time)
             if win32print is None:
                 raise RuntimeError("win32print is missing")
+        # MapleJet: every hx module, hashes, the key, HTTP and time-server replies from fakes on
+        # 127.0.0.1, the files, the Windows calls, the alert sound, the pictures and the tab
+        hx_ui.self_check(root)
     finally:
         root.destroy()
 

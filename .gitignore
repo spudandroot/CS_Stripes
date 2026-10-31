@@ -7,6 +7,7 @@ dist/
 !pyinstaller.spec
 stripes_version.py
 version_info.txt
+hx_key.py
 # Company-specific config never goes in this public repo (examples/config is the template)
 /printers.json
 /stock.json

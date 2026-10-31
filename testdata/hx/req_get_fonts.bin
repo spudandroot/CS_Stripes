@@ -1,0 +1,6 @@
+GET /sfl.xml HTTP/1.1
+Host: 192.0.2.10
+Connection: close
+Accept-Encoding: gzip
+Cookie: Access_token_1109=fedcba9876543210fedcba9876543210; Auth_token_1109=0123456789abcdef0123456789abcdef
+

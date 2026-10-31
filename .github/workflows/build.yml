@@ -6,6 +6,10 @@ name: Build
 # doesn't update itself: IT puts the release's Stripes.exe on the share and Group
 # Policy copies it to PCs (see README).
 #
+# Releases carry the printer-password key from the repository secret STRIPES_HX_KEY (see
+# README). Every other build gets the public development key and shows "(development key)"
+# next to its version.
+#
 # Releases are code-signed with Azure Artifact Signing (account ArrowfarmsSigning,
 # profile Stripes-Signing). Only the sign job can sign: it runs in the "release"
 # environment, whose secrets hold the Azure IDs, and Azure only accepts that environment.
@@ -32,6 +36,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30  # a hung test or self-check fails the build instead of holding a runner
     outputs:
       version: ${{ steps.stamp.outputs.version }}
     steps:
@@ -54,6 +59,8 @@ jobs:
         shell: pwsh
         env:
           RELEASE: ${{ inputs.release }}
+          KEYED: ${{ github.ref_type == 'tag' || inputs.release != '' }}
+          STRIPES_HX_KEY: ${{ (github.ref_type == 'tag' || inputs.release != '') && secrets.STRIPES_HX_KEY || '' }}
         run: |
           $v = if ($env:RELEASE) { $env:RELEASE }
                elseif ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME }
@@ -63,6 +70,7 @@ jobs:
             git merge-base --is-ancestor $env:GITHUB_SHA origin/main
             if ($LASTEXITCODE) { throw "Only main is released. Merge into main first, then release from main." }
           }
+          if ($env:KEYED -eq "true" -and -not $env:STRIPES_HX_KEY) { throw "Releases need the STRIPES_HX_KEY secret (see README, Releasing a new version)." }
           python make_version.py $v
           if ($LASTEXITCODE) { throw "make_version.py failed" }
           "version=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
@@ -70,8 +78,10 @@ jobs:
       - name: Build Stripes.exe
         run: pyinstaller --noconfirm pyinstaller.spec
 
-      # The exe is windowed, so it can't print errors: have it load everything it needs
-      # (Tk, Pillow, the tray) and write what it is to a file, before anything is published.
+      # The exe is windowed, so it can't print errors: have it load everything it needs (Tk,
+      # Pillow, the tray, and the MapleJet parts: hashes, the printer-password key, HTTP and
+      # time-server replies from fakes on 127.0.0.1, the Windows calls, the alert sound) and
+      # write what it is to a file, before anything is published.
       - name: Check the exe starts
         shell: pwsh
         run: |
