@@ -529,6 +529,65 @@ class ReadingTests(Base):
         self.assertGreaterEqual(len(sim.requests(kind="sme")), loads + 2)
         self.assertEqual(sim.code(), "drift")
 
+    def acked_drift(self, sim):
+        """A same-name drift committed and acknowledged on the floor; returns its alert."""
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        drift = next(x for x in sim.p().alerts if x.kind == "drift")
+        sim.observer.write_ack(Ack(alert_id=drift.id, by=JSMITH, computer="FLOOR01", at=sim.clock.time()))
+        self.assertTrue(sim.run(15, until=lambda: any(x.id == drift.id and x.acked_by for x in sim.p().alerts)))
+        return drift
+
+    def test_failed_retries_keep_a_known_drift_and_its_alert(self):
+        # Owner decision (31 Oct), second review: a failed Load's retry at the next cycle isn't a required
+        # Load, so when it fails too R stays, as for the slow set's own Load. Two failed Loads in a row
+        # leave a committed, acknowledged drift red with the same alert id, still acknowledged, and R's
+        # read-back: nothing ends, nothing rings again, no new alert id once the Loads work again
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        drift = self.acked_drift(sim)
+        attempts = []
+        self.drift_with_failing_loads(sim, lambda n: n <= 2, attempts)
+        seen = set()
+
+        def look():
+            p = sim.p()
+            seen.add((p.state.code, tuple((x.id, x.acked_by) for x in p.alerts if x.active and x.kind == "drift"),
+                      p.running.origin_line if p.running is not None else None))
+            return False
+        sim.run(200, until=look)
+        self.assertGreaterEqual(len(attempts), 3)
+        self.assertLessEqual(attempts[1] - attempts[0], LOGIC.poll_fast_s + 0.5)       # the retry, next cycle
+        self.assertEqual(seen, {("drift", ((drift.id, JSMITH),), "Product of Mexico")})
+        self.assertFalse([e for e in a.entries("alert_ended") if e["alert_id"] == drift.id])
+        self.assertEqual([e["alert"]["kind"] for e in a.entries("alert_started")], ["drift", "message_unreadable"])
+        self.no_violations(sim)
+
+    def test_random_load_failures_never_end_an_acknowledged_drift(self):
+        # The reviewer's realistic rate: 40 % of Loads fail at random for 15 minutes after an acknowledged
+        # drift. Every seed keeps one drift alert id, acknowledged, and the machine red all along
+        for seed in range(3):
+            sim = self.sim()
+            sim.expect()
+            sim.pc("akim")
+            self.steady(sim)
+            drift = self.acked_drift(sim)
+            rng = random.Random(seed)
+            self.drift_with_failing_loads(sim, lambda n: rng.random() < 0.4)
+            bad = []
+
+            def look():
+                p = sim.p()
+                ids = [(x.id, x.acked_by) for x in p.alerts if x.active and x.kind == "drift"]
+                if p.state.code != "drift" or ids != [(drift.id, JSMITH)]:
+                    bad.append((round(sim.clock.monotonic()), p.state.code, ids))
+                return False
+            sim.run(900, until=look)
+            self.assertEqual(bad, [], seed)
+
     def test_a_stray_prin(self):
         sim = self.sim()
         sim.expect()
