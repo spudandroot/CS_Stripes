@@ -857,11 +857,18 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
         carry("printing_off")
 
     # C11: drift
+    drift_e = mode == "running" and not e.rejected and not after_switch and names_message
+    known = drift_e and known_drift(prev) and prev.expected_counter == e.counter
     if not standalone:
         if trusted:
-            if (running is not None and mode == "running" and not e.rejected and not after_switch and names_message
+            if (running is not None and drift_e
                     and not matches_expected(running, name=e.message_name, slot=e.slot, fingerprint=e.fingerprint)):
                 codes.add("drift")
+                need("drift")
+            elif running is None and known:
+                # R unknown (a required Load failed: a worker start, the share back, a paused tick): only a
+                # Load can end a known drift. Its alert stays, the same id and acks (owner decision, 31 Oct);
+                # C11b gives message_unchecked with the origin unknown, and the red alert keeps it red
                 need("drift")
         else:
             carry("drift")
@@ -869,15 +876,25 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
     # C11c (owner decision, 31 Oct): a drift known from the share stays in standalone mode. Standalone
     # checks never load the message, so they can't see a drift end, and its name alone (C12) can't tell a
     # same-name drift from E: only a share-mode judgement clears it. Same alert, same acks, R's origin.
-    # A MSGNAM that no longer names R's message means something else was selected at the printer: still
-    # never green, at best amber unknown_while_down, with the drift alert open
-    if (standalone and known_drift(prev) and prev.expected_counter == e.counter and mode == "running"
-            and not e.rejected and not after_switch and names_message):
+    # A MSGNAM that no longer names R's message means something else was selected at the printer, and an
+    # R that is unknown (a share-mode Load failed) names nothing: still never green, at best amber
+    # unknown_while_down, with the drift alert open
+    if standalone and known:
         if trusted:
-            renamed = (running is not None and F.message_name is not None
-                       and norm_name(F.message_name) != norm_name(running.name))
-            codes.add("unknown_while_down" if renamed else "drift")
+            unknown = running is None or (F.message_name is not None
+                                          and norm_name(F.message_name) != norm_name(running.name))
+            codes.add("unknown_while_down" if unknown else "drift")
         need("drift")
+
+    # C11d (owner decision, 31 Oct): share mode's message check had failed when the share went down
+    # (F.running_unchecked, carried from the seed, §6.12 item 3; standalone never computes it). Standalone
+    # checks never load the message, so they can't do better: at best amber unknown_while_down, the origin
+    # unknown, its warning kept
+    if standalone and F.running_unchecked:
+        if trusted and mode == "running" and not e.rejected:
+            codes.add("unknown_while_down")
+        if prev_alert("message_unreadable") is not None:
+            need("message_unreadable")
 
     # C11b: the running message can't be read
     if not standalone:
@@ -1351,6 +1368,8 @@ def effective_origin(poll: PollStatus | None, expected: ExpectedState | None) ->
         return ""
     if poll is not None and not poll.standalone and poll.state is not None and poll.state.code == "unknown_while_down":
         return ""                              # a standalone check's finding carried into share mode (§6.3 step 1)
+    if poll is not None and poll.running is None and known_drift(poll):
+        return ""                              # a known drift whose R is unknown (a Load failed), never E's origin
     if (poll is None or poll.running is None) and expected is not None and expected.mode == "switch_pending":
         return ""
     r = poll.running if poll is not None else None

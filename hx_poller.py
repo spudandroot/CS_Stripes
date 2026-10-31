@@ -195,6 +195,7 @@ class _Worker:
         self.lock_seen = False
         self.need_hxui = True        # first cycle after a start, a pause or being unreachable
         self.need_load = True        # a Load is required this cycle
+        self.retry_load = False      # a Load this cycle, not a required one: a failed Load's retry (§6.4)
         self.r_stale = True          # R may no longer describe the printer until a judgement commits
         self.last_slow = None
         self.load_ok_mono = None
@@ -1041,9 +1042,9 @@ class _Worker:
                             self._clock(cyc, r)
                         if self._daily_due(p, machine, at):
                             self._daily_item(cyc, r, p, machine)
-                        if self.need_load or slow_due:
+                        if self.need_load or self.retry_load or slow_due:
                             required = self.need_load
-                            self.need_load = False
+                            self.need_load = self.retry_load = False
                             self._load(cyc, r, required=required)
             except _NoMore:
                 pass
@@ -1224,8 +1225,10 @@ class _Worker:
         if load_failed and not (j.committed and r.running_unchecked):
             # A failed Load, or a confirming Load that failed or wasn't made, is tried again at the next
             # cycle (about 5 s), not the next slow set, until the message check counts as failed and that
-            # has committed (amber message_unchecked; then the slow set's pace again). Owner decision, 31 Oct
-            self.need_load = True
+            # has committed (amber message_unchecked; then the slow set's pace again). Owner decision, 31 Oct.
+            # The retry isn't a required Load: when it fails too, R stays as for a slow set's Load, so a
+            # committed drift keeps its R, code and alert (a required Load is need_load's, R stale)
+            self.retry_load = True
         self._write_judgement(j, r, e, cyc)
 
     def _second_reading(self, cyc, r, items, data):
@@ -1368,12 +1371,17 @@ class _StandaloneCheck:
 
     def _seed(self):
         """prev for the first check (§6.12 item 3): None, or the last share P of a machine with a known
-        origin mismatch (owner decision, 31 Oct): a drift (its code or an active drift alert) whose R is
-        set and isn't E's message, judged against the E this PC holds. Standalone checks never load the
-        message and can't tell a same-name drift from E, so it stays red, with its alert, acks and R,
-        until a share-mode judgement clears it (§3.4 C11c). Only that is carried; every other machine
-        starts afresh as before. The newest P this PC has: the coordinator's last read, or what this PC's
-        own worker last wrote (the coordinator reads only every heartbeat_s)."""
+        origin mismatch (owner decision, 31 Oct), judged against the E this PC holds:
+        - a drift (its code or an active drift alert) whose R isn't E's message, or is unknown (a Load
+          failed). Standalone checks never load the message and can't tell a same-name drift from E, so
+          it stays red, with its alert, acks and R, until a share-mode judgement clears it (§3.4 C11c);
+        - a message share mode couldn't check (message_unchecked, or running_unchecked: the Loads, or
+          their confirmations, failed, maybe while each good first Load read another origin). Standalone
+          can't check it either, so it is carried with running_unchecked set: at best amber, the origin
+          unknown (C11d).
+        Only those are carried; every other machine starts afresh as before. The newest P this PC has: the
+        coordinator's last read, or what this PC's own worker last wrote (the coordinator reads only
+        every heartbeat_s)."""
         poller = self.poller
         found = [p for p in ((poller.seen_polls().get(self.machine_id) or (None, 0.0))[0],
                              poller._written_polls().get(self.machine_id)) if p is not None]
@@ -1381,12 +1389,15 @@ class _StandaloneCheck:
             return None
         p = max(found, key=lambda x: x.counter)
         e = poller._cached_expected(self.machine_id)
-        if (e is None or p.running is None or p.expected_counter != e.counter or p.machine_id != self.machine_id
-                or not hx_state.known_drift(p)
-                or hx_state.matches_expected(p.running, name=e.message_name, slot=e.slot, fingerprint=e.fingerprint)):
+        if e is None or p.expected_counter != e.counter or p.machine_id != self.machine_id:
+            return None
+        drift = hx_state.known_drift(p) and not hx_state.matches_expected(
+            p.running, name=e.message_name, slot=e.slot, fingerprint=e.fingerprint)
+        unchecked = p.running_unchecked or (p.state is not None and p.state.code == "message_unchecked")
+        if not (drift or unchecked):
             return None
         return dataclasses.replace(p, printer_id=self.printer_id, poller=poller.identity.key, counter=0,
-                                   paused_for_lock="", yielded_to="", standalone=True)
+                                   paused_for_lock="", yielded_to="", running_unchecked=unchecked, standalone=True)
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
