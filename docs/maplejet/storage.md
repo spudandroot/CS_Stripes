@@ -71,6 +71,7 @@ assignment · 13 DataService · 14 Permissions and the folder script · 15 Inter
       machines\<machine_id>.poll.json                written only by the assigned poller
       machines\<machine_id>.preview.bmp              written only by the assigned poller
       machines\<machine_id>.expected.json            written by senders and testers under the lock
+      machines\<machine_id>.nm-alarm.json            NOT MONITORED alarm marker, by a watcher that rang
       lines\<line_id>.json                           written by senders
       locks\<printer_id>.lock                        printer lock
       alerts\<alert_id>.json                         one acknowledgement each, written once
@@ -135,6 +136,7 @@ the `logs\<kind>\<YYYY-MM>\` month folders. Every other missing folder is a set-
 | Poll status | `status/machines/<machine_id>.poll.json` | the assigned poller only | everyone |
 | Running-message picture | `status/machines/<machine_id>.preview.bmp` | the assigned poller only | everyone |
 | Expected state | `status/machines/<machine_id>.expected.json` | the printer-lock holder | everyone |
+| NOT MONITORED alarm marker | `status/machines/<machine_id>.nm-alarm.json` | a status watcher that rang the alarm (§5.9) | status watchers |
 | Line status | `status/lines/<line_id>.json` | senders | everyone |
 | Printer lock | `status/locks/<printer_id>.lock` | the lock holder | everyone |
 | Lock set aside during a takeover | `status/locks/<printer_id>.lock.stale-<new token>` | the taker; removed at once | nobody |
@@ -184,7 +186,7 @@ order).
 | Key | Type | Value |
 |---|---|---|
 | `format_version` | int | `hx_model.FORMAT` (1) when written |
-| `file_type` | str | one of: `company`, `changes`, `line`, `machine`, `printer`, `adjustment`, `calibration`, `product`, `film`, `print_text`, `poll`, `expected`, `line_status`, `lock`, `heartbeat`, `ack`, `log`, `local_copy`, `user_settings`, `local_state`, `upload_marker` |
+| `file_type` | str | one of: `company`, `changes`, `line`, `machine`, `printer`, `adjustment`, `calibration`, `product`, `film`, `print_text`, `poll`, `expected`, `line_status`, `lock`, `heartbeat`, `ack`, `log`, `local_copy`, `user_settings`, `local_state`, `upload_marker`, `nm_alarm` |
 
 `encode_json(file_type, data) -> bytes` returns `{"format_version": FORMAT, "file_type": file_type,
 **data}` as `json.dumps(obj, ensure_ascii=False, indent=1, allow_nan=False) + "\n"` in UTF-8. Values
@@ -247,6 +249,7 @@ from a newer file.
 | `lock` | `counter`, `printer_id`, `token`, `user`, `computer`, `purpose` |
 | `expected`, `line_status`, `heartbeat` | `counter` |
 | `ack` | `alert_id` |
+| `nm_alarm` | `machine_id`, `alarm_id` |
 | `log` (line 2 of the file) | `end` |
 
 ### 3.5 Files without the envelope
@@ -600,6 +603,7 @@ text: stored exactly as typed and never translated.
 | `status/lines/<id>.json` | senders | after a Send, a confirmation or a stop | by name, by watchers |
 | `status/locks/<printer_id>.lock` | the lock holder | acquire, every `lock_refresh_s`, removed at release | by name, by the poller before every request and by watchers |
 | `status/alerts/<alert_id>.json` | whoever acknowledges | once | by name, only for alerts that are active |
+| `status/machines/<id>.nm-alarm.json` | a status watcher that rang the NOT MONITORED alarm | once per occurrence, over the last one | by name, at most once a pass, only for a machine shown NOT MONITORED (§5.9) |
 | `status/pollers/<key>.json` | that process | every `heartbeat_s`; removed on a clean exit | listing plus open, by pollers |
 
 General rules:
@@ -875,6 +879,33 @@ list[str] · `origin_line` str · `machines` dict[str, str] · `confirmed` bool 
  "counter": 4,
  "acquired_at": 1793275215.0,
  "note": {}
+}
+```
+
+### 5.9 NOT MONITORED alarm marker: `status/machines/<machine_id>.nm-alarm.json`
+
+`file_type` `nm_alarm`. Class `hx_share.AlarmMarker`. Fields: `machine_id` str · `alarm_id` str (states.md
+§4.2's id of the `not_monitored` alarm) · `started_at` float (the writer's alert `started_at`, its own
+clock, for display only) · `by` str · `computer` str. It says a PC rang that occurrence of the alarm, so
+a PC restarted or started later rings for it too (states.md §7 item 7.6). Final review, 31 Oct.
+
+1. Only a status watcher that rang the alarm through its own record writes it, and only when the
+   marker doesn't hold that id yet. `write_alarm_marker` writes it whole and swapped in (§8), setting
+   `by` and `computer` to this PC's. A new occurrence overwrites it; Stripes never deletes it.
+2. `read_alarm_marker(machine_id)` opens it by name and never caches it: None when missing or damaged,
+   or when its `machine_id` differs from the file name. A newer file is read from its stable keys.
+3. Domain Users have Modify on `status\machines` (§14.1), so every PC can write it. Pollers never read
+   it, and nothing lists it.
+
+```json
+{
+ "format_version": 1,
+ "file_type": "nm_alarm",
+ "machine_id": "mc_5d1e2f3a4b",
+ "alarm_id": "mc_5d1e2f3a4b.not_monitored.18740_sd_8a7b6c5d4e.1793275240200",
+ "started_at": 1793275420.6,
+ "by": "EXAMPLE\\akim",
+ "computer": "FLOOR02"
 }
 ```
 

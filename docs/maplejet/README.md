@@ -133,7 +133,9 @@ These changes follow, all differing from the spec as first written:
    checked while printing since it started, so the first PC opened in the morning doesn't ring for
    last night's machines. Not while that PC can't read the server, for a machine that is stopped or
    inactive, or during a Send. One acknowledgement silences every PC; the machine stays grey NOT
-   MONITORED (states.md §7 item 7, §15 decision 9).
+   MONITORED (states.md §7 item 7, §15 decision 9). Final review, 31 Oct: the PC that rings leaves a
+   marker on the server, so a PC restarted or opened later rings for the same unacknowledged
+   occurrence too; restarting Stripes no longer silences it.
 
 ## OPEN items
 
