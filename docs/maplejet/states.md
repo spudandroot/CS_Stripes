@@ -1553,15 +1553,15 @@ Every `heartbeat_s`, for the alerts in the latest P of each printer this PC poll
       `checking`, and P not paused for a lock), whether P said it may be printing (`maybe_printing`:
       `P.printing` True, or unknown while `printing_unchecked`) with E.mode `running`. A paused write
       moves the counter but reads nothing, so the judgement before it stays the last good one.
-   2. It rings when the view is `not_monitored`, E.mode is `running`, this PC has shown NOT MONITORED
-      for `NOT_MONITORED_ALARM_S` (120 s) of share-mode passes in a row, and one of these holds: the
-      record saw the counter move and was printing with E running; the record saw the counter move and
-      E has changed since P's judgement (`E.counter != P.expected_counter`: a Resume, or a Send onto a
-      stopped machine, that no poller judged, so it may be printing); or the shared marker holds this
-      occurrence's id (item 6). A stuck worker is fenced and a
-      backup polls within about 70 s (§6.2 item 3.0), and normal takeovers are quicker, so 2 minutes of
-      NOT MONITORED means something is really wrong. With no backup PC it rings about 2.5 minutes after
-      the last judgement.
+   2. It rings when the view is `not_monitored` (or a poller's start write, item 5), E.mode is
+      `running`, this PC has shown NOT MONITORED for `NOT_MONITORED_ALARM_S` (120 s) of share-mode
+      passes in a row, and one of these holds: the record saw the counter move and was printing with E
+      running; the record saw the counter move and E has changed since P's judgement (`E.counter !=
+      P.expected_counter`: a Resume, or a Send onto a stopped machine, that no poller judged, so it may
+      be printing); or the shared marker holds this occurrence's id (item 6). A stuck worker is fenced
+      and a backup polls within about 70 s (§6.2 item 3.0), and normal takeovers are quicker, so 2
+      minutes of NOT MONITORED means something is really wrong. With no backup PC it rings about 2.5
+      minutes after the last judgement.
    3. Never for a P this watcher hasn't seen move, unless the marker holds that occurrence: after a
       night with every PC closed, the first PC opened doesn't ring for every machine whose old P still
       says printing, and nothing rings at startup. Never while this PC can't read the share (`share_ok`

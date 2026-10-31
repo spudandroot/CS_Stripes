@@ -1646,13 +1646,16 @@ board rings for `"floor"` alerts). Closing it does the same in reverse.
 
 1. `mons = hx_win.monitors()`. The screen is `mons[screen]` when `0 <= screen < len(mons)`, else
    `mons[0]`; with no list (off Windows) it is the Tk screen: `Monitor(index=0, x=0, y=0,
-   width=root.winfo_screenwidth(), height=root.winfo_screenheight(), primary=True)`. A missing screen
-   falls back to 0 (states §8.1).
+   width=root.winfo_screenwidth(), height=root.winfo_screenheight(), primary=True)`, with no work
+   area. A missing screen falls back to 0 (states §8.1).
 2. `size == "full"`: full screen with no title bar on that screen: `overrideredirect(True)` and
    `geometry(f"{m.width}x{m.height}+{m.x}+{m.y}")`. Not topmost: the production-schedule PC runs other
    programs too.
-3. `size == "<w>x<h>"`: a normal window titled "MapleJet floor board" at the screen's top-left,
-   `geometry(f"{min(w, m.width)}x{min(h, m.height)}+{m.x}+{m.y}")`.
+3. `size == "<w>x<h>"`: a normal window titled "MapleJet floor board" at the top-left of the
+   screen's work area, the screen less the taskbar: `x, y, width, height = m.work_area()` (Windows'
+   `rcWork`; the whole screen elsewhere), then `geometry(f"{min(w, width)}x{min(h, height)}+{x}+{y}")`.
+   So a window as tall as the screen never has its bottom row under the taskbar (final review,
+   31 Oct). Full screen (item 2) still takes the whole screen.
 4. Any other value is treated as `"full"` (`HxSettings.load` already cleans it, §14).
 
 ### 10.3 Drawing
@@ -3363,6 +3366,7 @@ last.
 | `test_row_without_an_origin_has_no_gap` | `test_hx_ui.py` | a machine row with `origin_line` `""` shows `unknown_label` in place of the unpacked `origin`, so it is as tall as a row with an origin less the origin's height plus the label's; updated in place either way, the origin (or the label) stays above details, alerts and buttons |
 | `test_floor_layout` | `test_hx_ui.py` | `floor_layout(1920, 1080, 12)` gives `header_h` 76, `origin_px` 42, `status_px` 25; with 2 rows `row_h` is 251.0; with 20 rows `row_h` is 50.2; 12 machines on 4 lines give `row_h` 71.71 and fit; 30 machines on 5 lines at 1280x800 give 44 px rows, `scrolls` and the rows narrower by the scrollbar; `fit_px`, `ellipsize` and `short_name` as §10.3 says |
 | `test_floor_board` | `test_hx_ui.py` | rows in board order under their lines' bands; names without the line's name; `origin_items` texts equal the rows' origins; a NOT MONITORED row's texts are `DIM_FG`; the colour bar alternates while `unacked_sound`; `size="1280x800"` gives that geometry; `monitors()` patched to `[]` uses the Tk screen; the Acknowledge button shows only with `roles.acknowledge` |
+| `test_a_window_keeps_out_of_the_taskbar` | `test_hx_ui.py` | a window size as big as the screen is cut to the work area (`Monitor.work`: taskbar at the bottom, left or top, and on a second screen) and placed at its top-left; full screen still takes the whole screen; the rows are drawn for the window it got, the last one above the taskbar (final review, 31 Oct) |
 | `test_rows_fit_without_overlap` | `test_hx_ui.py` | at 1280x800 and 1920x1080, 6 machines on 2 lines and 12 on 4: no scrolling, the last row on screen, every text inside its column and row with `width` 0, one size per column, and the origin size the largest at which the widest origin fits |
 | `test_one_origin_size_never_cut_short`, `test_long_names_and_statuses_get_an_ellipsis`, `test_scrolls_when_the_rows_cannot_fit` | `test_hx_ui.py` | a very long origin shrinks every origin and is drawn whole; long names and statuses end in "…", origins never; 30 machines scroll with the wheel, a new board keeps the place, and a board that fits hides the scrollbar |
 | `test_alert_sounder` | `test_hx_ui.py` | `hx_win.play_alert`/`stop_alert` patched: a board with a sound alert to `user:EXAMPLE\jsmith` plays once (a second board doesn't replay); an acknowledged board stops it; a `"floor"` alert rings only while the floor board is open; the `AlertPopup` opens for the personal alert only |

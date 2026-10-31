@@ -2605,7 +2605,7 @@ class StatusWatcher:
                         found = self.store.read_alarm_marker(mid)
                     except ShareUnavailable:
                         gone = True
-                    except ShareError:
+                    except (ShareError, ValueError):
                         found = None
                     if found is not None:
                         s, alarm = hx_state.not_monitored_alarm(*args, marker=found.alarm_id, **kw)
@@ -2643,7 +2643,7 @@ class StatusWatcher:
             return self.store.read_alarm_marker(machine_id)
         except ShareUnavailable:
             return _GONE
-        except ShareError:
+        except (ShareError, ValueError):
             return None
 
     def _mark(self, machine_id, alarm, s, found):

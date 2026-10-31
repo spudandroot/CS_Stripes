@@ -895,7 +895,7 @@ a PC restarted or started later rings for it too (states.md §7 item 7.6). Final
 2. `read_alarm_marker(machine_id)` opens it by name and never caches it: None when missing or damaged,
    or when its `machine_id` differs from the file name. A newer file is read from its stable keys.
 3. Domain Users have Modify on `status\machines` (§14.1), so every PC can write it. Pollers never read
-   it, and nothing lists it.
+   it, and no reader finds it by listing.
 
 ```json
 {
@@ -1256,6 +1256,12 @@ share that works.
    `Msg(N_("No server folder is set up for Stripes on this PC."))`, and no probe ever runs.
 5. A missing root (`FileNotFoundError` from the probe's listing) counts as down, with the reason
    "Stripes can't find {folder} on the server."
+6. `reach_now()` (final review, 31 Oct): while the share is marked down, one probe now on the
+   caller's thread instead of at the next due time, waiting at most `share_timeout_s`; True when the
+   share is available afterwards. A probe that failed less than `share_timeout_s` ago isn't repeated,
+   so in a real outage the next caller fails at once. A printer lock's acquire uses it (§11.2 step 4):
+   one slow operation marks the share down for `share_retry_s`, and a lock must not fall back to
+   `local_only` on that alone.
 
 ### 9.4 Status method rules
 
@@ -1336,10 +1342,14 @@ No share operation runs while holding it, so `check()` never blocks on the share
 3. Build a `LockInfo` with a new `token`, our `user`, `computer` and `pid`, the purpose and ids,
    `counter` 1, `acquired_at = clock.time()` and an empty `note`. Steps 4 to 6 run holding the store's
    mutex for this printer, so a pending release's retry can't remove the file made here (§11.5).
-4. `t0 = clock.monotonic()`, then `create_exclusive("status/locks/<printer_id>.lock", encode_json("lock",
-   ...))`. On success, the state is `held` and `last_ok = t0`; return `"held"`.
-5. `ShareUnavailable` at any point: the state is `local_only`; return `"local_only"`. The
-   registration stays.
+4. If the share is marked down, `store.reach_now()` first (§9.3 item 6): one real try, at most
+   `share_timeout_s`. One operation slower than the share timeout marks the share down for
+   `share_retry_s`; without the try, the next Send took a `local_only` lock while the share answered,
+   and the other PCs' pollers, seeing no lock, polled during it: two requests in flight (final review,
+   31 Oct). Then `t0 = clock.monotonic()`, then `create_exclusive("status/locks/<printer_id>.lock",
+   encode_json("lock", ...))`. On success, the state is `held` and `last_ok = t0`; return `"held"`.
+5. `ShareUnavailable` at any point (the try in step 4 failed too: a real outage): the state is
+   `local_only`; return `"local_only"`. The registration stays.
 6. If the file exists, `read_lock(printer_id)`, which updates the watch. If the file has vanished in
    the meantime, go back to step 4 (at most 3 rounds in all). If the age of its counter is below
    `lock_stale_s`, remove the registration and raise `LockHeld(info)`. If the age is at or above
@@ -1939,7 +1949,7 @@ What each right is used for:
 
 | Who | Writes |
 |---|---|
-| Every PC (Domain Users) | `poll.json` and `preview.bmp` (status\machines), heartbeats, the Zebra deployment log, hx-events entries |
+| Every PC (Domain Users) | `poll.json`, `preview.bmp` and the NOT MONITORED alarm marker (status\machines), heartbeats, the Zebra deployment log, hx-events entries |
 | Senders | expected states (status\machines), line statuses, locks, acks, hx-sends entries |
 | Administrators | records, film files and previews, `changes.json`, expected states and locks during tests, acks, hx-admin entries |
 
@@ -2020,6 +2030,14 @@ NETWORK_WINERRORS = frozenset({51, 53, 54, 55, 59, 64, 67, 121, 1203, 1222, 1225
 
 class ShareDenied(ShareError): ...          # PermissionError on the share; the share stays available
 
+@dataclass(kw_only=True)
+class AlarmMarker:                          # status/machines/<machine_id>.nm-alarm.json (§5.9)
+    machine_id: str
+    alarm_id: str
+    started_at: float = 0.0
+    by: str = ""                            # set by write_alarm_marker
+    computer: str = ""
+
 # encoding (pure)
 def encode_json(file_type: str, data: dict) -> bytes
 def decode_json(raw: bytes, *, file_type: str | None, rel: str) -> dict
@@ -2062,6 +2080,9 @@ class CounterWatch:
 class ShareStore:
     down_reason: Msg | None
     def probe_now(self) -> None: ...                          # non-blocking
+    def reach_now(self) -> bool: ...                          # blocking, at most share_timeout_s (§9.3 item 6)
+    def read_alarm_marker(self, machine_id: str) -> AlarmMarker | None: ...   # §5.9, by name, never cached
+    def write_alarm_marker(self, marker: AlarmMarker) -> None: ...            # §5.9, whole file; sets by, computer
     def read_bytes(self, rel: str) -> bytes | None: ...      # None if missing
     def write_bytes(self, rel: str, data: bytes) -> None: ...   # write_whole
     def create_once(self, rel: str, data: bytes) -> bool: ...   # create_exclusive
@@ -2236,6 +2257,11 @@ sleeps more than 0.5 s in real time.
       returns the holder's `LockInfo` (user, computer, purpose `send`) with the latest `update()`
       note, a copy that changing doesn't affect the store; after `release`, None, as for a printer
       that was never locked.
+    - A store marked down by one operation slower than `share_timeout_s`, with the share answering
+      again: `"held"`, the file on the share, the store available, and another PC gets `LockHeld`. In
+      a real outage (down, or hanging) the one try is a probe: `"local_only"` within
+      `share_timeout_s`, and a second acquire straight after falls back at once without touching the
+      share; `share_timeout_s` later it tries again (§11.2 step 4).
     - A second acquire in the same process: `LockHeld`.
     - A damaged lock is held, then taken over after 60 s. A format-2 lock is held.
     - Refreshes failing for 30 s: `lost`, and no write after that.
@@ -2271,7 +2297,9 @@ sleeps more than 0.5 s in real time.
     `poll_age` still tracks its counter. `write_ack` twice: the first ack stays. `read_ack` caches it
     (one `read_bytes` for two calls). `preview.bmp` round-trips. `cached_expected` returns the state
     last read or written, and still returns it with `down=True`; so does `cached_poll` for the newest P
-    read.
+    read. The alarm marker (§5.9) round-trips with `by` and `computer` set by the store, is overwritten
+    whole, is read again every call (never cached), gives None when missing, damaged or naming another
+    machine, is read from its stable keys when newer, and a bad alarm id gives `ValueError`.
 16. **Not-found cache:** with `not_found_cache_s=5` on store B's view, a lock created by store A is
     invisible to B's `read_lock` for 5 s and visible after. `settle_s()` with the default timings is
     6.0, which is more than 5.

@@ -1836,8 +1836,8 @@ class ShareStore:
         never cached: it changes with each occurrence."""
         _check_id(machine_id, "machine id")
         kind, d = self._read_status(f"status/machines/{machine_id}.nm-alarm.json", "nm_alarm")
-        if kind == "newer":
-            d = d[0]            # machine_id and alarm_id are stable keys (§3.4)
+        if kind == "newer":     # machine_id and alarm_id are stable keys (§3.4)
+            d = {k: d[0].get(k) for k in ("machine_id", "alarm_id")}
         elif kind != "ok":
             return None
         try:

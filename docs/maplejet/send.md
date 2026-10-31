@@ -1172,7 +1172,7 @@ The UI shows the problems and keeps the Send window open.
    | Outcome | What happens |
    |---|---|
    | `"held"` | `lock.start_keeping()` |
-   | `"local_only"` (the share didn't answer) | the machine carries on with the note `no_lock`; a `warning` event with `NOTE_TEXTS["no_lock"]` |
+   | `"local_only"` (the share didn't answer, also to the one try `acquire()` makes while the share is marked down, storage.md §11.2 step 4) | the machine carries on with the note `no_lock`; a `warning` event with `NOTE_TEXTS["no_lock"]` |
    | `LockHeld(info)` | the whole line isn't sent: release the locks already taken for it; every machine of the line is red at `STEP_LOCK` with the holder's message (below), a `failed` event each |
    | any other `ShareError` (such as `ShareDenied`) | the same, with the error's own message |
 

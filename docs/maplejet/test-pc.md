@@ -222,9 +222,10 @@ never shows: write "not possible" in the record.
 - On the test PC: right-click the tray icon > **Quit Stripes**.
 
 Pass: after about 30 s the machine shows NOT MONITORED on the office PC. After about 2.5 minutes in
-all, the alarm sounds there, with an alert saying no PC has checked the machine. **Acknowledge**
-stops it. Start the test copy on the test PC again: the machine is checked again and NOT MONITORED
-goes.
+all, the alarm sounds there, with an alert saying no PC has checked the machine. Before you
+acknowledge it, quit Stripes on the office PC (tray icon > **Quit Stripes**) and start it again: after
+about 2.5 minutes the same alarm sounds again (a restart doesn't silence it). **Acknowledge** stops it.
+Start the test copy on the test PC again: the machine is checked again and NOT MONITORED goes.
 
 ## Optional: two PCs on the new release
 

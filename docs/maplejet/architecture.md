@@ -1295,9 +1295,12 @@ def open_for_read(path: str) -> BinaryIO
 @dataclass(frozen=True)
 class Monitor:
     index: int; x: int; y: int; width: int; height: int; primary: bool
+    work: tuple[int, int, int, int] | None = None   # (x, y, width, height) less the taskbar (rcWork)
+    def work_area(self) -> tuple[int, int, int, int]  # work, or the whole screen when None
 
 def monitors() -> list[Monitor]
-    # Windows: EnumDisplayMonitors + GetMonitorInfoW, primary first; elsewhere [] (the UI then uses Tk's screen)
+    # Windows: EnumDisplayMonitors + GetMonitorInfoW (rcMonitor, and rcWork as work), primary first;
+    # elsewhere [] (the UI then uses Tk's screen)
 
 def play_alert(repeat: bool = True) -> None
     # winsound.PlaySound(<bundled assets/alert.wav>, SND_FILENAME | SND_ASYNC | (SND_LOOP if repeat));
@@ -1952,10 +1955,14 @@ Two mechanisms, both through the share. storage.md specifies the files and the f
    change and printer, never repeated, logged to `hx-events` (states.md §6.11). It doesn't take a
    lock: it is already the only PC talking to that printer.
 7. **Share down.** No lock can be taken (`local_only`) and pollers can't coordinate. That PC's Send
-   still checks and confirms each printer but every machine is amber (plan wording). In standalone
+   still checks and confirms each printer but every machine is amber (plan wording). A share only
+   marked down (one operation slower than the share timeout marks it down for `share_retry_s`) gets
+   one real try, at most `share_timeout_s`, before a lock falls back to `local_only`, so a Send never
+   goes unlocked while the share answers (storage.md §11.2 step 4; final review, 31 Oct). In standalone
    mode only PCs with a MapleJet monitor or the floor board open poll, every `standalone_poll_s` at a
    random offset, quick items only, and only once the share has been unreachable for `lock_stale_s`
-   without a break (states.md §6.12). **Residual risk (owner sign-off, §12.1):** when only some PCs
+   without a break, and only on a PC that can poll (it reached a printer within a day; states.md
+   §6.12). **Residual risk (owner sign-off, §12.1):** when only some PCs
    lose the share (a broken SMB session on one PC), that PC's standalone checks can overlap the
    share-mode pollers and lock-holding senders on the other PCs for as long as its outage lasts, and
    those senders get no `no_lock` warning. The overlap is limited to the quick reads every 30 s; web
@@ -2118,7 +2125,7 @@ and logic tests use `FakeClock`.
 | `test_hx_poller.py` | Request budget under 1 request/s per printer; pause for a lock and resume; drift needs a second reading; unreachable after 3 failures and the backoff; standalone mode; the DST clock set fires once, only without a lock |
 | `test_hx_sim.py` | Several simulated PCs (own identity, store, pool, gates) on one share with several fakes, `mixup` on: PCs drop out and return, printers switched off, a Send from two PCs at once, a slow printer with a slow share and a silent time server, one PC cut off from the share alone. Asserts: every fake's `max_in_flight == 1` (in the one-PC-cut-off case, which §7.3 rule 7 accepts as a residual risk, that and the "two requests in flight" violation are replaced by: every Send's read-backs matched their own TN and XID), no `violations`, one writer per `poll.json` at a time, takeover within 15–20 s (scaled), NOT MONITORED when every poller is gone |
 | `test_hx_ui.py`, `test_hx_ui_send.py`, `test_hx_ui_admin.py` | Under xvfb (skipped if Tk can't start), split by module (ui.md §17): the MapleJet tab builds; the Send window flow against fakes (bus pumped by hand, dialogs patched); result and red windows; monitor and floor board render a `BoardView`; an admin save |
-| `test_hx_win.py` | the non-Windows fallbacks of every `hx_win` function, the identity overrides (unfrozen only), and `open_for_read`; the Windows calls themselves run in `test_hx_share_windows.py` and the self-check |
+| `test_hx_win.py` | the non-Windows fallbacks of every `hx_win` function, the identity overrides (unfrozen only), `open_for_read`, and `Monitor.work_area()` (the work area, else the whole screen; on Windows each work area inside its screen); the Windows calls themselves run in `test_hx_share_windows.py` and the self-check |
 | `test_i18n.py` (changed) | `SOURCES` also lists every `hx_*.py` in the repo folder except `hx_fake.py` and the generated `hx_key.py`, found by listing the folder (so the test covers each module as soon as it exists); the test imports them so their catalogues are registered; `add_spanish` refuses a conflicting pair |
 | `test_stripes.py` (changed) | The v2 paths, the one-time settings copy, the deployment-log folder, the Zebra config read from `v2\config` with the fallback; Ctrl+P ignored on the MapleJet tab and in MapleJet windows; bag text unchanged after switching to Spanish and running `App._retranslate` (ui.md §17.2) |
 | `test_make_version.py` (changed) | deploy.md §6.1: `parse_key`, `stamp_key`, `key_id` equal to `hx_protocol.key_id`, `main` |

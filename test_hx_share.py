@@ -2638,6 +2638,41 @@ class StatusFileTests(ShareCase):
         self.assertEqual(self.sender.poll_age(MACHINE_ID), 0.0)
         self.assertEqual(status.poller, "")                          # the caller's copy is untouched
 
+    def test_alarm_marker(self):
+        # §5.9 (final review, 31 Oct): the NOT MONITORED alarm's shared occurrence
+        rel = f"status/machines/{MACHINE_ID}.nm-alarm.json"
+        aid = f"{MACHINE_ID}.not_monitored.18740_sd_8a7b6c5d4e.1793275240200"
+        self.assertIsNone(self.sender.read_alarm_marker(MACHINE_ID))
+        plain = self.store(identity("akim", "FLOOR03"))             # any PC (Domain Users) writes it
+        plain.write_alarm_marker(hx_share.AlarmMarker(machine_id=MACHINE_ID, alarm_id=aid, started_at=T0 + 5,
+                                                      by="someone", computer="ELSEWHERE"))
+        d = decode_json(self.read(rel), file_type="nm_alarm", rel=rel)
+        self.assertEqual((d["format_version"], d["alarm_id"], d["started_at"], d["by"], d["computer"]),
+                         (FORMAT, aid, T0 + 5, "EXAMPLE\\akim", "FLOOR03"))
+        back = self.sender.read_alarm_marker(MACHINE_ID)
+        self.assertEqual(back, hx_share.AlarmMarker(machine_id=MACHINE_ID, alarm_id=aid, started_at=T0 + 5,
+                                                    by="EXAMPLE\\akim", computer="FLOOR03"))
+        # A new occurrence overwrites it whole; readers never cache it
+        second = aid.replace("18740", "18790")
+        self.poller.write_alarm_marker(hx_share.AlarmMarker(machine_id=MACHINE_ID, alarm_id=second))
+        self.assertEqual(self.sender.read_alarm_marker(MACHINE_ID).alarm_id, second)
+        self.assertEqual([n for n in self.listing("status/machines") if "nm-alarm" in n], [f"{MACHINE_ID}.nm-alarm.json"])
+        # Damaged, another machine's or an id that isn't one: None
+        for raw in (b"{not json", {"format_version": 1, "file_type": "nm_alarm", "machine_id": "mc_0000000000",
+                                   "alarm_id": aid},
+                    {"format_version": 1, "file_type": "nm_alarm", "machine_id": MACHINE_ID, "alarm_id": "a b"},
+                    {"format_version": 1, "file_type": "poll", "machine_id": MACHINE_ID, "alarm_id": aid}):
+            self.write(rel, raw)
+            self.assertIsNone(self.sender.read_alarm_marker(MACHINE_ID), raw)
+        # A newer file: its stable keys still count
+        self.write(rel, {"format_version": FORMAT + 1, "file_type": "nm_alarm", "machine_id": MACHINE_ID,
+                         "alarm_id": aid, "started_at": "later"})
+        self.assertEqual(self.sender.read_alarm_marker(MACHINE_ID).alarm_id, aid)
+        with self.assertRaises(ValueError):
+            self.sender.write_alarm_marker(hx_share.AlarmMarker(machine_id=MACHINE_ID, alarm_id="no/slash"))
+        with self.assertRaises(ValueError):
+            self.sender.read_alarm_marker("../x")
+
     def test_poll_counter_must_go_up(self):
         self.poller.write_poll(self.poll(5))
         for counter in (5, 4):
