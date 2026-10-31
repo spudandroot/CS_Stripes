@@ -837,6 +837,123 @@ class StubbedRunTests(unittest.TestCase):
                 self.assertIn("isn't a folder that exists", output)
                 self.assertFalse(os.path.exists(v2), output)
 
+    def test_other_groups_warn(self):
+        # A re-run with other groups gives the folder rights to them but keeps company.json, which
+        # Stripes goes by: it says so (final review B-1)
+        old = {"Admins": ("administrators' group", "Stripes Administrators", "AdminGroup"),
+               "Senders": ("senders' group", "Stripes MapleJet Senders", "SenderGroup")}
+
+        def expected(who):
+            label, old_name, parameter = old[who]
+            new_name, new_sid = OTHER_GROUPS[who]
+            return (f"Warning: v2\\config\\hx\\company.json has the {label} {old_name} ({EXAMPLE_SIDS[who]}), not "
+                    f"{new_name} ({new_sid}) from -{parameter}. Stripes still uses {old_name}, but this script gives "
+                    f"the folder rights to {new_name}.")
+        admin, sender = OTHER_GROUPS["Admins"][0], OTHER_GROUPS["Senders"][0]
+        for name, exe in powershells():
+            with self.subTest(powershell=name):
+                config, v2 = make_tree(self)
+                code, output = self.run_script(exe, config)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(warnings_in(output), [])
+                path = os.path.join(v2, "config", "hx", "company.json")
+                before = read_bytes(path)
+                code, output = self.run_script(exe, config)          # the same groups: nothing to say
+                self.assertEqual(code, 0, output)
+                self.assertEqual(warnings_in(output), [])
+                for args, changed in ((("-AdminGroup", admin), ["Admins"]),
+                                      (("-AdminGroup", admin, "-SenderGroup", sender), ["Admins", "Senders"]),
+                                      (("-SenderGroup", sender, "-WhatIf"), ["Senders"])):
+                    code, output = self.run_script(exe, config, *args)
+                    self.assertEqual(code, 0, output)
+                    self.assertEqual(read_bytes(path), before)
+                    self.assertIn("Kept: v2\\config\\hx\\company.json (already there)", output)
+                    warnings = warnings_in(output)
+                    self.assertEqual(warnings[:len(changed)], [expected(who) for who in changed], output)
+                    advice, reminder = warnings[len(changed):]
+                    self.assertTrue(advice.startswith("Warning: this script never changes company.json. "), advice)
+                    for part in ("MapleJet > Admin > Company, presses Look up and saves", "admin_group_sid",
+                                 'as the README says under "If a group is replaced"'):
+                        self.assertIn(part, advice)
+                    self.assertEqual(reminder, "Warning: Stripes still uses the groups in company.json, not the "
+                                               "ones given to this run (see above).")
+                    # The reminder comes last, below the rights, just before the closing line
+                    whatif = "-WhatIf" in args
+                    end = "Nothing was changed (-WhatIf)" if whatif else "Done. Put Stripes.exe"
+                    rights = '"Set rights" on target' if whatif else "Rights left alone (test)"
+                    self.assertLess(output.rindex(rights), output.index(reminder))
+                    self.assertLess(output.index(reminder), output.index(end))
+
+    def test_unreadable_company_json_warns(self):
+        for name, exe in powershells():
+            with self.subTest(powershell=name):
+                config, v2 = make_tree(self)
+                os.makedirs(os.path.join(v2, "config", "hx"))
+                path = os.path.join(v2, "config", "hx", "company.json")
+                with open(path, "wb") as f:
+                    f.write(b"{not json\n")
+                code, output = self.run_script(exe, config)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(read_bytes(path), b"{not json\n")
+                self.assertEqual(warnings_in(output),
+                                 ["Warning: couldn't read v2\\config\\hx\\company.json to check its groups."])
+
+    def run_failing(self, exe, config, extra):
+        script = self.script
+        if extra:
+            script = stubbed_script(self.tmp, extra, name="failing.ps1")
+        return run_powershell(exe, script, "-ConfigPath", config)
+
+    def test_failure_before_the_rights_says_v2_isnt_protected(self):
+        # Until the rights step, v2 has the Stripes folder's rights: a failure says so (final review B-2)
+        def file_at(*parts):
+            def make(v2):
+                os.makedirs(os.path.join(v2, *parts[:-1]), exist_ok=True)
+                with open(os.path.join(v2, *parts), "wb"):
+                    pass                                # a file where a folder must go
+            return make
+        cases = [
+            (file_at("config", "hx"), "", "Failed while creating the folders (v2\\config\\hx): "),
+            (None, "function Get-CurrentAccount { throw 'no account (test)' }\n",
+             "Failed while writing the first settings (company.json): no account (test)"),
+        ]
+        for name, exe in powershells():
+            for make, extra, failed in cases:
+                with self.subTest(powershell=name, failed=failed):
+                    config, v2 = make_tree(self)
+                    if make:
+                        make(v2)
+                    code, output = self.run_failing(exe, config, extra)
+                    self.assertEqual(code, 1, output)
+                    self.assertIn(failed, output)
+                    self.assertTrue(os.path.isdir(v2), output)
+                    self.assertNotIn("Rights left alone", output)
+                    self.assertIn(NOT_PROTECTED, output)
+                    self.assertIn(RUN_AGAIN, output)
+                    self.assertLess(output.index(failed), output.index(NOT_PROTECTED))
+                    self.assertLess(output.index(NOT_PROTECTED), output.index(RUN_AGAIN))
+
+    def test_failure_with_no_v2_or_after_the_rights_doesnt(self):
+        def v2_is_a_file(v2):
+            with open(v2, "wb"):
+                pass
+        cases = [
+            (v2_is_a_file, "", "Failed while creating the folders (v2): "),
+            (None, "function Test-ShareSettings([string]$V2) { throw 'share check (test)' }\n",
+             "Failed while checking the share ("),
+        ]
+        for name, exe in powershells():
+            for make, extra, failed in cases:
+                with self.subTest(powershell=name, failed=failed):
+                    config, v2 = make_tree(self)
+                    if make:
+                        make(v2)
+                    code, output = self.run_failing(exe, config, extra)
+                    self.assertEqual(code, 1, output)
+                    self.assertIn(failed, output)
+                    self.assertNotIn("isn't protected", output)
+                    self.assertIn(RUN_AGAIN, output)
+
 
 # --------------------------------------------------------------------------
 # The real script on Windows (deploy.md §8.8)
@@ -964,6 +1081,49 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual(read_bytes(os.path.join(v2, "config", "stock.json")),
                          read_bytes(os.path.join(config, "stock.json")))
         self.assertTrue(os.path.isfile(os.path.join(v2, "config", "hx", "changes.json")))
+
+    def test_other_groups_warn(self):
+        # A re-run with another administrators' group moves the rights and keeps company.json (B-1)
+        config, v2 = make_tree(self)
+        code, output = self.run_script(config)
+        self.assertEqual(code, 0, output)
+        path = os.path.join(v2, "config", "hx", "company.json")
+        before = read_bytes(path)
+        code, output = self.run_script(config, "-AdminGroup", "BUILTIN\\Guests", *self.GROUP_ARGS[2:])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(read_bytes(path), before)
+        warnings = warnings_in(output)
+        self.assertEqual(len(warnings), 3, output)
+        self.assertIn("has the administrators' group BUILTIN\\Backup Operators (S-1-5-32-551), not BUILTIN\\Guests "
+                      "(S-1-5-32-546) from -AdminGroup.", warnings[0])
+        self.assertIn("Rights set: v2\\config\n", output)
+        self.assertIn("Guests", self.icacls(os.path.join(v2, "config")))
+
+    def test_failure_says_whether_v2_is_protected(self):
+        # Before the rights step v2 still inherits, and the error says so; once it has its own
+        # rights, a failure doesn't (B-2)
+        config, v2 = make_tree(self)
+        os.makedirs(os.path.join(v2, "config"))
+        blocker = os.path.join(v2, "config", "hx")
+        with open(blocker, "wb"):
+            pass
+        code, output = self.run_script(config)
+        self.assertEqual(code, 1, output)
+        self.assertIn("Failed while creating the folders (v2\\config\\hx): ", output)
+        self.assertIn(NOT_PROTECTED, output)
+        self.assertIn("(I)", self.icacls(v2))
+        os.remove(blocker)
+        code, output = self.run_script(config)
+        self.assertEqual(code, 0, output)
+        admin_logs = os.path.join(v2, "logs", "hx-admin")
+        os.rmdir(admin_logs)
+        with open(admin_logs, "wb"):
+            pass
+        code, output = self.run_script(config)
+        self.assertEqual(code, 1, output)
+        self.assertIn("Failed while creating the folders (v2\\logs\\hx-admin): ", output)
+        self.assertNotIn("isn't protected", output)
+        self.assertIn(RUN_AGAIN, output)
 
     @unittest.skipUnless(shutil.which("pwsh"), "no PowerShell 7")
     def test_powershell_7_gives_the_same_rights(self):

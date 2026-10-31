@@ -705,6 +705,7 @@ function Invoke-FolderSetup {
 
     # 5. The first company settings and the change counter
     $script:SetupStep = 'writing the first settings'
+    $script:SetupItem = 'company.json'
     $hx = Join-Path $v2config 'hx'
     $account = Get-CurrentAccount
     $now = Get-UnixTime
