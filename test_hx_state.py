@@ -1458,6 +1458,45 @@ class StandaloneKnownDriftTests(unittest.TestCase):
         # Share mode is unchanged: C11 decides from R
         self.assertEqual(classify(facts(running=NEW), expected(), prev=prev).code, "running_confirmed")
 
+    def test_a_failed_load_keeps_a_known_drift_in_share_mode(self):
+        # Owner decision (31 Oct), second review: a required Load that fails (a worker start, the share back)
+        # leaves R unknown. That reads nothing about the message, so a known drift keeps its alert, the same
+        # id and ack: message_unchecked, red from the alert, the origin unknown, never E's. Only a Load and
+        # its second reading end it
+        acked = self.drifted(alerts=[alert("drift", acked_by=AKIM, acked_at=T0)])
+        r = reading(running=None, running_reset=True)
+        j = judge(acked, r, expected())
+        self.assertTrue(j.committed)
+        self.assertEqual((j.state.code, [(a.id, a.acked_by) for a in j.alerts], j.ended),
+                         ("message_unchecked", [(acked.alerts[0].id, AKIM)], []))
+        p = dataclasses.replace(acked, state=j.state, alerts=j.alerts, running=None)
+        v = hs.machine_view(MACHINE, p, 1.0, expected(), None, None, {})
+        self.assertEqual((v.colour, v.origin_line, v.unacked_sound), (RED, "", False))
+        # A Load that reads R again: drift, still the same alert
+        j = commit_second(p, reading(running=self.WRONG), expected())
+        self.assertEqual((j.state.code, [a.id for a in j.alerts]), ("drift", [acked.alerts[0].id]))
+        # A Load that reads E's message, confirmed: green, the alert ends
+        j = commit_second(p, reading(running=NEW), expected())
+        self.assertEqual((j.state.code, j.alerts, [a.id for a in j.ended]),
+                         ("running_confirmed", [], [acked.alerts[0].id]))
+        # Not for a newer E (a Send since), and nothing new without a known drift
+        self.assertNotIn("drift", kinds(classify(hs.facts_from(acked, r), expected(counter=6), prev=acked)))
+        green = poll()
+        self.assertEqual(classify(hs.facts_from(green, r), expected(), prev=green).code, "message_unchecked")
+        self.assertEqual(kinds(classify(hs.facts_from(green, r), expected(), prev=green)), [])
+
+    def test_a_known_drift_whose_r_is_unknown_in_standalone(self):
+        # That P carried into standalone: amber unknown_while_down with the drift alert, so the view is red
+        # and rings, and the origin unknown, never E's (MSGNAM is E's name)
+        prev = self.drifted(state=snapshot("message_unchecked"), running=None)
+        r = reading(running=None, standalone=True)
+        j = commit_second(prev, r, expected())
+        self.assertEqual((j.state.code, [a.id for a in j.alerts]), ("unknown_while_down", [prev.alerts[0].id]))
+        st = dataclasses.replace(prev, state=j.state, alerts=j.alerts, standalone=True)
+        self.assertEqual(hs.effective_origin(st, expected()), "")
+        v = hs.machine_view(MACHINE, st, 1.0, expected(), None, None, {})
+        self.assertEqual((v.colour, v.origin_line, v.unacked_sound), (RED, "", True))
+
     def test_origin(self):
         st = self.drifted(standalone=True)
         self.assertEqual(hs.effective_origin(st, expected()), "Product of Mexico")
@@ -1466,6 +1505,54 @@ class StandaloneKnownDriftTests(unittest.TestCase):
         self.assertEqual(hs.effective_origin(dataclasses.replace(st, message_name=None), expected()), "")
         v = hs.machine_view(MACHINE, st, 1.0, expected(), None, None, {})
         self.assertEqual((v.code, v.colour, v.origin_line), ("drift", RED, "Product of Mexico"))
+
+
+class StandaloneUncheckedTests(unittest.TestCase):
+    """§3.4 C11d (owner decision, 31 Oct, second review): a message share mode couldn't check, carried into
+    standalone mode (running_unchecked), is at best amber there, the origin unknown."""
+
+    def carried(self, code="message_unchecked", **kw):
+        return poll(code, **{"running": None, "running_unchecked": True, "alerts": [alert("message_unreadable")],
+                             "standalone": True, **kw})
+
+    def test_never_better_than_amber(self):
+        prev = self.carried()
+        r = reading(running=None, standalone=True)
+        j = commit_second(prev, r, expected())
+        self.assertEqual((j.state.code, [a.id for a in j.alerts]), ("unknown_while_down", [prev.alerts[0].id]))
+        self.assertTrue(j.facts.running_unchecked)                  # standalone never computes it
+        st = dataclasses.replace(self.carried("unknown_while_down"), alerts=j.alerts)
+        v = hs.machine_view(MACHINE, st, 1.0, expected(), None, None, {})
+        self.assertEqual((v.colour, v.origin_line), (AMBER, ""))
+        # The next checks keep it, also with another message selected, and after the printer was off
+        self.assertEqual(judge(st, r, expected()).state.code, "unknown_while_down")
+        other = dataclasses.replace(r, message_name="SOMETHING-ELSE")
+        self.assertEqual(classify(hs.facts_from(st, other), expected(), prev=st, standalone=True).code,
+                         "unknown_while_down")
+        off = dataclasses.replace(self.carried("off"), reachable=False, printing=None, message_name=None)
+        self.assertEqual(classify(hs.facts_from(off, r), expected(), prev=off, standalone=True).code,
+                         "unknown_while_down")
+        self.assertEqual(kinds(classify(hs.facts_from(off, r), expected(), prev=off, standalone=True)),
+                         ["message_unreadable"])
+        # A higher code still wins (printing read off while it should run)
+        stopped = dataclasses.replace(r, printing=False)
+        self.assertIn(classify(hs.facts_from(st, stopped), expected(), prev=st, standalone=True).code,
+                      ("printing_off", "not_printing"))
+
+    def test_only_when_carried(self):
+        # A fresh standalone status (nothing carried) is judged by its name as before; share mode is unchanged
+        r = reading(running=None, standalone=True)
+        fresh = poll(running=None, standalone=True)
+        self.assertEqual(classify(hs.facts_from(fresh, r), expected(), prev=fresh, standalone=True).code,
+                         "running_confirmed")
+        self.assertEqual(classify(hs.facts_from(None, r), expected(), prev=None, standalone=True).code,
+                         "running_confirmed")
+        self.assertEqual(classify(facts(running_unchecked=True), expected(), prev=poll()).code, "message_unchecked")
+        # A stopped machine keeps its own code
+        e = expected("stopped_by_user", stopped_by=AKIM, stop_reason="user")
+        off_r = dataclasses.replace(r, printing=False)
+        self.assertEqual(classify(hs.facts_from(self.carried(), off_r), e, prev=self.carried(), standalone=True).code,
+                         "stopped")
 
 
 class CheckingAfterAGapTests(unittest.TestCase):

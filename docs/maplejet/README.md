@@ -98,19 +98,27 @@ from the plan's wording or accept a risk:
 The owner's goal: the printer's own web portal and panel are used rarely, only for maintenance and
 diagnostics. Everything else goes through Stripes. So a change made on the printer itself (say a
 same-name message edited during maintenance) is rare but possible, and Stripes must never hide it.
-Two changes follow, both differing from the spec as first written:
+These changes follow, all differing from the spec as first written:
 
 1. **Server down: a known wrong origin isn't forgotten.** When standalone checks start, a machine
    whose last poll status this PC read shows it printing something other than what Stripes sent
    stays red, with its drift alert (sounding unless someone acknowledged it) and the origin that is
    really printing. Standalone checks can't clear it; another message selected at the printer gives
    at best amber "Can't check the message while the server is down". Only share mode's own Loads
-   clear it. Nothing else is carried, and standalone still makes no Loads (states.md §3.4 C11c,
-   §6.12 item 3, §7 item 3).
+   clear it. A machine whose message share mode couldn't check ("Can't read the message on this
+   printer") stays at best amber, with the origin unknown, never green on the message name alone.
+   Nothing else is carried, and standalone still makes no Loads (states.md §3.4 C11c, C11d, §6.12
+   item 3, §7 item 3).
 2. **A failed message check is tried again at the next cycle.** A Load that fails, or a confirming
    Load that fails, is tried again about 5 s later, not a slow set (60 s) later. Three failed
    confirmations in a row give amber "Can't read the message on this printer". Two agreeing Loads are
    still needed for red drift (states.md §3.8, §6.4, §6.5).
+3. **A failed Load never ends a known drift** (from the second review of the two changes above). The
+   retry is an ordinary Load: when it fails too, the last reading stays, so a red drift stays red with
+   the same alert. A Load that had to read the message again (Stripes starting, or the server back)
+   and failed leaves the origin unknown, but the drift alert stays open, with its acknowledgement:
+   only a Load that works and a second one that agrees end it. So flaky reads never end an alarm
+   nobody acknowledged, or ring again for one that was (states.md §3.4 C11e, §6.4, §6.12 item 7).
 
 ## OPEN items
 
@@ -143,7 +151,7 @@ the item names.
 | INKL meanings; PRIN after an error | 0 cartridge error, 2 and 3 low, 4 out of ink; both alerts may fire | states.md §14 |
 | Whether the ink name follows a cartridge swap | treated as a settings check | send.md §10.5 |
 | Power cycle: which message loads, whether printing comes back on | printing off gives amber `not_printing`; the first Load is checked for drift | states.md §14 item 2 |
-| Edits made on the printer's own panel or web portal (a same-name message changed during maintenance) | red drift once two Loads agree, within a slow set plus seconds; a failed Load is tried again at the next cycle; with the server down a known drift stays red. Owner's goal: the portal and panel are for maintenance and diagnostics only, everything else goes through Stripes (owner decisions, 31 Oct) | states.md §3.4 C11, C11c, §6.5 |
+| Edits made on the printer's own panel or web portal (a same-name message changed during maintenance) | red drift once two Loads agree, within a slow set plus seconds; a failed Load is tried again at the next cycle and never ends a known drift; with the server down a known drift stays red, and a message that couldn't be checked stays amber. Owner's goal: the portal and panel are for maintenance and diagnostics only, everything else goes through Stripes (owner decisions, 31 Oct) | states.md §3.4 C11 to C11e, §6.5 |
 | Best-by month arithmetic at month ends and on 29 Feb | the day cut to the month's end; any difference fails the date check | send.md §3.2 |
 | Empty messages at the end of a test | CRTMSG with no name, SAVEMSG with no items | send.md §15.5 |
 | Font names on the test print | `hx_model.STANDARD_FONTS` | send.md §15.3 |

@@ -1650,6 +1650,171 @@ class StandaloneTests(Base):
         self.assertEqual((mv.colour, mv.unacked_sound), (RED, False))
         self.assertEqual(hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True), [])
 
+    def outage_board(self, sim, a, checks=3):
+        """The share goes down with the floor board open on PC a. a's board once a second from then until
+        `checks` standalone checks have run: (mode, code, colour, origin, floor row colour, its origin, line
+        card colour, ringing alert ids)."""
+        a.poller.set_monitor_open(True, True)
+        sim.world.fs.down = True
+        self.addCleanup(setattr, sim.world.fs, "down", False)
+        samples = []
+        for _ in range(int(LOGIC.lock_stale_s + checks * LOGIC.standalone_poll_s)):
+            sim.run(1)
+            a.watcher.run_once()
+            mv = machine_on_board(a, sim.mid)
+            row = next(r for r in hx_state.floor_board_rows(a.watcher.latest) if r.machine_id == sim.mid)
+            card = next(ln for ln in a.watcher.latest.lines if ln.line_id == mv.line_id)
+            ringing = [x.id for x in hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)]
+            samples.append((a.poller.mode, mv.code, mv.colour, mv.origin_line, row.colour, row.origin_line,
+                            card.colour, ringing))
+        self.assertEqual(samples[-1][0], "standalone")
+        return samples
+
+    def share_back(self, sim, a):
+        sim.world.fs.down = False
+        a.store.probe_now()
+        deadline = time.monotonic() + 5
+        while not a.store.available and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    @staticmethod
+    def failing_loads(sim, fails):
+        """fails(n): the n-th Load from now (1 first) gets junk in its reply. Returns the Load count."""
+        n = [0]
+
+        def hook(body):
+            if b"<FCDOC>" not in body:
+                return body
+            n[0] += 1
+            return body.replace(b"<FCDOC>", b"<FCDOC>junk", 1) if fails(n[0]) else body
+        sim.fake.web_reply_hook = hook
+        return n
+
+    def test_a_known_drift_whose_loads_failed_stays_red_while_the_share_is_down(self):
+        # Owner decision (31 Oct), second review: a committed drift, then two Loads in a row fail just before
+        # the outage. The failed retry keeps R, so P still holds the drift, and the standalone checks carry
+        # it: red and ringing on the card, the floor row and the line card; the message check counts as
+        # failed (two failed Loads), so the origin shows as unknown, as in share mode, never E's
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.assertTrue(sim.run(70, until=lambda: sim.code() == "drift"))
+        drift = next(x.id for x in sim.p().alerts if x.kind == "drift")
+        n = self.failing_loads(sim, lambda k: k <= 2)
+        self.assertTrue(sim.run(100, until=lambda: n[0] >= 2))
+        p = sim.p()
+        self.assertEqual((p.state.code, p.running.origin_line, p.running_unchecked), ("drift", "Product of Mexico", True))
+        samples = self.outage_board(sim, a)
+        self.assertEqual([s for s in samples if s[2:] != (RED, "", RED, "", RED, [drift])], [])
+        self.assertEqual(a.poller.local_statuses()[sim.mid].state.code, "drift")
+
+    def test_a_carried_drift_survives_a_failed_first_load_when_the_share_is_back(self):
+        # Owner decision (31 Oct), second review: the share is back and the new worker's first Load (a
+        # required one) fails. R unknown reads nothing about the message: the carried drift keeps its alert
+        # (the same id, still acknowledged), the machine stays red with the origin unknown meanwhile, and only
+        # a Load and its second reading decide. Nothing rings again, no new alert id
+        sim = self.sim()
+        a, drift = self.known_drift_then_down(sim, ack=True)
+        sim.run(2 * LOGIC.standalone_poll_s)
+        self.assertEqual(a.poller.local_statuses()[sim.mid].state.code, "drift")
+        n = self.failing_loads(sim, lambda k: k == 1)
+        self.share_back(sim, a)
+        codes, bad = set(), []
+        for _ in range(120):
+            sim.run(1)
+            a.watcher.run_once()
+            p = sim.p()
+            mv = machine_on_board(a, sim.mid)
+            ringing = hx_state.sounding_alerts(a.watcher.latest, a.identity, floor_board=True)
+            ids = [(x.id, x.acked_by) for x in p.alerts if x.active and x.kind == "drift"]
+            codes.add(p.state.code)
+            if ids != [(drift.id, a.identity.user)] or mv.colour != RED or ringing or mv.origin_line == ORIGIN:
+                bad.append((a.poller.mode, p.state.code, ids, mv.colour, mv.origin_line, ringing))
+        self.assertGreaterEqual(n[0], 3)
+        self.assertIn("message_unchecked", codes)              # the failed first Load: R unknown
+        self.assertEqual(bad, [])
+        self.assertEqual((sim.code(), sim.p().running.origin_line), ("drift", "Product of Mexico"))
+        self.assertFalse([e for e in a.entries("alert_ended") if e["alert_id"] == drift.id])
+
+    def test_a_known_drift_whose_r_is_unknown_stays_red_while_the_share_is_down(self):
+        # The same, and every Load fails after the share is back, so P holds the drift alert with R unknown
+        # when the share goes down again: still carried, red and ringing, the origin unknown, never green
+        sim = self.sim()
+        a, drift = self.known_drift_then_down(sim)
+        sim.run(LOGIC.standalone_poll_s)
+        self.failing_loads(sim, lambda k: True)
+        self.share_back(sim, a)
+        self.assertTrue(sim.run(120, until=lambda: sim.code() == "message_unchecked"))
+        p = sim.p()
+        self.assertIsNone(p.running)
+        self.assertEqual([x.id for x in p.alerts if x.active and x.kind == "drift"], [drift.id])
+        sim.run(LOGIC.heartbeat_s + 0.1)
+        samples = self.outage_board(sim, a)
+        self.assertEqual([s for s in samples if s[2:] != (RED, "", RED, "", RED, [drift.id])], [])
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual((st.state.code, [x.id for x in st.alerts if x.active and x.kind == "drift"]),
+                         ("unknown_while_down", [drift.id]))
+        # Back with working Loads: share mode's two agreeing Loads give the drift again, the same alert
+        sim.fake.web_reply_hook = None
+        self.share_back(sim, a)
+        self.assertTrue(sim.run(120, until=lambda: sim.code() == "drift"))
+        self.assertEqual([x.id for x in sim.p().alerts if x.active and x.kind == "drift"], [drift.id])
+
+    def test_a_message_share_mode_couldnt_check_stays_amber_while_the_share_is_down(self):
+        # Owner decision (31 Oct), second review: every first Load reads another origin and every confirming
+        # Load fails, so share mode says amber "can't check the message" with the origin unknown. The
+        # standalone checks can't check it either (no Loads, and MSGNAM is E's name): at best amber
+        # unknown_while_down with the origin unknown on the card, the floor row and the line card, never
+        # green with E's origin. Share mode decides again once the share is back
+        sim = self.sim()
+        sim.expect()
+        a = sim.pc("akim")
+        self.steady(sim)
+        with sim.fake.lock:
+            sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+        self.failing_loads(sim, lambda k: k % 2 == 0)
+        self.assertTrue(sim.run(120, until=lambda: sim.code() == "message_unchecked"))
+        self.assertIsNone(sim.p().running)
+        loads = len(sim.requests(kind="sme"))
+        samples = self.outage_board(sim, a)
+        self.assertEqual([s for s in samples if s[2:] != (AMBER, "", AMBER, "", AMBER, [])], [])
+        self.assertEqual(len(sim.requests(kind="sme")), loads)                 # standalone never Loads
+        st = a.poller.local_statuses()[sim.mid]
+        self.assertEqual((st.state.code, st.running_unchecked), ("unknown_while_down", True))
+        self.assertIn("message_unreadable", [x.kind for x in st.alerts if x.active])
+        # Back with working Loads: two agreeing Loads give red drift
+        sim.fake.web_reply_hook = None
+        self.share_back(sim, a)
+        self.assertTrue(sim.run(130, until=lambda: sim.code() == "drift"))
+        self.assertEqual(sim.p().running.origin_line, "Product of Mexico")
+
+    def test_random_load_failures_then_an_outage_are_never_green(self):
+        # The reviewer's rate (40 % of Loads failing) on 10 seeds, the share going down as soon as share mode
+        # says red drift or amber "can't check the message": the standalone board is never green and never
+        # shows E's origin, the drift seeds red and ringing
+        out = []
+        for seed in range(10):
+            sim = self.sim()
+            sim.expect()
+            a = sim.pc("akim")
+            self.steady(sim)
+            with sim.fake.lock:
+                sim.fake.slots[9] = design(9, NAME, "Product of Mexico")
+            rng = random.Random(seed)
+            self.failing_loads(sim, lambda k: rng.random() < 0.4)
+            self.assertTrue(sim.run(600, until=lambda: sim.code() in ("drift", "message_unchecked")), seed)
+            code = sim.code()
+            samples = self.outage_board(sim, a, checks=2)
+            out.append(code)
+            want = {(RED, RED)} if code == "drift" else {(AMBER, AMBER), (RED, RED)}
+            bad = [s for s in samples if (s[2], s[4]) not in want or ORIGIN in (s[3], s[5])]
+            self.assertEqual(bad, [], (seed, code))
+        self.assertIn("message_unchecked", out)                 # both kinds of seed were seen
+        self.assertIn("drift", out)
+
     def test_a_pc_that_never_read_p_starts_its_checks_afresh(self):
         # §6.12 item 3: nothing to carry on a PC whose poller never read P (Stripes started while the share
         # was already down; here its data comes from before): its checks start from nothing, as before

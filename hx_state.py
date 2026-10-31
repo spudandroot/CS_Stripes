@@ -866,9 +866,9 @@ def classify(facts: Facts, prev: PollStatus | None, expected: ExpectedState | No
                 codes.add("drift")
                 need("drift")
             elif running is None and known:
-                # R unknown (a required Load failed: a worker start, the share back, a paused tick): only a
-                # Load can end a known drift. Its alert stays, the same id and acks (owner decision, 31 Oct);
-                # C11b gives message_unchecked with the origin unknown, and the red alert keeps it red
+                # C11e: R unknown (a required Load failed: a worker start, the share back, a paused tick):
+                # only a Load can end a known drift. Its alert stays, the same id and acks (owner decision,
+                # 31 Oct); C11b gives message_unchecked with the origin unknown, and the red alert keeps it red
                 need("drift")
         else:
             carry("drift")
